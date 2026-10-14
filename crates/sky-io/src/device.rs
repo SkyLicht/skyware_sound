@@ -209,6 +209,28 @@ fn pick(
     Ok((device, supported, host_name))
 }
 
+/// A cpal output device as resolved from an [`OutputConfig`], for streams
+/// that play something other than the engine, such as `sky-runtime`.
+pub struct CpalOutput {
+    pub device: cpal::Device,
+    pub config: cpal::SupportedStreamConfig,
+    pub host: String,
+    pub name: String,
+}
+
+/// Resolves the device and format an [`OutputConfig`] names, through cpal
+/// (shared mode on WASAPI), without opening a stream.
+pub fn cpal_output(config: &OutputConfig) -> Result<CpalOutput, IoError> {
+    let (device, config, host) = pick(config)?;
+    let name = device_name(&device);
+    Ok(CpalOutput {
+        device,
+        config,
+        host,
+        name,
+    })
+}
+
 /// Resolves the device and format a stream would use, without opening it.
 pub fn probe_output(config: &OutputConfig) -> Result<DeviceInfo, IoError> {
     let (device, supported, host) = pick(config)?;
@@ -317,7 +339,10 @@ pub struct StreamStatsSnapshot {
 const UNKNOWN: u64 = u64::MAX;
 
 impl StreamStats {
-    fn new(fills_free_space: bool, sample_rate: u32) -> Self {
+    /// Stats for a stream at `sample_rate`. `fills_free_space` is for hosts
+    /// that hand each callback all the free space in the device buffer, as
+    /// WASAPI does.
+    pub fn new(fills_free_space: bool, sample_rate: u32) -> Self {
         Self {
             epoch: Instant::now(),
             sample_rate: sample_rate.max(1),
@@ -391,9 +416,10 @@ impl StreamStats {
     }
 
     /// Records one device callback that started at `started` and is handing
-    /// its audio over now.
+    /// its audio over now. `load` is `busy` as a share of the time the
+    /// buffer lasts.
     #[inline]
-    fn record(&self, frames: usize, started: Instant, busy: Duration, load: f32) {
+    pub fn record(&self, frames: usize, started: Instant, busy: Duration, load: f32) {
         let r = Ordering::Relaxed;
         let ns = |t: Instant| t.saturating_duration_since(self.epoch).as_nanos() as u64;
         let (start, end) = (ns(started), ns(Instant::now()));

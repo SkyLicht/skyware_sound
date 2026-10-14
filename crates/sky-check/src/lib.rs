@@ -12,8 +12,13 @@
 //!
 //! `skyware check` runs both from the command line, and the `system_check`
 //! MCP tool runs them for an assistant. Both report the same [`Report`].
+//!
+//! [`check_game`] does the same for a whole game export: it loads it into
+//! `sky-runtime` the way a game does, checks every loop and SFX set, and
+//! plays them through the device (`skyware play-game`).
 
 mod device;
+mod game;
 mod loops;
 
 use std::path::{Path, PathBuf};
@@ -22,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 pub use device::{DeviceCheck, DeviceOptions, DeviceProgress, check_device};
+pub use game::{GameCheck, GameOptions, GamePlayback, check_game};
 pub use loops::{
     Expected, LoopCheck, LoopOptions, MAX_BARS, check_loop, check_project, verify_loop_export,
 };

@@ -1,6 +1,6 @@
 [package]
 name = "sky-check"
-description = "The system check: device dropouts at a buffer size, and seamless game loop exports"
+description = "The system check: device dropouts at a buffer size, seamless game loop exports, and game exports played through sky-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,6 +19,8 @@ sky-io = { workspace = true, features = ["device"] }
 sky-game.workspace = true
 sky-session.workspace = true
 sky-runtime.workspace = true
+assert_no_alloc.workspace = true
+cpal.workspace = true
 serde.workspace = true
 tracing.workspace = true
 

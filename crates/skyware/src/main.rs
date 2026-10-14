@@ -14,7 +14,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use sky_mcp::{Permission, Policy, SkywareMcp};
 use sky_model::templates::demo_project;
-use sky_session::{LoopExportOptions, Session};
+use sky_session::{GameExportOptions, LoopExportOptions, Session};
 
 use crate::cli::{Cli, Cmd, McpArgs, OutputArgs};
 
@@ -111,6 +111,84 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             );
             print_licenses(&out.licenses, "Credit in the manifest");
             Ok(())
+        }
+        Some(Cmd::ExportGame { project, dir, only }) => {
+            if project.is_none() && dir.is_none() {
+                bail!("give a project folder, or --dir to export the demo project's game assets");
+            }
+            let session = open_session(project.as_deref(), None)?;
+            let out = session.export_game(&GameExportOptions { dir, only })?;
+            for a in &out.assets {
+                let files: Vec<_> = a.asset.files().map(|f| f.path.as_str()).collect();
+                let seam = a
+                    .seam
+                    .as_ref()
+                    .map(|s| {
+                        format!(
+                            ", seam: {}{}",
+                            s.verdict,
+                            s.note
+                                .as_ref()
+                                .map(|n| format!(" ({n})"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default();
+                let kind = match a.asset {
+                    sky_core::manifest::Asset::Loop(_) => "Loop",
+                    sky_core::manifest::Asset::Sfx(_) => "SFX",
+                };
+                println!("{kind} {}: {}{seam}", a.asset.name(), files.join(", "));
+            }
+            for name in &out.removed {
+                println!("Removed {name} from the manifest");
+            }
+            for file in &out.deleted {
+                println!("Deleted {}", file.display());
+            }
+            println!("Manifest {}", out.manifest.display());
+            print_licenses(&out.licenses, "Credit in the manifest");
+            Ok(())
+        }
+        Some(Cmd::PlayGame {
+            dir,
+            assets,
+            seconds,
+            every,
+            device,
+            buffer,
+            sample_rate,
+            report,
+        }) => {
+            let opts = sky_check::GameOptions {
+                dir,
+                assets,
+                seconds: seconds.max(0.0),
+                every_ms: every,
+                output: sky_io::device::OutputConfig {
+                    device,
+                    sample_rate,
+                    buffer_frames: buffer,
+                    silent: report.silent,
+                    ..Default::default()
+                },
+            };
+            if opts.seconds > 0.0 {
+                eprintln!("Playing for {:.0} s...", opts.seconds);
+            }
+            let check = sky_check::check_game(&opts).map_err(anyhow::Error::msg)?;
+            if report.json {
+                println!("{}", serde_json::to_string_pretty(&check)?);
+            } else {
+                for line in check.lines() {
+                    println!("{line}");
+                }
+            }
+            if check.passed {
+                Ok(())
+            } else {
+                bail!("the check failed")
+            }
         }
         Some(Cmd::Analyze { file }) => {
             let audio = sky_io::read_audio(&file)?;

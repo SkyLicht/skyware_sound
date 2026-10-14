@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::app::Action;
 use crate::dialogs::{LoopSummary, PathPurpose, WavSummary};
+use crate::game::GameSummary;
 use crate::waveform::Peaks;
 use sky_core::AudioId;
 use sky_library::Pack;
@@ -28,6 +29,7 @@ pub enum JobOutput {
         result: Result<AudioId, String>,
     },
     LoopExported(Result<LoopSummary, String>),
+    GameExported(Result<GameSummary, String>),
     WavExported(Result<WavSummary, String>),
     PathPicked {
         purpose: PathPurpose,

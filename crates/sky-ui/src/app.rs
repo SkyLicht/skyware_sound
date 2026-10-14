@@ -49,6 +49,9 @@ pub enum Action {
     LoadSounds,
     ExportLoop,
     ExportWav,
+    /// The Game assets window: loops and SFX sets for a game, and their
+    /// export.
+    GameAssets,
     ToggleLoop,
     PlayStop,
     Undo,
@@ -471,6 +474,7 @@ impl App {
             }
             Action::ExportLoop => self.open_export_loop(),
             Action::ExportWav => self.open_export_wav(),
+            Action::GameAssets => self.open_game_assets(),
             Action::ToggleLoop => {
                 let r = actions::set_loop_enabled(&self.session, !self.view.project.loop_enabled);
                 self.report(r);
@@ -607,6 +611,12 @@ impl App {
             },
             JobOutput::LoopExported(result) => {
                 if let Some(d) = self.dialogs.export_loop.as_mut() {
+                    d.running = false;
+                    d.result = Some(result);
+                }
+            }
+            JobOutput::GameExported(result) => {
+                if let Some(d) = self.dialogs.game.as_mut() {
                     d.running = false;
                     d.result = Some(result);
                 }

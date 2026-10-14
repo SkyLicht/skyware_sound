@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use serde::Serialize;
-use sky_core::manifest::Category;
+use sky_core::manifest::{Asset, Category};
 use sky_core::{AudioId, Ticks, TrackId};
 use sky_dsp::AudioData;
 use sky_dsp::InstrumentType;
@@ -23,13 +23,13 @@ use sky_dsp::analysis::{self, SeamReport};
 use sky_engine::{
     AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, compile, create_engine,
 };
-use sky_game::{Exported, LoopExport};
+use sky_game::{AssetAudio, AssetExport, ExportSet, Exported, LoopExport};
 use sky_io::{WavFormat, read_audio, write_wav};
 use sky_library::{Library, LibraryError, PackSource};
 use sky_model::file::{self, Journal};
 use sky_model::{
-    AudioSource, BankSample, Command, History, InstrumentSlot, License, LicenseReport, ModelError,
-    Origin, PoolEntry, Project, SampleBank, TrackKind, Transaction,
+    AudioSource, BankSample, Command, GameAssetKind, History, InstrumentSlot, License,
+    LicenseReport, ModelError, Origin, PoolEntry, Project, SampleBank, TrackKind, Transaction,
 };
 use thiserror::Error;
 
@@ -151,6 +151,75 @@ pub struct LoopExported {
     pub sample_rate: u32,
     /// Credits written into the manifest, and license warnings.
     pub licenses: LicenseReport,
+}
+
+/// Options for [`Session::export_game`].
+#[derive(Clone, Debug, Default)]
+pub struct GameExportOptions {
+    /// Export folder; defaults to the project's game export folder (see
+    /// [`Session::game_export_dir`]).
+    pub dir: Option<PathBuf>,
+    /// Names of the game assets to export. Empty exports all of them and
+    /// removes the project's assets that the folder's manifest still has
+    /// but the project no longer lists.
+    pub only: Vec<String>,
+}
+
+/// One game asset [`Session::export_game`] wrote.
+#[derive(Clone, Debug)]
+pub struct GameAssetExported {
+    /// The manifest entry.
+    pub asset: Asset,
+    /// For loops: how the end of the body meets its start.
+    pub seam: Option<SeamReport>,
+}
+
+/// What [`Session::export_game`] wrote.
+#[derive(Clone, Debug)]
+pub struct GameExported {
+    pub dir: PathBuf,
+    pub manifest: PathBuf,
+    pub assets: Vec<GameAssetExported>,
+    /// Every audio file written.
+    pub files: Vec<PathBuf>,
+    /// Assets removed from the manifest because the project dropped them.
+    pub removed: Vec<String>,
+    /// Old audio files the manifest no longer uses, now deleted.
+    pub deleted: Vec<PathBuf>,
+    /// Credits written into the manifest, and license warnings.
+    pub licenses: LicenseReport,
+}
+
+/// Samples quieter than this (about -80 dBFS) count as silence when SFX
+/// variations are trimmed.
+const SILENCE: f32 = 1e-4;
+
+/// Cuts trailing silence, keeping at least one frame.
+fn trim_silence(audio: &mut AudioData) {
+    let last = audio
+        .channels
+        .iter()
+        .filter_map(|ch| ch.iter().rposition(|s| s.abs() > SILENCE))
+        .max()
+        .unwrap_or(0);
+    for ch in &mut audio.channels {
+        ch.truncate(last + 1);
+    }
+}
+
+/// Mixes stereo down to one channel at the same loudness for centered
+/// sounds.
+fn fold_to_mono(audio: &mut AudioData) {
+    if audio.channels.len() < 2 {
+        return;
+    }
+    let mono: Vec<f32> = audio
+        .left()
+        .iter()
+        .zip(audio.right())
+        .map(|(l, r)| 0.5 * (l + r))
+        .collect();
+    audio.channels = vec![mono];
 }
 
 /// Which sounds [`Session::load_bank`] loads, and from where.
@@ -975,6 +1044,170 @@ impl Session {
             bars,
             frames,
             sample_rate: audio.sample_rate,
+            licenses,
+        })
+    }
+}
+
+impl Session {
+    /// The folder game exports go to: the project's game export folder
+    /// (relative to the project folder unless absolute), or else
+    /// `renders/export` inside the project folder.
+    pub fn game_export_dir(&self) -> Result<PathBuf, SessionError> {
+        let view = self.view();
+        let base = view.path.as_deref();
+        match (view.project.game.export_dir.as_deref(), base) {
+            (Some(d), _) if Path::new(d).is_absolute() => Ok(PathBuf::from(d)),
+            (Some(d), Some(p)) => Ok(p.join(d)),
+            (Some(d), None) => Err(SessionError::Invalid(format!(
+                "the game export folder {d:?} is relative to the project folder; save the \
+                 project first or set an absolute folder"
+            ))),
+            (None, Some(p)) => Ok(p.join(file::RENDERS_DIR).join("export")),
+            (None, None) => Err(SessionError::NoProjectPath),
+        }
+    }
+
+    /// Renders the project's game assets and exports them for `sky-runtime`:
+    /// loops (with their intros) and SFX sets with one file per variation,
+    /// all recorded in the folder's manifest.
+    pub fn export_game(&self, opts: &GameExportOptions) -> Result<GameExported, SessionError> {
+        let (project, audio) = self.render_inputs();
+        let game = &project.game;
+        if game.assets.is_empty() {
+            return Err(SessionError::Invalid(
+                "the project has no game assets to export; add a loop or an SFX set first".into(),
+            ));
+        }
+        for name in &opts.only {
+            if game.find(name).is_none() {
+                return Err(SessionError::Invalid(format!(
+                    "the project has no game asset {name:?}; it has {}",
+                    game.assets
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        let dir = match &opts.dir {
+            Some(d) => d.clone(),
+            None => self.game_export_dir()?,
+        };
+        let format = WavFormat::from_bits(game.bits).unwrap_or(WavFormat::Pcm24);
+        let selected: Vec<_> = game
+            .assets
+            .iter()
+            .filter(|a| opts.only.is_empty() || opts.only.contains(&a.name))
+            .collect();
+
+        // Render first, so a bad range fails before anything is written.
+        let sr = project.sample_rate;
+        let to_sample = |t: Ticks| project.tempo.tick_to_sample(t, sr);
+        let constant_tempo = project.tempo.points().len() == 1;
+        let time_signature = Some([
+            project.time_signature.numerator,
+            project.time_signature.denominator,
+        ]);
+        let mut total_seconds = 0.0;
+        let mut rendered = Vec::with_capacity(selected.len());
+        for asset in &selected {
+            match &asset.kind {
+                GameAssetKind::Loop { range, intro_start } => {
+                    let (s, e) = (to_sample(range.start), to_sample(range.end));
+                    let i = intro_start.map_or(s, to_sample);
+                    total_seconds += ((s - i) + 2 * (e - s)) as f64 / sr as f64;
+                    Self::check_length(total_seconds)?;
+                    let snap = compile(&project, &audio, sr, 0);
+                    let out = if i < s {
+                        sky_engine::render_intro_loop(snap, i, s, e)
+                    } else {
+                        sky_engine::render_loop(snap, s, e, 2)
+                    };
+                    let loop_start = (s - i) as u64;
+                    let seam = analysis::seam_check(&out, loop_start as usize, out.frames());
+                    rendered.push((vec![out], loop_start, Some(seam)));
+                }
+                GameAssetKind::Sfx {
+                    variations,
+                    tail_seconds,
+                    mono,
+                    ..
+                } => {
+                    let tail = f64::from(*tail_seconds);
+                    let mut outs = Vec::with_capacity(variations.len());
+                    for v in variations {
+                        let (s, e) = (to_sample(v.start), to_sample(v.end));
+                        total_seconds += (e - s) as f64 / sr as f64 + tail;
+                        Self::check_length(total_seconds)?;
+                        let frames = (e - s) as usize + (tail * sr as f64) as usize;
+                        let snap = compile(&project, &audio, sr, 0);
+                        let mut out = sky_engine::render(snap, s, frames, false);
+                        trim_silence(&mut out);
+                        if *mono {
+                            fold_to_mono(&mut out);
+                        }
+                        outs.push(out);
+                    }
+                    rendered.push((outs, 0, None));
+                }
+            }
+        }
+
+        let licenses = sky_model::license_report(&project);
+        let exports: Vec<AssetExport> = selected
+            .iter()
+            .zip(&rendered)
+            .map(|(asset, (outs, loop_start, _))| AssetExport {
+                name: asset.name.clone(),
+                id: asset.id,
+                category: asset.category,
+                tags: asset.tags.clone(),
+                credits: licenses.credits.clone(),
+                audio: match &asset.kind {
+                    GameAssetKind::Loop { range, .. } => AssetAudio::Loop {
+                        audio: &outs[0],
+                        loop_start: *loop_start,
+                        loop_end: outs[0].frames() as u64,
+                        tempo_bpm: constant_tempo.then(|| project.tempo.initial_bpm()),
+                        time_signature,
+                        bars: Some(range.length() as f64 / project.ticks_per_bar() as f64),
+                    },
+                    GameAssetKind::Sfx {
+                        selection,
+                        pitch_semitones,
+                        gain_db,
+                        ..
+                    } => AssetAudio::Sfx {
+                        variations: outs.iter().collect(),
+                        selection: *selection,
+                        pitch_semitones: *pitch_semitones,
+                        gain_db: *gain_db,
+                    },
+                },
+            })
+            .collect();
+        let set = ExportSet {
+            project: project.name.clone(),
+            project_id: Some(project.id.to_string()),
+            prune: opts.only.is_empty(),
+            format,
+        };
+        let out = sky_game::export_assets(&dir, &set, &exports)?;
+        let assets = out
+            .assets
+            .into_iter()
+            .zip(rendered)
+            .map(|(asset, (_, _, seam))| GameAssetExported { asset, seam })
+            .collect();
+        Ok(GameExported {
+            dir,
+            manifest: out.manifest,
+            assets,
+            files: out.files,
+            removed: out.removed,
+            deleted: out.deleted,
             licenses,
         })
     }

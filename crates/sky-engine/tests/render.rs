@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use sky_core::{AudioId, ClipId, PPQ};
 use sky_dsp::{AudioData, InstrumentType, analysis};
-use sky_engine::{AudioCache, EngineMsg, compile, create_engine, render, render_loop};
+use sky_engine::{
+    AudioCache, EngineMsg, compile, create_engine, render, render_intro_loop, render_loop,
+};
 use sky_model::templates::demo_project;
 use sky_model::*;
 
@@ -141,6 +143,36 @@ fn loop_render_folds_tails_into_the_start() {
     let head = |a: &AudioData| a.left()[..2_000].iter().fold(0.0f32, |m, s| m.max(s.abs()));
     assert!(head(&folded) > head(&plain));
     let seam = analysis::seam_check(&folded, 0, folded.frames());
+    assert_eq!(seam.verdict, "seamless", "{seam:?}");
+}
+
+#[test]
+fn intro_loops_keep_the_intro_and_a_folded_body() {
+    let p = demo_project();
+    let bar = p.tempo.tick_to_sample(p.ticks_per_bar(), SR);
+    // Bar 1 is the intro; bars 2 to 4 repeat.
+    let (intro, start, end) = (0, bar, bar * 4);
+    let out = render_intro_loop(compile(&p, &AudioCache::new(), SR, 1), intro, start, end);
+    assert_eq!(out.frames(), end as usize);
+    // The intro is the arrangement played from its start.
+    let plain = render(
+        compile(&p, &AudioCache::new(), SR, 1),
+        0,
+        bar as usize,
+        false,
+    );
+    assert_eq!(&out.left()[..bar as usize], plain.left());
+    // The body is the second time through, so the pad's reverb from the end
+    // of the loop already rings at its start.
+    let from_silence = render(
+        compile(&p, &AudioCache::new(), SR, 1),
+        start,
+        (end - start) as usize,
+        false,
+    );
+    let head = |a: &[f32]| a[..2_000].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(head(&out.left()[bar as usize..]) > head(from_silence.left()));
+    let seam = analysis::seam_check(&out, bar as usize, out.frames());
     assert_eq!(seam.verdict, "seamless", "{seam:?}");
 }
 

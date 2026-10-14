@@ -141,6 +141,47 @@ pub enum Cmd {
         #[arg(long, default_value_t = 24)]
         bits: u16,
     },
+    /// Export the project's game assets (loops and SFX sets) with a manifest
+    /// for sky-runtime, to the project's game export folder.
+    ExportGame {
+        /// A .skyproj project folder. Without one, the demo project's game
+        /// assets are exported (give --dir).
+        project: Option<PathBuf>,
+        /// Export folder. Default: the project's game export folder.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Export only this asset. Repeatable. Without it, every asset is
+        /// exported and assets the project dropped are removed.
+        #[arg(long, value_name = "NAME")]
+        only: Vec<String>,
+    },
+    /// Load a game export into sky-runtime the way a game does, check every
+    /// loop and SFX set, then play them through the audio device: loops
+    /// throughout, SFX fired in turn from a game thread.
+    PlayGame {
+        /// The export folder, holding skyware-manifest.json.
+        dir: PathBuf,
+        /// Check and play only this asset. Repeatable.
+        #[arg(long = "asset", value_name = "NAME")]
+        assets: Vec<String>,
+        /// Seconds to play through the device; 0 only checks offline.
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+        /// Milliseconds between SFX triggers.
+        #[arg(long, default_value_t = 500)]
+        every: u32,
+        /// Output device (part of its name). Default: the system default.
+        #[arg(long)]
+        device: Option<String>,
+        /// Buffer size in frames, such as 256.
+        #[arg(long)]
+        buffer: Option<u32>,
+        /// Sample rate, such as 48000. Default: the device's.
+        #[arg(long)]
+        sample_rate: Option<u32>,
+        #[command(flatten)]
+        report: ReportArgs,
+    },
     /// Print loudness, peaks and other measurements of an audio file as JSON.
     Analyze { file: PathBuf },
     /// List audio output devices.

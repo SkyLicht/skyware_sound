@@ -6,7 +6,7 @@
 //! dB. Tracks, clips and effects can be named by ID or by name.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -17,21 +17,21 @@ use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sky_core::manifest::Category;
-use sky_core::{AudioId, ClipId, EffectId, Ticks, TrackId};
+use sky_core::manifest::{Category, RandomRange, Selection};
+use sky_core::{AssetId, AudioId, ClipId, EffectId, Ticks, TrackId};
 use sky_dsp::analysis;
 use sky_dsp::params::{self, ParamKind, ParamSpec};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_io::WavFormat;
 use sky_library::{PACKS, PackSource};
 use sky_model::notes::{format_note_list, parse_note_list};
-use sky_model::summary::{clip_json, project_summary, track_json};
+use sky_model::summary::{clip_json, game_asset_json, game_json, project_summary, track_json};
 use sky_model::templates::{demo_project, empty_project};
 use sky_model::{
-    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, License, Origin, Project,
-    Track, TrackKind, Transaction,
+    ChannelRef, Clip, ClipContent, Command, EffectSlot, GameAsset, GameAssetKind, InstrumentSlot,
+    License, MAX_SFX_VARIATIONS, Origin, Project, TimeRange, Track, TrackKind, Transaction,
 };
-use sky_session::{BankRequest, LoopExportOptions, Session};
+use sky_session::{BankRequest, GameExportOptions, LoopExportOptions, Session};
 
 use crate::policy::{Permission, Policy};
 
@@ -70,7 +70,13 @@ their license: exports list the credits they need and warn about unknown \
 licenses.\n\
 \n\
 For a game loop: set_loop to the bars, loop_check_seam to confirm it repeats \
-cleanly, then export_loop writes the WAV and the manifest the game reads.";
+cleanly, then export_loop writes the WAV and the manifest the game reads.\n\
+\n\
+For everything a game plays from this project, keep game assets in the project \
+(project_summary lists them under game): game_asset_set adds loops (with an \
+optional intro) and SFX sets (variations, such as one per beat of a bar, with \
+random pitch and gain); game_export writes them all to the game's folder \
+(game_export_settings) with one manifest, and checks them in the game runtime.";
 
 #[derive(Clone)]
 pub struct SkywareMcp {
@@ -84,8 +90,16 @@ fn required(tool: &str) -> Permission {
     match tool {
         "project_summary" | "track_get" | "clip_get" | "catalog" | "history" | "pattern_query"
         | "analyze" | "loop_check_seam" => Permission::ReadOnly,
-        "project_open" | "project_save" | "audio_import" | "export_wav" | "export_loop"
-        | "system_check" | "sound_packs" | "bank_load" => Permission::Files,
+        "project_open"
+        | "project_save"
+        | "audio_import"
+        | "export_wav"
+        | "export_loop"
+        | "system_check"
+        | "sound_packs"
+        | "bank_load"
+        | "game_export_settings"
+        | "game_export" => Permission::Files,
         _ => Permission::Edit,
     }
 }
@@ -343,6 +357,51 @@ fn category(name: Option<&str>) -> Result<Category, String> {
             }
         },
     )
+}
+
+fn selection(name: &str) -> Result<Selection, String> {
+    let key: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    Ok(match key.as_str() {
+        "random" => Selection::Random,
+        "randomnorepeat" => Selection::RandomNoRepeat,
+        "roundrobin" => Selection::RoundRobin,
+        "shuffle" => Selection::Shuffle,
+        _ => {
+            return Err(format!(
+                "selection {name:?} is not one of random, random_no_repeat, round_robin, shuffle"
+            ));
+        }
+    })
+}
+
+/// Resolves `.` and `..` in a path without touching the disk, so a game
+/// folder next to the project (`../game/assets/audio`) can be checked
+/// against the allowed folders.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn game_asset<'a>(project: &'a Project, name: &str) -> Result<&'a GameAsset, String> {
+    project.game.find(name.trim()).ok_or_else(|| {
+        format!(
+            "no game asset is named {name:?}; the game assets are: {}",
+            names(project.game.assets.iter().map(|a| a.name.as_str()))
+        )
+    })
 }
 
 /// Shortens long arrays in a JSON value so results stay small.
@@ -688,6 +747,91 @@ pub struct SystemCheckArgs {
     /// Folder to keep the exported test loop in. Default: a temporary
     /// folder that is deleted afterwards.
     pub dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BarSpan {
+    pub start_bar: f64,
+    pub end_bar: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MinMax {
+    pub min: f32,
+    pub max: f32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GameAssetSetArgs {
+    /// The name the game plays it by: lowercase letters, digits and
+    /// underscores, such as footstep_grass. An asset with this name is
+    /// changed; otherwise one is added.
+    pub name: String,
+    /// loop or sfx. Needed to add an asset.
+    pub kind: Option<String>,
+    /// A new name for the asset.
+    pub rename: Option<String>,
+    /// music, sfx, ui, voice or ambience. Default for a new asset: music
+    /// for a loop, sfx for an SFX set.
+    pub category: Option<String>,
+    pub tags: Option<Vec<String>>,
+    /// Loop: the bars of the repeating body (default for a new loop: the
+    /// loop region). SFX set: the bars split into `count` variations.
+    pub start_bar: Option<f64>,
+    pub end_bar: Option<f64>,
+    /// Loop: the bar an intro that plays once starts at, before start_bar.
+    /// 0 removes the intro.
+    pub intro_start_bar: Option<f64>,
+    /// SFX set: split start_bar to end_bar into this many equal variations,
+    /// such as 4 for one per beat of a 4/4 bar. Default 1. Alone, it
+    /// splits the set's current span again.
+    pub count: Option<usize>,
+    /// SFX set: one bar range per variation, instead of start_bar, end_bar
+    /// and count.
+    pub variations: Option<Vec<BarSpan>>,
+    /// SFX set: how the game picks a variation per trigger: random,
+    /// random_no_repeat (default), round_robin or shuffle.
+    pub selection: Option<String>,
+    /// SFX set: random pitch offset per trigger in semitones, such as
+    /// {"min": -1, "max": 1}.
+    pub pitch_semitones: Option<MinMax>,
+    /// SFX set: random gain offset per trigger in dB.
+    pub gain_db: Option<MinMax>,
+    /// SFX set: seconds rendered after each variation so it rings out,
+    /// 0 to 10; trailing silence is trimmed. Default 1.
+    pub tail_seconds: Option<f32>,
+    /// SFX set: mix the variations to mono, for sounds the game positions
+    /// itself.
+    pub mono: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GameAssetArg {
+    /// The game asset's name.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GameExportSettingsArgs {
+    /// The folder game exports go to, such as the game's assets/audio
+    /// folder. A relative path is relative to the project folder. An empty
+    /// string resets it to renders/export inside the project folder.
+    pub dir: Option<String>,
+    /// Bits per sample of the WAV files: 16, 24 or 32 (float).
+    pub bits: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GameExportArgs {
+    /// Export only these assets. Default: all of them, and assets the
+    /// project no longer has are removed from the folder.
+    pub only: Option<Vec<String>>,
+    /// Export folder for this export only. Default: the project's game
+    /// export folder.
+    pub dir: Option<String>,
+    /// Load the export into the game runtime afterwards and check that
+    /// every loop repeats exactly and every SFX set plays. Default true.
+    pub verify: Option<bool>,
 }
 
 // ----- the server -----
@@ -1899,6 +2043,327 @@ impl SkywareMcp {
                 "licenseWarnings": out.licenses.warnings,
             })
             .to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Adds or changes a game asset: a loop (a body that repeats seamlessly, with an optional intro that plays once) or an SFX set (variations the game picks one of per trigger, with random pitch and gain). Assets are rendered from the arrangement; game_export writes them all for the game. Give name plus kind to add one; give name and only what changes to edit one."
+    )]
+    async fn game_asset_set(
+        &self,
+        Parameters(a): Parameters<GameAssetSetArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let project = self.session.project();
+        let existing = project.game.find(a.name.trim()).cloned();
+        let kind = match (a.kind.as_deref(), &existing) {
+            (Some(k), _) => match k.trim().to_ascii_lowercase().as_str() {
+                "loop" => "loop",
+                "sfx" => "sfx",
+                other => return Err(format!("kind {other:?} is not loop or sfx")),
+            },
+            (None, Some(e)) => e.kind.kind_name(),
+            (None, None) => {
+                return Err(format!(
+                    "no game asset is named {:?}; to add one, give kind: loop or sfx. The game \
+                     assets are: {}",
+                    a.name,
+                    names(project.game.assets.iter().map(|a| a.name.as_str()))
+                ));
+            }
+        };
+        let is_loop = kind == "loop";
+        let sfx_only = [
+            ("count", a.count.is_some()),
+            ("variations", a.variations.is_some()),
+            ("selection", a.selection.is_some()),
+            ("pitch_semitones", a.pitch_semitones.is_some()),
+            ("gain_db", a.gain_db.is_some()),
+            ("tail_seconds", a.tail_seconds.is_some()),
+            ("mono", a.mono.is_some()),
+        ];
+        if is_loop {
+            let given: Vec<&str> = sfx_only
+                .iter()
+                .filter(|(_, g)| *g)
+                .map(|(n, _)| *n)
+                .collect();
+            if !given.is_empty() {
+                return Err(format!("{} are for SFX sets, not loops", given.join(", ")));
+            }
+        } else if a.intro_start_bar.is_some() {
+            return Err("intro_start_bar is for loops, not SFX sets".into());
+        }
+        let mut asset = existing.clone().unwrap_or_else(|| GameAsset {
+            id: AssetId::new(),
+            name: a.name.trim().to_string(),
+            category: if is_loop {
+                Category::Music
+            } else {
+                Category::Sfx
+            },
+            tags: Vec::new(),
+            kind: GameAssetKind::sfx(Vec::new()),
+        });
+        if let Some(n) = &a.rename {
+            asset.name = n.trim().to_string();
+        }
+        if let Some(c) = &a.category {
+            asset.category = category(Some(c))?;
+        }
+        if let Some(t) = a.tags {
+            asset.tags = t;
+        }
+        let range = bar_range(&project, a.start_bar, a.end_bar)?
+            .map(|(start, end)| TimeRange { start, end });
+        let same_kind = existing
+            .as_ref()
+            .is_some_and(|e| e.kind.kind_name() == kind);
+        asset.kind = if is_loop {
+            let (old_range, old_intro) = match &asset.kind {
+                GameAssetKind::Loop { range, intro_start } if same_kind => {
+                    (Some(*range), *intro_start)
+                }
+                _ => (None, None),
+            };
+            let intro_start = match a.intro_start_bar {
+                Some(0.0) => None,
+                Some(b) => Some(bar_tick(&project, b)?),
+                None => old_intro,
+            };
+            GameAssetKind::Loop {
+                range: range.or(old_range).unwrap_or(project.loop_region),
+                intro_start,
+            }
+        } else {
+            let old = match &asset.kind {
+                k @ GameAssetKind::Sfx { .. } if same_kind => k.clone(),
+                _ => GameAssetKind::sfx(Vec::new()),
+            };
+            let GameAssetKind::Sfx {
+                variations: old_variations,
+                selection: old_selection,
+                pitch_semitones,
+                gain_db,
+                tail_seconds,
+                mono,
+            } = old
+            else {
+                unreachable!("old is an SFX set")
+            };
+            if let Some(c) = a.count
+                && !(1..=MAX_SFX_VARIATIONS).contains(&c)
+            {
+                return Err(format!("count must be 1 to {MAX_SFX_VARIATIONS}, got {c}"));
+            }
+            let variations = match (&a.variations, range) {
+                (Some(_), Some(_)) => {
+                    return Err("give variations, or start_bar, end_bar and count, not both".into());
+                }
+                (Some(_), None) if a.count.is_some() => {
+                    return Err(
+                        "count splits start_bar to end_bar; with variations, leave it out".into(),
+                    );
+                }
+                (Some(spans), None) => spans
+                    .iter()
+                    .map(|v| {
+                        bar_range(&project, Some(v.start_bar), Some(v.end_bar))
+                            .map(|r| r.map(|(start, end)| TimeRange { start, end }))
+                    })
+                    .collect::<Result<Option<Vec<_>>, _>>()?
+                    .unwrap_or_default(),
+                (None, Some(r)) => r.split(a.count.unwrap_or(1)),
+                (None, None) => match (a.count, old_variations.first(), old_variations.last()) {
+                    (Some(n), Some(first), Some(last)) => TimeRange {
+                        start: first.start,
+                        end: last.end,
+                    }
+                    .split(n),
+                    (_, None, _) | (_, _, None) => {
+                        return Err(
+                            "give start_bar and end_bar (and count), or variations, for \
+                                    the bars the SFX set is rendered from"
+                                .into(),
+                        );
+                    }
+                    (None, _, _) => old_variations,
+                },
+            };
+            GameAssetKind::Sfx {
+                variations,
+                selection: match &a.selection {
+                    Some(s) => selection(s)?,
+                    None => old_selection,
+                },
+                pitch_semitones: a
+                    .pitch_semitones
+                    .map_or(pitch_semitones, |r| RandomRange::new(r.min, r.max)),
+                gain_db: a
+                    .gain_db
+                    .map_or(gain_db, |r| RandomRange::new(r.min, r.max)),
+                tail_seconds: a.tail_seconds.unwrap_or(tail_seconds),
+                mono: a.mono.unwrap_or(mono),
+            }
+        };
+        let id = asset.id;
+        let label = if existing.is_some() {
+            format!("Edit game asset {}", asset.name)
+        } else {
+            format!("Add game {kind} {}", asset.name)
+        };
+        let cmd = if existing.is_some() {
+            Command::UpdateGameAsset {
+                asset: Box::new(asset),
+            }
+        } else {
+            Command::AddGameAsset {
+                asset: Box::new(asset),
+                index: None,
+            }
+        };
+        self.apply(&ctx, "game_asset_set", label, vec![cmd])?;
+        let project = self.session.project();
+        let saved = project.game.asset(id).ok_or("the asset was not saved")?;
+        Ok(json!({
+            "asset": game_asset_json(&project, saved),
+            "next": "game_export writes it for the game",
+        })
+        .to_string())
+    }
+
+    #[tool(
+        description = "Removes a game asset from the project. The next full game_export removes its files from the export folder.",
+        annotations(destructive_hint = true)
+    )]
+    async fn game_asset_remove(
+        &self,
+        Parameters(a): Parameters<GameAssetArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let project = self.session.project();
+        let asset = game_asset(&project, &a.name)?;
+        let name = asset.name.clone();
+        self.apply(
+            &ctx,
+            "game_asset_remove",
+            format!("Remove game asset {name}"),
+            vec![Command::RemoveGameAsset { id: asset.id }],
+        )?;
+        Ok(format!("Removed the game asset {name}."))
+    }
+
+    #[tool(
+        description = "Sets where game_export writes (such as the game's assets/audio folder; relative paths are relative to the project folder) and the WAV bit depth. Without arguments, shows the current settings."
+    )]
+    async fn game_export_settings(
+        &self,
+        Parameters(a): Parameters<GameExportSettingsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let view = self.session.view();
+        let game = &view.project.game;
+        if a.dir.is_some() || a.bits.is_some() {
+            let export_dir = match a.dir.as_deref().map(str::trim) {
+                None => game.export_dir.clone(),
+                Some("") => None,
+                Some(d) => {
+                    let given = Path::new(d);
+                    let full = if given.is_absolute() {
+                        given.to_path_buf()
+                    } else {
+                        match &view.path {
+                            Some(p) => normalize(&p.join(given)),
+                            None => {
+                                return Err("a relative folder is relative to the project \
+                                            folder; save the project first, or give an \
+                                            absolute folder"
+                                    .into());
+                            }
+                        }
+                    };
+                    self.policy.resolve(&full.to_string_lossy())?;
+                    Some(d.to_string())
+                }
+            };
+            let bits = a.bits.unwrap_or(game.bits);
+            self.apply(
+                &ctx,
+                "game_export_settings",
+                "Change game export".into(),
+                vec![Command::SetGameExport { export_dir, bits }],
+            )?;
+        }
+        let project = self.session.project();
+        let mut v = game_json(&project);
+        if let Some(assets) = v.as_object_mut() {
+            assets.remove("assets");
+        }
+        v["folder"] = json!(
+            self.session
+                .game_export_dir()
+                .ok()
+                .map(|d| normalize(&d).display().to_string())
+        );
+        Ok(v.to_string())
+    }
+
+    #[tool(
+        description = "Renders the project's game assets and writes them for the game: one WAV per loop and per SFX variation, and skyware-manifest.json, which sky-runtime loads. Exporting everything also removes assets the project no longer has and their old files. Then loads the export into the game runtime and checks every asset."
+    )]
+    async fn game_export(&self, Parameters(a): Parameters<GameExportArgs>) -> ToolResult {
+        let dir = match &a.dir {
+            Some(d) => self.policy.resolve(d)?,
+            None => {
+                let d = self.session.game_export_dir().map_err(|e| e.to_string())?;
+                self.policy.resolve(&normalize(&d).to_string_lossy())?
+            }
+        };
+        let session = self.session.clone();
+        blocking(move || {
+            let out = session
+                .export_game(&GameExportOptions {
+                    dir: Some(dir.clone()),
+                    only: a.only.clone().unwrap_or_default(),
+                })
+                .map_err(|e| e.to_string())?;
+            let assets: Vec<Value> = out
+                .assets
+                .iter()
+                .map(|x| {
+                    let mut v = json!({
+                        "name": x.asset.name(),
+                        "files": x.asset.files().map(|f| f.path.clone()).collect::<Vec<_>>(),
+                    });
+                    if let Some(seam) = &x.seam {
+                        v["seam"] = json!(seam);
+                    }
+                    v
+                })
+                .collect();
+            let mut v = json!({
+                "dir": out.dir.display().to_string(),
+                "manifest": out.manifest.display().to_string(),
+                "assets": assets,
+                "removed": out.removed,
+                "deletedFiles": out.deleted.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "credits": out.licenses.credits,
+                "licenseWarnings": out.licenses.warnings,
+            });
+            if a.verify != Some(false) {
+                let check = sky_check::check_game(&sky_check::GameOptions {
+                    dir,
+                    assets: a.only.unwrap_or_default(),
+                    seconds: 0.0,
+                    ..Default::default()
+                })?;
+                v["verified"] = json!({
+                    "passed": check.passed,
+                    "checks": check.checks,
+                });
+            }
+            Ok(v.to_string())
         })
         .await
     }
