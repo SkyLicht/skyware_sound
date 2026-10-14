@@ -1,5 +1,6 @@
 [package]
 name = "sky-game"
+description = "Game-audio exports and the manifests sky-runtime reads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,13 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+sky-core.workspace = true
+sky-dsp.workspace = true
+sky-io.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -1137,6 +1137,13 @@ dependencies = [
 [[package]]
 name = "sky-game"
 version = "0.1.0-alpha.1"
+dependencies = [
+ "sky-core",
+ "sky-dsp",
+ "sky-io",
+ "tempfile",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "sky-io"

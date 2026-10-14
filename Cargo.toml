@@ -45,7 +45,7 @@ sky-dsp = { path = "crates/sky-dsp" }
 sky-pattern = { path = "crates/sky-pattern" }
 sky-model = { path = "crates/sky-model" }
 sky-engine = { path = "crates/sky-engine" }
-sky-io = { path = "crates/sky-io" }
+sky-io = { path = "crates/sky-io", default-features = false }
 sky-game = { path = "crates/sky-game" }
 sky-session = { path = "crates/sky-session" }
 sky-mcp = { path = "crates/sky-mcp" }
