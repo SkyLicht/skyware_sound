@@ -1,0 +1,19 @@
+[package]
+name = "sky-core"
+description = "Shared IDs, time and tempo types, and the export manifest schema for Skyware Sound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+# Permissive on purpose: sky-runtime, which ships inside games, depends on it.
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

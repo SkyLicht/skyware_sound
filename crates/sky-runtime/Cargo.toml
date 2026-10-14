@@ -1,0 +1,14 @@
+[package]
+name = "sky-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+sky-core.workspace = true
+
+[lints]
+workspace = true

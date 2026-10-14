@@ -1,0 +1,4 @@
+/target
+*.skyproj/renders/
+*.skyproj/cache/
+.DS_Store
