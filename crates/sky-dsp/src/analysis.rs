@@ -220,8 +220,12 @@ pub struct SeamReport {
     /// RMS over the first 50 ms of the loop, in dBFS.
     pub level_after_db: f32,
     pub level_jump_db: f32,
-    /// `seamless`, `click` or `level_jump`.
+    /// `seamless` or `click`.
     pub verdict: &'static str,
+    /// Set when the level changes a lot across the seam. That is often the
+    /// music itself (a drum hit on beat one), so it is a hint, not a fault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
 }
 
 /// Checks how cleanly `[loop_start, loop_end)` repeats.
@@ -260,11 +264,13 @@ pub fn seam_check(audio: &AudioData, loop_start: usize, loop_end: usize) -> Seam
     let level_jump = (before_db - after_db).abs();
     let verdict = if jump > typical * 2.0 + 0.01 {
         "click"
-    } else if level_jump > 3.0 && before_db.max(after_db) > -50.0 {
-        "level_jump"
     } else {
         "seamless"
     };
+    let note = (level_jump > 6.0 && before_db.max(after_db) > -50.0).then_some(
+        "the level changes by more than 6 dB across the seam; fine if the music does that, \
+         but a fade at the end of the loop would make the repeat audible",
+    );
     let r3 = |x: f32| (x * 1000.0).round() / 1000.0;
     let r1 = |x: f32| (x * 10.0).round() / 10.0;
     SeamReport {
@@ -274,6 +280,7 @@ pub fn seam_check(audio: &AudioData, loop_start: usize, loop_end: usize) -> Seam
         level_after_db: r1(after_db),
         level_jump_db: r1(level_jump),
         verdict,
+        note,
     }
 }
 

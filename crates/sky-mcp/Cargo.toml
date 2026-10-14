@@ -1,5 +1,6 @@
 [package]
 name = "sky-mcp"
+description = "The MCP server: tools that let AI assistants read and edit the open project"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,27 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+sky-core.workspace = true
+sky-dsp.workspace = true
+sky-pattern.workspace = true
+sky-model.workspace = true
+sky-io.workspace = true
+sky-game.workspace = true
+sky-session.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+axum.workspace = true
+rmcp = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
+sky-runtime.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
