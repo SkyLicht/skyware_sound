@@ -3,7 +3,7 @@ name = "sky-core"
 description = "Shared IDs, time and tempo types, and the export manifest schema for Skyware Sound"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.88"
 authors.workspace = true
 repository.workspace = true
 # Permissive on purpose: sky-runtime, which ships inside games, depends on it.

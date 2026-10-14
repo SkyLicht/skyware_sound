@@ -32,7 +32,9 @@ default-members = [
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
-rust-version = "1.88"
+# egui and eframe 0.36 need 1.95. sky-core and sky-runtime, which games
+# embed, keep a lower minimum of their own.
+rust-version = "1.95"
 authors = ["Jorge Ortiz"]
 repository = "https://github.com/SkyLicht/skyware_sound"
 # Every crate is GPL-3.0-or-later except sky-core and sky-runtime, which set

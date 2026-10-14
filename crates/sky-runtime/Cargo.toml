@@ -3,7 +3,7 @@ name = "sky-runtime"
 description = "Plays Skyware Sound exports (seamless loops and randomized SFX containers) inside games"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.88"
 authors.workspace = true
 repository.workspace = true
 # Permissive on purpose: this crate ships inside games. It must never depend

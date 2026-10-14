@@ -39,6 +39,16 @@ jobs:
       # Release mode catches timing and overflow behaviour debug builds hide.
       - run: cargo test --release -p sky-engine -p sky-pattern -p sky-runtime
 
+  runtime-msrv:
+    name: sky-runtime on Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      # Games may use an older compiler than the app needs.
+      - run: cargo test -p sky-runtime -p sky-core
+
   licenses:
     name: Licenses
     runs-on: ubuntu-latest

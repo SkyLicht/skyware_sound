@@ -21,7 +21,7 @@ Not in the alpha yet: plugins (VST3/CLAP), audio recording, automation lanes, te
 
 ## Building
 
-You need Rust 1.88 or newer (`rustup update stable`).
+You need Rust 1.95 or newer (`rustup update stable`). `sky-runtime` and `sky-core`, which games embed, build with Rust 1.88.
 
 ```sh
 cargo build --release
@@ -29,7 +29,7 @@ cargo build --release
 ./target/release/skyware --help     # all commands and options
 ```
 
-On Linux the audio backend needs ALSA headers (`sudo apt install libasound2-dev`). The app targets Windows; Linux builds are used for development and CI.
+On Linux the audio backend needs ALSA headers (`sudo apt install libasound2-dev`) and the window needs `libxkbcommon-x11` at runtime. The app targets Windows; Linux builds are used for development and CI.
 
 Useful commands:
 
