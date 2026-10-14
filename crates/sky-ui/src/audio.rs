@@ -2,7 +2,7 @@
 //! The audio device: start, restart after a change or a lost device, and
 //! what to show about it.
 
-use sky_io::device::{AudioStream, OutputConfig, probe_output, start_output};
+use sky_io::device::{AudioStream, OutputConfig, OutputMode, probe_output, start_output};
 use sky_session::Session;
 
 /// Buffer sizes offered in the settings window; `None` is the device default.
@@ -51,18 +51,28 @@ impl AudioState {
                     stream.info.name,
                     stream.info.sample_rate
                 );
+                self.note = stream.note.clone();
                 self.stream = Some(stream);
                 self.error = None;
             }
-            Err(first) if self.config.buffer_frames.is_some() => {
-                // Some devices refuse fixed buffer sizes; try the default.
+            Err(first)
+                if self.config.buffer_frames.is_some()
+                    || !matches!(self.config.mode, OutputMode::Auto | OutputMode::Shared) =>
+            {
+                // Some devices refuse fixed buffer sizes or a mode; try the
+                // default in shared mode.
                 let mut fallback = self.config.clone();
                 fallback.buffer_frames = None;
+                fallback.mode = OutputMode::Shared;
                 match open(session, &fallback) {
                     Ok(stream) => {
                         self.note = Some(format!(
-                            "the device refused a {}-frame buffer, so it uses its default ({first})",
-                            self.config.buffer_frames.unwrap_or_default()
+                            "the device refused {}, so it uses its default in shared mode ({first})",
+                            match self.config.buffer_frames {
+                                Some(b) =>
+                                    format!("a {b}-frame buffer in {} mode", self.config.mode),
+                                None => format!("{} mode", self.config.mode),
+                            }
                         ));
                         self.stream = Some(stream);
                         self.error = None;
@@ -96,9 +106,18 @@ impl AudioState {
             Some(s) => {
                 let buffer = s
                     .info
-                    .buffer_frames
+                    .period_frames
+                    .or(s.info.buffer_frames)
                     .map_or_else(|| "default buffer".to_string(), |b| format!("{b} frames"));
-                format!("{} · {} Hz · {buffer}", s.info.name, s.info.sample_rate)
+                let mode = match s.info.mode {
+                    Some(OutputMode::LowLatency) => " · low-latency",
+                    Some(OutputMode::Exclusive) => " · exclusive",
+                    _ => "",
+                };
+                format!(
+                    "{} · {} Hz · {buffer}{mode}",
+                    s.info.name, s.info.sample_rate
+                )
             }
             None => match &self.error {
                 Some(e) => format!("No audio: {e}"),
@@ -116,6 +135,30 @@ fn open(session: &Session, config: &OutputConfig) -> Result<AudioStream, String>
 
 pub fn buffer_label(b: Option<u32>) -> String {
     b.map_or_else(|| "Device default".to_string(), |b| format!("{b} frames"))
+}
+
+pub fn mode_label(m: OutputMode) -> &'static str {
+    match m {
+        OutputMode::Auto => "Automatic",
+        OutputMode::Shared => "Shared",
+        OutputMode::LowLatency => "Low-latency shared",
+        OutputMode::Exclusive => "Exclusive",
+    }
+}
+
+pub fn mode_tip(m: OutputMode) -> &'static str {
+    match m {
+        OutputMode::Auto => {
+            "Shared mode, or a lower-latency mode when shared mode cannot run the buffer size"
+        }
+        OutputMode::Shared => "Through the Windows mixer; other programs keep playing",
+        OutputMode::LowLatency => {
+            "Through the Windows mixer at a shorter period, where the driver allows it"
+        }
+        OutputMode::Exclusive => {
+            "This app alone uses the device: the smallest buffers, but other programs go silent"
+        }
+    }
 }
 
 pub fn rate_label(r: Option<u32>) -> String {

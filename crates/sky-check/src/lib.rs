@@ -25,7 +25,7 @@ pub use device::{DeviceCheck, DeviceOptions, DeviceProgress, check_device};
 pub use loops::{
     Expected, LoopCheck, LoopOptions, MAX_BARS, check_loop, check_project, verify_loop_export,
 };
-pub use sky_io::device::OutputConfig;
+pub use sky_io::device::{OutputConfig, OutputMode};
 
 /// One verified property, with what was measured.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -92,13 +92,20 @@ impl Report {
         let mut out = Vec::new();
         if let Some(d) = &self.device {
             out.push(format!(
-                "{}  device: {} ({}), {} Hz, {:.1} s",
+                "{}  device: {} ({}{}), {} Hz, {:.1} s",
                 mark(d.passed),
                 d.device,
                 d.host,
+                d.mode
+                    .as_deref()
+                    .map(|m| format!(", {m} mode"))
+                    .unwrap_or_default(),
                 d.sample_rate,
                 d.seconds
             ));
+            if let Some(n) = &d.note {
+                out.push(format!("      note: {n}"));
+            }
             for c in &d.checks {
                 out.push(format!("      {} {}: {}", mark(c.passed), c.name, c.detail));
             }

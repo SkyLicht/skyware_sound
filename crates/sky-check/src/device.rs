@@ -54,6 +54,14 @@ pub struct DeviceProgress {
 pub struct DeviceCheck {
     pub passed: bool,
     pub host: String,
+    /// How the stream shared the device: shared, low-latency or exclusive.
+    pub mode: Option<String>,
+    /// The mode asked for, where it differs from the one used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_mode: Option<String>,
+    /// Why the stream ran differently from what was asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub device: String,
     pub sample_rate: u32,
     pub channels: u16,
@@ -68,6 +76,9 @@ pub struct DeviceCheck {
     pub buffer_ms: f64,
     /// Whether every callback was at most the requested size.
     pub buffer_honored: Option<bool>,
+    /// The shortest period any mode can run the device at, where Windows
+    /// tells. A request below it passes when the device ran at it.
+    pub device_min_frames: Option<u32>,
     /// The device's whole buffer, where the host shows it (WASAPI).
     pub device_buffer_frames: Option<u32>,
     pub device_buffer_ms: Option<f64>,
@@ -96,6 +107,28 @@ pub struct DeviceCheck {
     /// True when the device got silence while the engine ran.
     pub silent: bool,
     pub checks: Vec<Check>,
+}
+
+/// How a stream's callbacks compare with the buffer size asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Buffer {
+    /// Every callback was at most the request.
+    Honored,
+    /// The request is below the device's shortest period in any mode, and
+    /// the stream ran at that period.
+    AtFloor(u32),
+    NotHonored,
+}
+
+fn buffer_verdict(requested: u32, callbacks: u64, max_frames: u32, floor: Option<u32>) -> Buffer {
+    if callbacks == 0 {
+        return Buffer::NotHonored;
+    }
+    match floor {
+        _ if max_frames <= requested => Buffer::Honored,
+        Some(f) if requested < f && max_frames <= f => Buffer::AtFloor(f),
+        _ => Buffer::NotHonored,
+    }
 }
 
 fn ms(d: Duration) -> f64 {
@@ -187,6 +220,7 @@ fn run(
     let overruns = shared.overruns.load(Relaxed) - overruns_before;
     let _ = session.stop();
     let dev = stream.info.clone();
+    let note = stream.note.clone();
     drop(stream);
 
     let requested = opts.output.buffer_frames;
@@ -198,12 +232,17 @@ fn run(
     };
     let dropouts = xruns + s.late;
     let buffer_ms = s.max_frames as f64 / sr * 1000.0;
+    let mode = dev.mode.map(|m| m.to_string());
+    let in_mode = mode
+        .as_deref()
+        .map(|m| format!(" in {m} mode"))
+        .unwrap_or_default();
     let mut checks = vec![
         Check::new(
             "callbacks",
             s.callbacks > 0,
             format!(
-                "{} callbacks in {:.1} s, {} to {} frames each, at most {:.2} ms apart{}",
+                "{} callbacks in {:.1} s{in_mode}, {} to {} frames each, at most {:.2} ms apart{}",
                 s.callbacks,
                 elapsed.as_secs_f64(),
                 s.min_frames,
@@ -236,24 +275,37 @@ fn run(
             ),
         ),
     ];
-    if let (Some(r), Some(ok)) = (requested, honored) {
-        checks.push(Check::new(
-            "buffer size",
-            ok,
-            if ok {
+    // The device's floor, counted at the stream's rate.
+    let floor = periods.map(|p| {
+        (u64::from(p.shortest()) * u64::from(dev.sample_rate))
+            .div_ceil(u64::from(p.sample_rate.max(1))) as u32
+    });
+    if let Some(r) = requested {
+        let verdict = buffer_verdict(r, s.callbacks, s.max_frames, floor);
+        let asked = format!("asked for {r} frames ({:.2} ms)", r as f64 / sr * 1000.0);
+        let detail = match verdict {
+            Buffer::Honored => {
                 format!(
-                    "asked for {r} frames ({:.2} ms) and the device used at most {} frames",
-                    r as f64 / sr * 1000.0,
+                    "{asked} and the device used at most {} frames",
                     s.max_frames
                 )
-            } else {
+            }
+            Buffer::AtFloor(f) => format!(
+                "{asked}, below the {f} frames ({:.2} ms) this device can do at the least in \
+                 any mode, and {}{in_mode} ran at that: up to {} frames",
+                f as f64 / sr * 1000.0,
+                dev.host,
+                s.max_frames
+            ),
+            Buffer::NotHonored => {
                 let mut detail = format!(
-                    "asked for {r} frames ({:.2} ms) but {} called back with up to {} \
-                     frames ({buffer_ms:.2} ms); the request was not honored",
-                    r as f64 / sr * 1000.0,
-                    dev.host,
-                    s.max_frames
+                    "{asked} but {}{in_mode} called back with up to {} frames \
+                     ({buffer_ms:.2} ms); the request was not honored",
+                    dev.host, s.max_frames
                 );
+                if let Some(n) = &note {
+                    detail.push_str(&format!(" ({n})"));
+                }
                 if let Some(p) = periods {
                     let f = |frames: u32| {
                         format!(
@@ -271,12 +323,21 @@ fn run(
                     ));
                 }
                 detail
-            },
+            }
+        };
+        checks.push(Check::new(
+            "buffer size",
+            verdict != Buffer::NotHonored,
+            detail,
         ));
     }
+    let asked = opts.output.mode.to_string();
     Ok(DeviceCheck {
         passed: checks.iter().all(|c| c.passed),
         host: dev.host,
+        requested_mode: (mode.as_deref() != Some(asked.as_str())).then_some(asked),
+        mode,
+        note,
         device: dev.name,
         sample_rate: dev.sample_rate,
         channels: dev.channels,
@@ -291,6 +352,7 @@ fn run(
         },
         buffer_ms: round2(buffer_ms),
         buffer_honored: honored,
+        device_min_frames: floor,
         device_buffer_frames: s.device_buffer_frames,
         device_buffer_ms: s
             .device_buffer_frames
@@ -311,4 +373,28 @@ fn run(
         silent: opts.output.silent,
         checks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Buffer, buffer_verdict};
+
+    #[test]
+    fn a_buffer_passes_at_the_request_or_at_the_device_floor() {
+        // S/PDIF: 128 asked, 128 used.
+        assert_eq!(buffer_verdict(128, 100, 128, Some(128)), Buffer::Honored);
+        // The headset in exclusive mode: nothing goes below 144.
+        assert_eq!(
+            buffer_verdict(128, 100, 144, Some(144)),
+            Buffer::AtFloor(144)
+        );
+        // The headset in shared mode: 480 when 144 was possible.
+        assert_eq!(buffer_verdict(128, 100, 480, Some(144)), Buffer::NotHonored);
+        // Unknown floor (another host): only the request counts.
+        assert_eq!(buffer_verdict(128, 100, 144, None), Buffer::NotHonored);
+        // A request the device could meet is not excused by the floor.
+        assert_eq!(buffer_verdict(256, 100, 480, Some(144)), Buffer::NotHonored);
+        // No callbacks at all never passes.
+        assert_eq!(buffer_verdict(128, 0, 0, Some(144)), Buffer::NotHonored);
+    }
 }

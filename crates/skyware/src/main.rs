@@ -227,6 +227,7 @@ fn output_config(output: &OutputArgs) -> sky_io::device::OutputConfig {
         device: output.device.clone(),
         sample_rate: output.sample_rate,
         buffer_frames: output.buffer,
+        mode: output.mode.into(),
         asio: output.asio,
         silent: false,
     }
@@ -283,15 +284,24 @@ fn start_audio(
     match sky_io::device::start_output(cfg, engine) {
         Ok(stream) => {
             tracing::info!(
-                "audio: {} on {}, {} Hz, buffer {}",
+                "audio: {} on {}{}, {} Hz, buffer {}",
                 stream.info.name,
                 stream.info.host,
+                stream
+                    .info
+                    .mode
+                    .map(|m| format!(" ({m} mode)"))
+                    .unwrap_or_default(),
                 stream.info.sample_rate,
                 stream
                     .info
-                    .buffer_frames
+                    .period_frames
+                    .or(stream.info.buffer_frames)
                     .map_or("default".to_string(), |b| b.to_string())
             );
+            if let Some(note) = &stream.note {
+                tracing::warn!("{note}");
+            }
             Some(stream)
         }
         Err(e) => {
@@ -427,7 +437,7 @@ fn system_check(plan: &CheckPlan) -> anyhow::Result<()> {
             ..Default::default()
         };
         say(format!(
-            "Playing \"{}\" through the {} for {:.1} min at {}{}...",
+            "Playing \"{}\" through the {} for {:.1} min at {}, {} mode{}...",
             session.project().name,
             plan.output
                 .device
@@ -437,6 +447,7 @@ fn system_check(plan: &CheckPlan) -> anyhow::Result<()> {
             opts.output
                 .buffer_frames
                 .map_or("the default buffer".to_string(), |b| format!("{b} frames")),
+            opts.output.mode,
             if plan.silent { ", silently" } else { "" }
         ));
         sky_check::check_device(&session, &opts, &mut |p| {

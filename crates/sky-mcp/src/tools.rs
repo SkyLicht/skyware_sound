@@ -675,6 +675,11 @@ pub struct SystemCheckArgs {
     pub device_seconds: Option<f64>,
     /// Buffer size to ask the device for, in frames. Default 128.
     pub buffer_frames: Option<u32>,
+    /// How to share the device with other programs on Windows: auto
+    /// (default; low-latency shared or exclusive mode when shared mode
+    /// cannot run the buffer), shared, low-latency or exclusive. Exclusive
+    /// mode silences other programs while the check plays.
+    pub mode: Option<String>,
     /// Let the device check be heard. Default false: the engine runs as
     /// usual but the device gets silence.
     pub audible: Option<bool>,
@@ -1899,7 +1904,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Checks this machine and build for game audio work, without touching the open project. Plays a test loop through the default audio device at a buffer size (silently unless audible) and counts dropouts and overruns, and whether the device really used that buffer size; then exports a 16-bar test loop and verifies the file's length, manifest, seam and seamless playback in the game runtime. Takes device_seconds plus a few seconds."
+        description = "Checks this machine and build for game audio work, without touching the open project. Plays a test loop through the default audio device at a buffer size (silently unless audible) and counts dropouts and overruns, and whether the device really used that buffer size, in the output mode asked for (auto by default: exclusive or low-latency shared mode when shared mode cannot run the buffer); then exports a 16-bar test loop and verifies the file's length, manifest, seam and seamless playback in the game runtime. Takes device_seconds plus a few seconds."
     )]
     async fn system_check(&self, Parameters(a): Parameters<SystemCheckArgs>) -> ToolResult {
         let seconds = a.device_seconds.unwrap_or(20.0);
@@ -1920,6 +1925,10 @@ impl SkywareMcp {
         if !(16..=8_192).contains(&buffer) {
             return Err(format!("buffer_frames must be 16 to 8192, got {buffer}"));
         }
+        let mode = match a.mode.as_deref() {
+            Some(m) => m.parse::<sky_check::OutputMode>()?,
+            None => sky_check::OutputMode::Auto,
+        };
         let dir = a
             .dir
             .as_deref()
@@ -1934,6 +1943,7 @@ impl SkywareMcp {
                 let opts = sky_check::DeviceOptions {
                     output: sky_check::OutputConfig {
                         buffer_frames: Some(buffer),
+                        mode,
                         silent,
                         ..Default::default()
                     },

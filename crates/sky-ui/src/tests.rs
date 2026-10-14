@@ -611,9 +611,14 @@ fn changing_audio_settings_restarts_audio() {
     );
     if let Some(s) = h.app.dialogs.settings.as_mut() {
         s.buffer = Some(256);
+        s.mode = sky_io::device::OutputMode::Exclusive;
     }
     h.frames(2);
     assert_eq!(h.app.audio.config.buffer_frames, Some(256));
+    assert_eq!(
+        h.app.audio.config.mode,
+        sky_io::device::OutputMode::Exclusive
+    );
     // There is no device here, so the restart reports why.
     if h.app.audio.stream.is_none() {
         assert!(h.app.audio.error.is_some());
