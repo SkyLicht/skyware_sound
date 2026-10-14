@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +58,35 @@ pub struct OutputArgs {
     /// Use ASIO instead of WASAPI (Windows builds with the asio feature).
     #[arg(long)]
     pub asio: bool,
+    /// How to share the device with other programs (WASAPI). auto picks
+    /// low-latency shared or exclusive mode when shared mode cannot run
+    /// the --buffer asked for.
+    #[arg(long, value_enum, default_value_t = Mode::Auto)]
+    pub mode: Mode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Mode {
+    /// Shared mode, or a lower-latency mode when --buffer needs one.
+    Auto,
+    /// Through the Windows mixer at its usual period (10 ms on most devices).
+    Shared,
+    /// Through the Windows mixer at a shorter period, where the driver allows it.
+    LowLatency,
+    /// Take the device for this app alone: the shortest buffers, but other
+    /// programs go silent.
+    Exclusive,
+}
+
+impl From<Mode> for sky_io::device::OutputMode {
+    fn from(m: Mode) -> Self {
+        match m {
+            Mode::Auto => Self::Auto,
+            Mode::Shared => Self::Shared,
+            Mode::LowLatency => Self::LowLatency,
+            Mode::Exclusive => Self::Exclusive,
+        }
+    }
 }
 
 #[derive(Subcommand)]

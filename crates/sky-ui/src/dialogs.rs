@@ -11,6 +11,7 @@ use egui::{
 use sky_core::Ticks;
 use sky_core::manifest::{Asset, Category};
 use sky_io::WavFormat;
+use sky_io::device::OutputMode;
 use sky_model::Origin;
 use sky_session::LoopExportOptions;
 
@@ -111,6 +112,7 @@ pub struct SettingsDialog {
     pub device: Option<String>,
     pub buffer: Option<u32>,
     pub rate: Option<u32>,
+    pub mode: OutputMode,
 }
 
 #[derive(Default)]
@@ -438,6 +440,7 @@ impl App {
             device: cfg.device.clone(),
             buffer: cfg.buffer_frames,
             rate: cfg.sample_rate,
+            mode: cfg.mode,
         });
         self.spawn_device_list(ctx);
     }
@@ -999,6 +1002,18 @@ fn settings_window(app: &mut App, ctx: &Context) {
                             }
                         });
                     ui.end_row();
+                    ui.label("Mode");
+                    ComboBox::from_id_salt("audio_mode")
+                        .selected_text(audio::mode_label(s.mode))
+                        .show_ui(ui, |ui| {
+                            for m in OutputMode::ALL {
+                                ui.selectable_value(&mut s.mode, m, audio::mode_label(m))
+                                    .on_hover_text(audio::mode_tip(m));
+                            }
+                        })
+                        .response
+                        .on_hover_text(audio::mode_tip(s.mode));
+                    ui.end_row();
                     ui.label("Now");
                     ui.label(RichText::new(&status).color(if running { theme::TEXT_WEAK } else { theme::WARN }));
                     ui.end_row();
@@ -1023,7 +1038,8 @@ fn settings_window(app: &mut App, ctx: &Context) {
     // A choice that differs from the running setup restarts audio at once.
     let cfg = &app.audio.config;
     if app.dialogs.settings.as_ref().is_some_and(|s| {
-        (&s.device, s.rate, s.buffer) != (&cfg.device, cfg.sample_rate, cfg.buffer_frames)
+        (&s.device, s.rate, s.buffer, s.mode)
+            != (&cfg.device, cfg.sample_rate, cfg.buffer_frames, cfg.mode)
     }) {
         apply = true;
     }
@@ -1035,6 +1051,7 @@ fn settings_window(app: &mut App, ctx: &Context) {
         app.audio.config.device = s.device.clone();
         app.audio.config.sample_rate = s.rate;
         app.audio.config.buffer_frames = s.buffer;
+        app.audio.config.mode = s.mode;
         app.start_audio();
         if app.audio.stream.is_some() {
             app.info(format!("Audio: {}", app.audio.describe()));

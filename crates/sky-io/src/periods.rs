@@ -9,12 +9,32 @@ pub struct DevicePeriods {
     pub sample_rate: u32,
     /// The period of the shared-mode audio engine by default.
     pub shared_default: u32,
-    /// The smallest period a low-latency shared-mode stream can ask for
-    /// (Windows 10 and later, `IAudioClient3`), and the step above it.
+    /// The smallest and largest period a low-latency shared-mode stream
+    /// can ask for (Windows 10 and later, `IAudioClient3`), and the step
+    /// between them.
     pub shared_min: u32,
+    pub shared_max: u32,
     pub shared_step: u32,
     /// The smallest period in exclusive mode.
     pub exclusive_min: u32,
+}
+
+impl DevicePeriods {
+    /// Whether the driver lets a shared-mode stream run at a shorter period
+    /// than the default.
+    pub fn has_low_latency(&self) -> bool {
+        self.shared_min > 0 && self.shared_min < self.shared_default
+    }
+
+    /// The period a low-latency shared-mode stream uses for a request of
+    /// `frames`: the largest one the driver allows that is not longer, or
+    /// the shortest it allows if the request is below that.
+    pub fn low_latency_period(&self, frames: u32) -> u32 {
+        let min = self.shared_min.max(1);
+        let max = self.shared_max.max(min);
+        let step = self.shared_step.max(1);
+        (frames / step * step).clamp(min, max)
+    }
 }
 
 /// The periods of the output device whose name contains `name`, or of the
@@ -42,7 +62,7 @@ pub fn device_periods(name: Option<&str>) -> Option<DevicePeriods> {
 }
 
 #[cfg(windows)]
-mod wasapi {
+pub(crate) mod wasapi {
     use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName;
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::Audio::{
@@ -57,7 +77,7 @@ mod wasapi {
 
     use super::DevicePeriods;
 
-    unsafe fn friendly_name(device: &IMMDevice) -> Option<String> {
+    pub(crate) unsafe fn friendly_name(device: &IMMDevice) -> Option<String> {
         unsafe {
             let store = device.OpenPropertyStore(STGM_READ).ok()?;
             let key = &DEVPKEY_Device_FriendlyName as *const _ as *const PROPERTYKEY;
@@ -69,7 +89,9 @@ mod wasapi {
         }
     }
 
-    unsafe fn find(name: Option<&str>) -> Option<IMMDevice> {
+    /// The output device whose name contains `name` (lowercase), or the
+    /// default output device.
+    pub(crate) unsafe fn find(name: Option<&str>) -> Option<IMMDevice> {
         unsafe {
             let devices: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
@@ -110,6 +132,7 @@ mod wasapi {
                 sample_rate,
                 shared_default: default,
                 shared_min: min,
+                shared_max: max,
                 shared_step: step,
                 exclusive_min,
             })

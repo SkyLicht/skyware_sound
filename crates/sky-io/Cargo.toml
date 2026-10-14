@@ -28,15 +28,17 @@ assert_no_alloc.workspace = true
 # "realtime" registers the audio thread with MMCSS on Windows.
 cpal = { workspace = true, optional = true, features = ["realtime"] }
 
-# Asks Windows which buffer periods a device supports. cpal already
-# depends on this version.
+# Asks Windows which buffer periods a device supports, and plays in
+# exclusive and low-latency shared mode. cpal already depends on this version.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", optional = true, features = [
     "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_Media_Audio",
+    "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
     "Win32_System_Variant",
 ] }
 

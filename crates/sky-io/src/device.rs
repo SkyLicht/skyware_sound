@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Audio output through cpal: WASAPI on Windows (ASIO with the `asio`
-//! feature), ALSA or PipeWire on Linux, Core Audio on macOS.
+//! feature), ALSA or PipeWire on Linux, Core Audio on macOS. On Windows a
+//! WASAPI output of our own adds what cpal lacks: exclusive mode and
+//! low-latency shared mode (see [`OutputMode`]).
+
+#[cfg(windows)]
+mod wasapi;
 
 use std::cell::Cell;
+use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -12,6 +19,93 @@ use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample, StreamConfig};
 use sky_engine::{Engine, EngineShared};
 
 use crate::codec::IoError;
+use crate::periods::DevicePeriods;
+
+/// How the output shares a WASAPI device with other programs. Other hosts
+/// (ASIO, Linux, macOS) have one way and take only `Auto` or `Shared`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OutputMode {
+    /// Shared mode, unless the requested buffer is shorter than shared mode
+    /// can go: then low-latency shared mode if the driver allows the
+    /// buffer, otherwise exclusive mode. Falls back to shared mode if the
+    /// device refuses.
+    #[default]
+    Auto,
+    /// Through the Windows mixer at its usual period, 10 ms on most devices.
+    Shared,
+    /// Through the Windows mixer at a shorter period, where the driver
+    /// allows one (Windows 10 and later). Other programs keep playing.
+    LowLatency,
+    /// The app takes the device for itself: the shortest buffers the
+    /// hardware can do, but other programs go silent while it plays.
+    Exclusive,
+}
+
+impl OutputMode {
+    pub const ALL: [OutputMode; 4] = [
+        OutputMode::Auto,
+        OutputMode::Shared,
+        OutputMode::LowLatency,
+        OutputMode::Exclusive,
+    ];
+
+    /// The name used on the command line and in reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            OutputMode::Auto => "auto",
+            OutputMode::Shared => "shared",
+            OutputMode::LowLatency => "low-latency",
+            OutputMode::Exclusive => "exclusive",
+        }
+    }
+}
+
+impl fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for OutputMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        OutputMode::ALL
+            .into_iter()
+            .find(|m| m.name() == s.trim().to_lowercase().replace([' ', '_'], "-"))
+            .ok_or_else(|| {
+                format!("the mode must be auto, shared, low-latency or exclusive, not {s:?}")
+            })
+    }
+}
+
+/// The mode [`OutputMode::Auto`] picks for a buffer of `frames` at
+/// `sample_rate` on a device with `periods`: shared mode when it can run
+/// that buffer, else low-latency shared mode when that can, else whichever
+/// of exclusive and low-latency shared mode goes lower.
+pub fn auto_mode(
+    frames: Option<u32>,
+    sample_rate: u32,
+    periods: Option<&DevicePeriods>,
+) -> OutputMode {
+    let (Some(frames), Some(p)) = (frames, periods) else {
+        return OutputMode::Shared;
+    };
+    // The periods are counted at the device's mix rate.
+    let wanted = (frames as u64 * p.sample_rate as u64 / sample_rate.max(1) as u64) as u32;
+    if wanted >= p.shared_default {
+        return OutputMode::Shared;
+    }
+    // Low-latency shared mode runs at the mix rate only.
+    let low =
+        (p.has_low_latency() && sample_rate == p.sample_rate).then(|| p.low_latency_period(wanted));
+    match low {
+        Some(period) if period <= wanted => OutputMode::LowLatency,
+        Some(period) if p.exclusive_min >= period => OutputMode::LowLatency,
+        _ if p.exclusive_min > 0 && p.exclusive_min < p.shared_default => OutputMode::Exclusive,
+        _ => OutputMode::Shared,
+    }
+}
 
 /// What the caller asks for. `None` means the device's default.
 #[derive(Clone, Debug, Default)]
@@ -19,8 +113,12 @@ pub struct OutputConfig {
     /// Part of a device name to look for; the default device otherwise.
     pub device: Option<String>,
     pub sample_rate: Option<u32>,
-    /// Requested buffer size in frames, such as 128.
+    /// Requested buffer size in frames, such as 128. Without one, exclusive
+    /// mode runs at the device's default period and low-latency shared mode
+    /// at the shortest the driver allows.
     pub buffer_frames: Option<u32>,
+    /// How to share the device with other programs.
+    pub mode: OutputMode,
     /// Use the ASIO host instead of WASAPI (Windows, `asio` feature).
     pub asio: bool,
     /// Run the engine as usual but send silence to the device, so a test
@@ -35,8 +133,14 @@ pub struct DeviceInfo {
     pub name: String,
     pub sample_rate: u32,
     pub channels: u16,
+    /// The buffer size asked for.
     pub buffer_frames: Option<u32>,
     pub sample_format: String,
+    /// The mode a running stream uses; `None` before it starts and on ASIO.
+    pub mode: Option<OutputMode>,
+    /// The period the device really runs at, where the host tells: in
+    /// low-latency shared and exclusive mode.
+    pub period_frames: Option<u32>,
 }
 
 fn host(asio: bool) -> Result<cpal::Host, IoError> {
@@ -115,13 +219,26 @@ pub fn probe_output(config: &OutputConfig) -> Result<DeviceInfo, IoError> {
         channels: supported.channels(),
         buffer_frames: config.buffer_frames,
         sample_format: format!("{:?}", supported.sample_format()),
+        mode: None,
+        period_frames: None,
     })
+}
+
+/// What plays a stream, held only to be dropped when the stream stops.
+#[allow(dead_code)]
+enum Backend {
+    Cpal(cpal::Stream),
+    #[cfg(windows)]
+    Wasapi(wasapi::WasapiStream),
 }
 
 /// A running output stream. Dropping it stops playback.
 pub struct AudioStream {
-    _stream: cpal::Stream,
+    _stream: Backend,
     pub info: DeviceInfo,
+    /// Why the stream runs differently from what was asked, such as a mode
+    /// the device refused.
+    pub note: Option<String>,
     lost: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
 }
@@ -353,8 +470,134 @@ impl Callback {
 
 /// Opens the device and starts pulling audio from `engine`. The engine must
 /// have been created for `info.sample_rate` (see [`probe_output`]).
-pub fn start_output(config: &OutputConfig, mut engine: Engine) -> Result<AudioStream, IoError> {
+pub fn start_output(config: &OutputConfig, engine: Engine) -> Result<AudioStream, IoError> {
     let (device, supported, host) = pick(config)?;
+    if host != "Wasapi" {
+        return match config.mode {
+            OutputMode::Auto | OutputMode::Shared => {
+                let mode = (host != "Asio").then_some(OutputMode::Shared);
+                start_cpal(config, device, supported, host, mode, engine)
+            }
+            other => Err(IoError::Device(format!(
+                "{other} mode is for WASAPI on Windows; {host} has no such mode"
+            ))),
+        };
+    }
+    #[cfg(windows)]
+    {
+        start_wasapi(config, device, supported, host, engine)
+    }
+    #[cfg(not(windows))]
+    {
+        start_cpal(
+            config,
+            device,
+            supported,
+            host,
+            Some(OutputMode::Shared),
+            engine,
+        )
+    }
+}
+
+/// WASAPI in the mode asked for, through cpal for shared mode and our own
+/// output for the others. In auto mode a device that refuses the chosen
+/// mode gets the next best one, down to shared mode.
+#[cfg(windows)]
+fn start_wasapi(
+    config: &OutputConfig,
+    device: cpal::Device,
+    supported: cpal::SupportedStreamConfig,
+    host: String,
+    mut engine: Engine,
+) -> Result<AudioStream, IoError> {
+    let sample_rate = supported.sample_rate();
+    let auto = config.mode == OutputMode::Auto;
+    let periods = (auto && config.buffer_frames.is_some())
+        .then(|| crate::periods::device_periods(config.device.as_deref()))
+        .flatten();
+    let first = if auto {
+        auto_mode(config.buffer_frames, sample_rate, periods.as_ref())
+    } else {
+        config.mode
+    };
+    // The modes to try before shared mode, best first.
+    let mut tries = Vec::new();
+    if first != OutputMode::Shared {
+        tries.push(first);
+    }
+    if auto
+        && first == OutputMode::Exclusive
+        && periods.as_ref().is_some_and(|p| p.has_low_latency())
+    {
+        tries.push(OutputMode::LowLatency);
+    }
+    let mut refused: Vec<String> = Vec::new();
+    for mode in tries {
+        let lost = Arc::new(AtomicBool::new(false));
+        let request = wasapi::Request {
+            device: config.device.clone(),
+            mode,
+            sample_rate,
+            frames: config.buffer_frames,
+            silent: config.silent,
+        };
+        match wasapi::start(request, engine, lost.clone()) {
+            Ok(opened) => {
+                let note = (!refused.is_empty())
+                    .then(|| format!("{}, so audio runs in {mode} mode", refused.join("; ")));
+                return Ok(AudioStream {
+                    info: DeviceInfo {
+                        host,
+                        name: opened.name,
+                        sample_rate,
+                        channels: opened.channels,
+                        buffer_frames: config.buffer_frames,
+                        sample_format: opened.sample_format,
+                        mode: Some(mode),
+                        period_frames: Some(opened.period_frames),
+                    },
+                    _stream: Backend::Wasapi(opened.stream),
+                    note,
+                    lost,
+                    stats: opened.stats,
+                });
+            }
+            Err((e, Some(back))) if auto => {
+                tracing::warn!("{mode} mode failed: {e}");
+                refused.push(format!("{mode} mode failed ({e})"));
+                engine = *back;
+            }
+            Err((e, _)) => return Err(e),
+        }
+    }
+    // Shared mode, as asked or as the last resort in auto mode.
+    let mut stream = start_cpal(
+        config,
+        device,
+        supported,
+        host,
+        Some(OutputMode::Shared),
+        engine,
+    )?;
+    if !refused.is_empty() {
+        stream.note = Some(format!(
+            "{}, so audio runs in shared mode",
+            refused.join("; ")
+        ));
+    }
+    Ok(stream)
+}
+
+/// A stream through cpal: shared mode on WASAPI, or another host.
+fn start_cpal(
+    config: &OutputConfig,
+    device: cpal::Device,
+    supported: cpal::SupportedStreamConfig,
+    host: String,
+    mode: Option<OutputMode>,
+    mut engine: Engine,
+) -> Result<AudioStream, IoError> {
     let sample_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
     let mut stream_config: StreamConfig = supported.config();
@@ -407,7 +650,7 @@ pub fn start_output(config: &OutputConfig, mut engine: Engine) -> Result<AudioSt
     .map_err(|e| IoError::Device(e.to_string()))?;
     stream.play().map_err(|e| IoError::Device(e.to_string()))?;
     Ok(AudioStream {
-        _stream: stream,
+        _stream: Backend::Cpal(stream),
         info: DeviceInfo {
             host,
             name: device_name(&device),
@@ -415,7 +658,10 @@ pub fn start_output(config: &OutputConfig, mut engine: Engine) -> Result<AudioSt
             channels: channels as u16,
             buffer_frames: config.buffer_frames,
             sample_format: format!("{format:?}"),
+            mode,
+            period_frames: None,
         },
+        note: None,
         lost,
         stats,
     })
@@ -454,4 +700,240 @@ where
         on_error,
         None,
     )
+}
+
+/// Sample formats a device buffer can take, in the order exclusive mode
+/// tries them. Windows only, but kept here so it is tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pcm {
+    F32,
+    /// 32-bit integers, of which the device may use only the top 24 bits.
+    I32,
+    /// Packed 24-bit integers, three bytes each.
+    I24,
+    I16,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Pcm {
+    pub(crate) fn bytes(self) -> usize {
+        match self {
+            Pcm::F32 | Pcm::I32 => 4,
+            Pcm::I24 => 3,
+            Pcm::I16 => 2,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Pcm::F32 => "F32",
+            Pcm::I32 => "I32",
+            Pcm::I24 => "I24",
+            Pcm::I16 => "I16",
+        }
+    }
+
+    /// Writes `src` to `dst` as little-endian samples of this format,
+    /// clipping at full scale. `dst` holds `bytes()` per sample.
+    #[inline]
+    pub(crate) fn write(self, src: &[f32], dst: &mut [u8]) {
+        let full = |s: f32, max: f64| (f64::from(s.clamp(-1.0, 1.0)) * max).round();
+        match self {
+            Pcm::F32 => {
+                for (s, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
+                    d.copy_from_slice(&s.to_le_bytes());
+                }
+            }
+            Pcm::I32 => {
+                for (s, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
+                    d.copy_from_slice(&(full(*s, 2_147_483_647.0) as i32).to_le_bytes());
+                }
+            }
+            Pcm::I24 => {
+                for (s, d) in src.iter().zip(dst.chunks_exact_mut(3)) {
+                    let v = (full(*s, 8_388_607.0) as i32).to_le_bytes();
+                    d.copy_from_slice(&v[..3]);
+                }
+            }
+            Pcm::I16 => {
+                for (s, d) in src.iter().zip(dst.chunks_exact_mut(2)) {
+                    d.copy_from_slice(&(full(*s, 32_767.0) as i16).to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// `frames` at `sample_rate` in the 100-nanosecond units WASAPI counts in.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn frames_to_hns(frames: u32, sample_rate: u32) -> i64 {
+    (f64::from(frames) * 10_000_000.0 / f64::from(sample_rate.max(1))).round() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headset() -> DevicePeriods {
+        // What Windows reported for the G522 headset.
+        DevicePeriods {
+            sample_rate: 48_000,
+            shared_default: 480,
+            shared_min: 480,
+            shared_max: 480,
+            shared_step: 480,
+            exclusive_min: 144,
+        }
+    }
+
+    fn onboard() -> DevicePeriods {
+        // A typical HD Audio driver with low-latency shared mode.
+        DevicePeriods {
+            sample_rate: 48_000,
+            shared_default: 480,
+            shared_min: 128,
+            shared_max: 480,
+            shared_step: 32,
+            exclusive_min: 144,
+        }
+    }
+
+    #[test]
+    fn modes_parse_from_their_names() {
+        for m in OutputMode::ALL {
+            assert_eq!(m.name().parse::<OutputMode>(), Ok(m));
+            assert_eq!(m.to_string(), m.name());
+        }
+        assert_eq!("Low Latency".parse(), Ok(OutputMode::LowLatency));
+        assert_eq!("EXCLUSIVE".parse(), Ok(OutputMode::Exclusive));
+        assert!("asio".parse::<OutputMode>().is_err());
+    }
+
+    #[test]
+    fn auto_stays_shared_when_shared_mode_is_enough() {
+        assert_eq!(
+            auto_mode(None, 48_000, Some(&headset())),
+            OutputMode::Shared
+        );
+        assert_eq!(
+            auto_mode(Some(512), 48_000, Some(&headset())),
+            OutputMode::Shared
+        );
+        assert_eq!(
+            auto_mode(Some(480), 48_000, Some(&onboard())),
+            OutputMode::Shared
+        );
+        // Nothing known about the device: shared mode.
+        assert_eq!(auto_mode(Some(128), 48_000, None), OutputMode::Shared);
+    }
+
+    #[test]
+    fn auto_prefers_low_latency_shared_mode_when_it_honors_the_buffer() {
+        assert_eq!(
+            auto_mode(Some(128), 48_000, Some(&onboard())),
+            OutputMode::LowLatency
+        );
+        assert_eq!(
+            auto_mode(Some(256), 48_000, Some(&onboard())),
+            OutputMode::LowLatency
+        );
+    }
+
+    #[test]
+    fn auto_takes_exclusive_mode_when_only_it_gets_lower() {
+        // The headset's shared mode is stuck at 480; exclusive goes to 144.
+        assert_eq!(
+            auto_mode(Some(128), 48_000, Some(&headset())),
+            OutputMode::Exclusive
+        );
+        // Low-latency shared mode stops at 256 here, exclusive at 144.
+        let p = DevicePeriods {
+            shared_min: 256,
+            ..onboard()
+        };
+        assert_eq!(
+            auto_mode(Some(128), 48_000, Some(&p)),
+            OutputMode::Exclusive
+        );
+        // At another rate than the mixer's only exclusive mode can help.
+        assert_eq!(
+            auto_mode(Some(128), 44_100, Some(&onboard())),
+            OutputMode::Exclusive
+        );
+    }
+
+    #[test]
+    fn auto_keeps_other_programs_playing_when_exclusive_is_no_better() {
+        let p = DevicePeriods {
+            exclusive_min: 128,
+            ..onboard()
+        };
+        assert_eq!(
+            auto_mode(Some(64), 48_000, Some(&p)),
+            OutputMode::LowLatency
+        );
+        let none = DevicePeriods {
+            exclusive_min: 480,
+            ..headset()
+        };
+        assert_eq!(
+            auto_mode(Some(128), 48_000, Some(&none)),
+            OutputMode::Shared
+        );
+    }
+
+    #[test]
+    fn low_latency_periods_never_exceed_the_request_when_they_can_help_it() {
+        let p = onboard();
+        assert_eq!(p.low_latency_period(128), 128);
+        assert_eq!(p.low_latency_period(200), 192);
+        assert_eq!(p.low_latency_period(64), 128);
+        assert_eq!(p.low_latency_period(4_096), 480);
+        assert!(p.has_low_latency());
+        assert!(!headset().has_low_latency());
+    }
+
+    #[test]
+    fn buffer_durations_round_to_the_nearest_100_ns() {
+        assert_eq!(frames_to_hns(480, 48_000), 100_000);
+        assert_eq!(frames_to_hns(144, 48_000), 30_000);
+        assert_eq!(frames_to_hns(128, 48_000), 26_667);
+        assert_eq!(frames_to_hns(441, 44_100), 100_000);
+    }
+
+    #[test]
+    fn samples_convert_to_each_device_format() {
+        let src = [0.0f32, 1.0, -1.0, 0.5, 2.0, f32::NAN];
+        let mut out = vec![0u8; src.len() * 4];
+
+        Pcm::I16.write(&src, &mut out[..src.len() * 2]);
+        let i16s: Vec<i16> = out[..src.len() * 2]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(i16s, [0, 32_767, -32_767, 16_384, 32_767, 0]);
+
+        Pcm::I24.write(&src, &mut out[..src.len() * 3]);
+        let i24s: Vec<i32> = out[..src.len() * 3]
+            .chunks_exact(3)
+            .map(|b| i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8)
+            .collect();
+        assert_eq!(i24s, [0, 8_388_607, -8_388_607, 4_194_304, 8_388_607, 0]);
+
+        Pcm::I32.write(&src, &mut out);
+        let i32s: Vec<i32> = out
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(i32s, [0, i32::MAX, -i32::MAX, 1_073_741_824, i32::MAX, 0]);
+
+        Pcm::F32.write(&src[..5], &mut out[..20]);
+        let f32s: Vec<f32> = out[..20]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(f32s, src[..5]);
+        assert_eq!(Pcm::I24.bytes() * 2, 6);
+    }
 }

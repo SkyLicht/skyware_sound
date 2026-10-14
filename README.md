@@ -42,7 +42,7 @@ Useful commands:
 | `skyware export-loop PROJECT --name "Battle Loop"` | Export the loop region for the game |
 | `skyware analyze file.wav` | Loudness and peak measurements as JSON |
 | `skyware check` | The system check: play through the device at 128 frames and count dropouts, then export a 16-bar loop and verify it (see [Testing on Windows](#testing-on-windows)) |
-| `skyware latency-test --buffer 128 --minutes 10` | The device half of the check on its own |
+| `skyware latency-test --buffer 128 --minutes 10` | The device half of the check on its own (`--mode auto\|shared\|low-latency\|exclusive`, see [Output modes](#output-modes)) |
 | `skyware devices` | List output devices |
 | `skyware token` | Print the MCP access token |
 
@@ -60,7 +60,18 @@ pwsh scripts/local-test.ps1            # -Quick: release build and 30 s on the d
 
 Logs, `report.json`, the exported loop and `summary.txt` go to `target/local-test/<time>/`; the exit code is 0 only if every step passed.
 
-Windows shared mode (what `cpal` opens) runs at the audio engine's period, 10 ms on most devices, whatever buffer size is asked for, so the 128-frame check fails there and the report gives the smallest period the device supports in low-latency shared mode and in exclusive mode.
+### Output modes
+
+Windows shared mode runs at the audio engine's period, 10 ms (480 frames at 48 kHz) on most devices, whatever buffer size is asked for. To go lower, `--mode` (and Mode in the app's audio settings) picks how the app shares the device:
+
+| Mode | What it does |
+|---|---|
+| `auto` (default) | Shared mode, unless `--buffer` is smaller than shared mode can run: then low-latency shared mode if the driver allows that buffer, otherwise exclusive mode. If the device refuses, it falls back to the next mode down and says why |
+| `shared` | Through the Windows mixer at its usual period |
+| `low-latency` | Through the Windows mixer at a shorter period (`IAudioClient3`, Windows 10 and later) where the driver allows one; other programs keep playing |
+| `exclusive` | The app takes the device for itself: the shortest period the hardware can do, but other programs go silent while it plays. Windows must allow it ("Allow applications to take exclusive control" in the device's Advanced properties) |
+
+A request below what the hardware can do runs at the hardware's shortest period, and the check fails the buffer size and says what that period is (a headset whose exclusive minimum is 3 ms runs 144-frame buffers at 48 kHz). The check reports the mode it used. ASIO (`--asio`) has no modes; the driver sets them.
 
 ## Connecting an AI assistant
 

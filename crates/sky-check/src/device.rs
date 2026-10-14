@@ -54,6 +54,14 @@ pub struct DeviceProgress {
 pub struct DeviceCheck {
     pub passed: bool,
     pub host: String,
+    /// How the stream shared the device: shared, low-latency or exclusive.
+    pub mode: Option<String>,
+    /// The mode asked for, where it differs from the one used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_mode: Option<String>,
+    /// Why the stream ran differently from what was asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub device: String,
     pub sample_rate: u32,
     pub channels: u16,
@@ -187,6 +195,7 @@ fn run(
     let overruns = shared.overruns.load(Relaxed) - overruns_before;
     let _ = session.stop();
     let dev = stream.info.clone();
+    let note = stream.note.clone();
     drop(stream);
 
     let requested = opts.output.buffer_frames;
@@ -198,12 +207,17 @@ fn run(
     };
     let dropouts = xruns + s.late;
     let buffer_ms = s.max_frames as f64 / sr * 1000.0;
+    let mode = dev.mode.map(|m| m.to_string());
+    let in_mode = mode
+        .as_deref()
+        .map(|m| format!(" in {m} mode"))
+        .unwrap_or_default();
     let mut checks = vec![
         Check::new(
             "callbacks",
             s.callbacks > 0,
             format!(
-                "{} callbacks in {:.1} s, {} to {} frames each, at most {:.2} ms apart{}",
+                "{} callbacks in {:.1} s{in_mode}, {} to {} frames each, at most {:.2} ms apart{}",
                 s.callbacks,
                 elapsed.as_secs_f64(),
                 s.min_frames,
@@ -248,12 +262,15 @@ fn run(
                 )
             } else {
                 let mut detail = format!(
-                    "asked for {r} frames ({:.2} ms) but {} called back with up to {} \
-                     frames ({buffer_ms:.2} ms); the request was not honored",
+                    "asked for {r} frames ({:.2} ms) but {}{in_mode} called back with up \
+                     to {} frames ({buffer_ms:.2} ms); the request was not honored",
                     r as f64 / sr * 1000.0,
                     dev.host,
                     s.max_frames
                 );
+                if let Some(n) = &note {
+                    detail.push_str(&format!(" ({n})"));
+                }
                 if let Some(p) = periods {
                     let f = |frames: u32| {
                         format!(
@@ -274,9 +291,13 @@ fn run(
             },
         ));
     }
+    let asked = opts.output.mode.to_string();
     Ok(DeviceCheck {
         passed: checks.iter().all(|c| c.passed),
         host: dev.host,
+        requested_mode: (mode.as_deref() != Some(asked.as_str())).then_some(asked),
+        mode,
+        note,
         device: dev.name,
         sample_rate: dev.sample_rate,
         channels: dev.channels,

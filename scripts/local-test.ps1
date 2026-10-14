@@ -31,6 +31,9 @@ param(
     [int]$Bars = 16,
     # Part of an output device name; default: the system default device.
     [string]$Device = "",
+    # How to share the device: auto, shared, low-latency or exclusive.
+    [ValidateSet("auto", "shared", "low-latency", "exclusive")]
+    [string]$Mode = "auto",
     # Let the device check be heard.
     [switch]$Audible,
     # Skip rustfmt, clippy and the test suite, and play for 30 seconds
@@ -106,18 +109,21 @@ if ($built -and ($Minutes -gt 0 -or $Bars -gt 0)) {
         "--minutes", "$Minutes",
         "--bars", "$Bars",
         "--buffer", "$Buffer",
+        "--mode", $Mode,
         "--out", (Join-Path $out "export"),
         "--json"
     )
     if (-not $Audible) { $check += "--silent" }
     if ($Device) { $check += @("--device", $Device) }
-    Write-Host "    playing for $Minutes min at $Buffer frames$(if (-not $Audible) { ', silently' })"
+    Write-Host "    playing for $Minutes min at $Buffer frames in $Mode mode$(if (-not $Audible) { ', silently' })"
     $reportFile = Join-Path $out "report.json"
     Step "check" $exe $check $reportFile | Out-Null
     $json = if (Test-Path $reportFile) { Get-Content $reportFile -Raw } else { "" }
     if ($json -and $json.Trim().StartsWith("{")) {
         $report = $json | ConvertFrom-Json
         if ($report.device) {
+            $results.Add("      device: $($report.device.device), $($report.device.host) in $($report.device.mode) mode")
+            if ($report.device.note) { $results.Add("      note: $($report.device.note)") }
             foreach ($c in $report.device.checks) {
                 $mark = if ($c.passed) { "PASS" } else { "FAIL" }
                 $results.Add("      $mark device $($c.name): $($c.detail)")
