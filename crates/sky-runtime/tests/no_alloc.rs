@@ -3,7 +3,7 @@
 //!
 //! This test binary installs `assert_no_alloc`'s allocator, which aborts the
 //! process if anything allocates or frees memory inside `assert_no_alloc`.
-//! The check is active in debug builds, which is what `cargo test` uses.
+//! The check runs in debug and release test builds.
 
 mod common;
 

@@ -68,7 +68,10 @@ hound = "3.5"
 symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "ogg", "vorbis", "mp3", "pcm"] }
 cpal = "0.18"
 ebur128 = "0.1"
-assert_no_alloc = "1.1"
+# Default features turn the checker off in release builds; keep it on so
+# the no-allocation tests also run in release. The audio callback only
+# calls it in debug builds.
+assert_no_alloc = { version = "1.1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
