@@ -2,3 +2,4 @@
 *.skyproj/renders/
 *.skyproj/cache/
 .DS_Store
+/.claude/worktrees/
