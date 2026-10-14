@@ -292,3 +292,176 @@ fn export_loop_writes_a_manifest() {
     rt.render(&mut buf);
     assert!(buf.iter().any(|s| s.abs() > 0.01));
 }
+
+/// A local pack folder: `bd` with two variations, `sd`, and `keys` pitched.
+fn pack_folder(dir: &Path) {
+    for name in ["bd0", "bd1", "sd", "keys_c4"] {
+        sine_file(&dir.join(format!("{name}.wav")), 0.2);
+    }
+    std::fs::write(
+        dir.join("strudel.json"),
+        r#"{
+            "Kit_bd": ["bd0.wav", "bd1.wav"],
+            "Kit_sd": "sd.wav",
+            "keys": { "C4": "keys_c4.wav" }
+        }"#,
+    )
+    .unwrap();
+}
+
+fn pack_request(dir: &Path, license: sky_model::License) -> sky_session::BankRequest {
+    let mut source = sky_library::PackSource::parse(&dir.to_string_lossy(), Some(license));
+    source.name = "Test kit".into();
+    if license.needs_credit() {
+        source.credit = Some("Test kit by Someone (CC BY 4.0)".into());
+    }
+    sky_session::BankRequest {
+        source,
+        bank: Some("Kit".into()),
+        sounds: Vec::new(),
+        add: false,
+        pitched: None,
+    }
+}
+
+#[test]
+fn banks_load_from_packs_play_undo_and_credit_exports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    pack_folder(&pack);
+    let mut project = empty_project("Banks");
+    let mut track = Track::new_instrument("Beat", sky_dsp::InstrumentType::Synth);
+    track.clips.push(Clip {
+        id: ClipId::new(),
+        name: "Beat".into(),
+        start: 0,
+        length: PPQ * 4,
+        content: ClipContent::Pattern {
+            source: "bd sd bd:1 sd".into(),
+            seed: 0,
+            cycle: PPQ * 4,
+        },
+    });
+    let track_id = track.id;
+    project.tracks.push(track);
+    let session = headless(project);
+    session.set_library(sky_library::Library::new(tmp.path().join("cache")));
+
+    let request = pack_request(&pack, sky_model::License::CcBy4);
+    let loaded = session.load_bank(track_id, &request, Origin::User).unwrap();
+    assert_eq!(loaded.bank, "Kit");
+    assert_eq!(
+        loaded.sounds,
+        [("bd".to_string(), 2), ("sd".to_string(), 1)]
+    );
+    assert_eq!((loaded.new_files, loaded.reused_files), (3, 0));
+    assert!(loaded.pitched.is_none(), "a drum bank plays drums by note");
+    let project = session.project();
+    let slot = project.track(track_id).unwrap().instrument.clone().unwrap();
+    assert_eq!(slot.kind, sky_dsp::InstrumentType::Bank);
+    assert_eq!(project.audio_pool.len(), 3);
+    let source = project.audio_pool[0].source.clone().unwrap();
+    assert_eq!(source.pack, "Test kit");
+    assert_eq!(source.license, sky_model::License::CcBy4);
+    assert_eq!(
+        session.view().undo_label.as_deref(),
+        Some("Load Kit sounds")
+    );
+
+    // The pattern now plays the samples.
+    let audio = session.render_range(0, PPQ * 4, 0.0).unwrap();
+    assert!(audio.peak() > 0.1, "peak {}", audio.peak());
+
+    // A loop export carries the credit into the manifest.
+    session.save(Some(&tmp.path().join("song"))).unwrap();
+    let out = session.export_loop(&LoopExportOptions::default()).unwrap();
+    assert_eq!(out.licenses.credits, ["Test kit by Someone (CC BY 4.0)"]);
+    let manifest = std::fs::read_to_string(&out.exported.manifest).unwrap();
+    assert!(manifest.contains("Test kit by Someone"), "{manifest}");
+
+    // Adding the pitched sound keeps the drums and reuses their files.
+    let mut keys = pack_request(&pack, sky_model::License::CcBy4);
+    keys.bank = None;
+    keys.sounds = vec!["keys".into()];
+    keys.add = true;
+    keys.pitched = Some("keys".into());
+    let more = session.load_bank(track_id, &keys, Origin::User).unwrap();
+    assert_eq!(more.bank, "Kit + keys");
+    assert_eq!(more.sounds.len(), 3);
+    assert_eq!(more.pitched.as_deref(), Some("keys"));
+    let again = session.load_bank(track_id, &request, Origin::User).unwrap();
+    assert_eq!((again.new_files, again.reused_files), (0, 3));
+    assert_eq!(session.project().audio_pool.len(), 4);
+
+    // The bank's audio is saved and opens again with the project.
+    session.save(None).unwrap();
+    let reopened = headless(empty_project("Other"));
+    reopened.open(&tmp.path().join("song")).unwrap();
+    let audio = reopened.render_range(0, PPQ * 4, 0.0).unwrap();
+    assert!(audio.peak() > 0.1);
+
+    // Undo takes the loads back out, pool audio included.
+    session.undo().unwrap();
+    session.undo().unwrap();
+    session.undo().unwrap();
+    let project = session.project();
+    assert!(project.audio_pool.is_empty());
+    assert_eq!(
+        project
+            .track(track_id)
+            .unwrap()
+            .instrument
+            .as_ref()
+            .unwrap()
+            .kind,
+        sky_dsp::InstrumentType::Synth
+    );
+}
+
+#[test]
+fn unknown_licenses_warn_and_bad_requests_change_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    pack_folder(&pack);
+    let mut project = empty_project("Banks");
+    let track = Track::new_instrument("Beat", sky_dsp::InstrumentType::Bank);
+    let track_id = track.id;
+    project.tracks.push(track);
+    let session = headless(project);
+    session.set_library(sky_library::Library::new(tmp.path().join("cache")));
+
+    let mut request = pack_request(&pack, sky_model::License::Unknown);
+    request.bank = Some("Nope".into());
+    let err = session
+        .load_bank(track_id, &request, Origin::User)
+        .unwrap_err();
+    assert!(err.to_string().contains("no bank \"Nope\""), "{err}");
+    assert!(session.view().undo_label.is_none());
+
+    request.bank = Some("Kit".into());
+    session.load_bank(track_id, &request, Origin::User).unwrap();
+    // No clips yet: nothing would be exported.
+    assert!(session.license_report().is_empty());
+    session
+        .apply(Transaction::single(Command::AddClip {
+            track: track_id,
+            clip: Box::new(Clip {
+                id: ClipId::new(),
+                name: "p".into(),
+                start: 0,
+                length: PPQ * 4,
+                content: ClipContent::Pattern {
+                    source: "bd".into(),
+                    seed: 0,
+                    cycle: PPQ * 4,
+                },
+            }),
+        }))
+        .unwrap();
+    let report = session.license_report();
+    assert!(report.credits.is_empty());
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].starts_with("Test kit does not state a license"));
+}

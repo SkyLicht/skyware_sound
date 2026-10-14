@@ -111,6 +111,7 @@ pub fn loop_asset(name: &str, file: AudioFile, loop_start: u64, loop_end: u64) -
         loudness_lufs: None,
         peak_dbfs: None,
         tags: Vec::new(),
+        credits: Vec::new(),
     })
 }
 

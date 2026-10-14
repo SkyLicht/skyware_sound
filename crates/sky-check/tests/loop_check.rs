@@ -69,6 +69,7 @@ fn export(dir: &std::path::Path, audio: &AudioData, loop_end: u64, bars: f64) {
             bars: Some(bars),
             category: Category::Music,
             tags: Vec::new(),
+            credits: Vec::new(),
             format: WavFormat::Pcm24,
         },
     )

@@ -19,6 +19,7 @@ sky-engine.workspace = true
 sky-io = { workspace = true, features = ["device"] }
 sky-game.workspace = true
 sky-session.workspace = true
+sky-library.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 directories.workspace = true
