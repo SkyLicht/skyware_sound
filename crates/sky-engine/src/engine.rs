@@ -275,14 +275,17 @@ fn render_source(track: &mut TrackNode, playing: bool, pos: i64, offset: usize, 
                     if n.time > t {
                         break;
                     }
-                    if n.end > t
-                        && let Some(slot) = state.active.get_mut(n.pitch as usize)
-                    {
-                        if *slot >= 0 {
-                            inst.note_off(n.pitch);
+                    if n.end > t {
+                        if let Some(sound) = n.sound {
+                            // Bank sounds are one-shots: nothing to end.
+                            inst.sound_on(sound, n.velocity);
+                        } else if let Some(slot) = state.active.get_mut(n.pitch as usize) {
+                            if *slot >= 0 {
+                                inst.note_off(n.pitch);
+                            }
+                            *slot = n.end;
+                            inst.note_on(n.pitch, n.velocity);
                         }
-                        *slot = n.end;
-                        inst.note_on(n.pitch, n.velocity);
                     }
                     state.cursor += 1;
                 }

@@ -113,6 +113,7 @@ impl Track {
                 InstrumentType::Drums => [214, 120, 86],
                 InstrumentType::Synth => [140, 110, 214],
                 InstrumentType::Sampler => [86, 190, 140],
+                InstrumentType::Bank => [214, 176, 86],
             },
             instrument: Some(InstrumentSlot::new(instrument)),
             channel: Channel::default(),
@@ -135,6 +136,9 @@ pub struct InstrumentSlot {
     /// The pool audio a sampler plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<AudioId>,
+    /// The sounds a sample bank plays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bank: Option<SampleBank>,
 }
 
 impl InstrumentSlot {
@@ -143,6 +147,7 @@ impl InstrumentSlot {
             kind,
             params: BTreeMap::new(),
             sample: None,
+            bank: None,
         }
     }
 
@@ -150,6 +155,66 @@ impl InstrumentSlot {
     pub fn param(&self, name: &str) -> Option<f32> {
         let spec = sky_dsp::params::find(self.kind.params(), name)?;
         Some(self.params.get(name).copied().unwrap_or(spec.default))
+    }
+}
+
+/// The sounds a sample-bank instrument plays, by name, as in Strudel: the
+/// pattern `bd sd:2` plays the first `bd` and the third `sd`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleBank {
+    /// What the bank is called, such as `RolandTR808` or `piano`.
+    pub name: String,
+    /// Each sound's variations in order. A pattern index past the end wraps
+    /// around, so `bd:5` with two variations plays the second.
+    pub sounds: BTreeMap<String, Vec<BankSample>>,
+    /// The sound that MIDI notes and note names play, pitched across the
+    /// keyboard. Without one, notes play the drum sounds on their General
+    /// MIDI notes (36 `bd`, 38 `sd`, 42 `hh`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitched: Option<String>,
+}
+
+/// One variation of a bank sound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BankSample {
+    pub audio: AudioId,
+    /// The MIDI note the sample was recorded at, for pitched sounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<u8>,
+}
+
+impl SampleBank {
+    /// The sound a pattern name plays and its variations: the name itself,
+    /// then the name in another case, then another name for the same drum,
+    /// so `sd` finds a bank's `sn`.
+    pub fn resolve(&self, name: &str) -> Option<(&str, &[BankSample])> {
+        let found = |key: &str| {
+            self.sounds
+                .get_key_value(key)
+                .or_else(|| {
+                    self.sounds
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                })
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+        };
+        found(name).or_else(|| {
+            let note = sky_pattern::drum_note(name)?;
+            sky_pattern::drum_names(note).find_map(found)
+        })
+    }
+
+    /// Every pool file the bank uses.
+    pub fn audio_ids(&self) -> impl Iterator<Item = AudioId> + '_ {
+        self.sounds.values().flatten().map(|s| s.audio)
+    }
+
+    /// How many samples the bank holds.
+    pub fn sample_count(&self) -> usize {
+        self.sounds.values().map(Vec::len).sum()
     }
 }
 
@@ -329,6 +394,115 @@ pub struct PoolEntry {
     pub channels: u16,
     pub sample_rate: u32,
     pub frames: u64,
+    /// Where the file came from, for files loaded from a sound pack. Files
+    /// imported from disk have none: they are the user's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AudioSource>,
+}
+
+/// The pack a pool file was loaded from, and its license.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioSource {
+    /// The pack's name, such as `Salamander Grand Piano`.
+    pub pack: String,
+    /// The address the file was loaded from: an http(s) URL or a path.
+    pub url: String,
+    pub license: License,
+    /// The credit line the license asks for, such as `Salamander Grand
+    /// Piano by Alexander Holm (CC BY 3.0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<String>,
+}
+
+/// The license of downloaded audio. Serialized as SPDX identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum License {
+    /// Public domain dedication; no conditions.
+    #[serde(rename = "CC0-1.0")]
+    Cc0,
+    #[serde(rename = "public-domain")]
+    PublicDomain,
+    /// Keep the copyright notice.
+    #[serde(rename = "MIT")]
+    Mit,
+    /// Credit the author.
+    #[serde(rename = "CC-BY-3.0")]
+    CcBy3,
+    #[serde(rename = "CC-BY-4.0")]
+    CcBy4,
+    /// Credit the author, and share what is made with it under the same terms.
+    #[serde(rename = "CC-BY-SA-4.0")]
+    CcBySa4,
+    /// The pack does not say. Nothing is known about what is allowed.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl License {
+    pub const ALL: [License; 7] = [
+        License::Cc0,
+        License::PublicDomain,
+        License::Mit,
+        License::CcBy3,
+        License::CcBy4,
+        License::CcBySa4,
+        License::Unknown,
+    ];
+
+    /// The SPDX identifier, or `public-domain` or `unknown`.
+    pub fn id(self) -> &'static str {
+        match self {
+            License::Cc0 => "CC0-1.0",
+            License::PublicDomain => "public-domain",
+            License::Mit => "MIT",
+            License::CcBy3 => "CC-BY-3.0",
+            License::CcBy4 => "CC-BY-4.0",
+            License::CcBySa4 => "CC-BY-SA-4.0",
+            License::Unknown => "unknown",
+        }
+    }
+
+    /// A short name for people, such as `CC BY 3.0`.
+    pub fn label(self) -> &'static str {
+        match self {
+            License::Cc0 => "CC0",
+            License::PublicDomain => "Public domain",
+            License::Mit => "MIT",
+            License::CcBy3 => "CC BY 3.0",
+            License::CcBy4 => "CC BY 4.0",
+            License::CcBySa4 => "CC BY-SA 4.0",
+            License::Unknown => "License unknown",
+        }
+    }
+
+    /// Reads an identifier or label, ignoring case: `CC0-1.0`, `cc0`,
+    /// `CC BY 3.0`, `unknown`.
+    pub fn parse(text: &str) -> Option<License> {
+        let norm = |s: &str| {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        };
+        let want = norm(text);
+        License::ALL
+            .into_iter()
+            .find(|l| norm(l.id()) == want || norm(l.label()) == want)
+    }
+
+    /// True when shipping the audio means crediting its author.
+    pub fn needs_credit(self) -> bool {
+        matches!(
+            self,
+            License::Mit | License::CcBy3 | License::CcBy4 | License::CcBySa4
+        )
+    }
+
+    /// True when work made with the audio must use the same license.
+    pub fn share_alike(self) -> bool {
+        self == License::CcBySa4
+    }
 }
 
 impl Project {

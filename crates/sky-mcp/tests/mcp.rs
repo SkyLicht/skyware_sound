@@ -340,3 +340,137 @@ async fn http_needs_the_token() {
     assert!(ok.contains("200"), "{ok}");
     server.shutdown();
 }
+
+/// A pack folder with a `Kit` bank (bd with two variations, sd) and a
+/// pitched `keys` sound.
+fn write_pack(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, level) in [("bd0", 0.5), ("bd1", 0.4), ("sd", 0.3), ("c4", 0.2)] {
+        let audio = sky_dsp::AudioData {
+            sample_rate: 48_000,
+            channels: vec![vec![level; 4_800]],
+        };
+        sky_io::write_wav(
+            &dir.join(format!("{name}.wav")),
+            &audio,
+            sky_io::WavFormat::Pcm16,
+            false,
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.join("strudel.json"),
+        r#"{"Kit_bd": ["bd0.wav", "bd1.wav"], "Kit_sd": "sd.wav", "keys": {"C4": "c4.wav"}}"#,
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assistant_loads_a_strudel_bank_and_exports_with_its_credits() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_pack(&tmp.path().join("packs/kit"));
+    let (session, _) = Session::new(empty_project("Banks"), None);
+    session.set_library(sky_library::Library::new(tmp.path().join("cache")));
+    let server = SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Files, vec![tmp.path().to_path_buf()]),
+    );
+    let client = connect(server).await;
+
+    let packs = ok(&client, "sound_packs", json!({})).await;
+    let ids: Vec<&str> = packs["packs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["pack"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"tidal-drum-machines") && ids.contains(&"vcsl"));
+
+    let kit = ok(&client, "sound_packs", json!({ "pack": "packs/kit" })).await;
+    assert_eq!(kit["banks"], json!({ "Kit": 2 }), "{kit}");
+    assert_eq!(kit["sounds"], json!({ "keys": 1 }), "{kit}");
+    assert_eq!(kit["license"], "unknown");
+    let bank = ok(
+        &client,
+        "sound_packs",
+        json!({ "pack": "packs/kit", "bank": "Kit" }),
+    )
+    .await;
+    assert_eq!(bank["sounds"], json!({ "bd": 2, "sd": 1 }));
+
+    ok(
+        &client,
+        "track_create",
+        json!({ "name": "Beat", "instrument": "bank" }),
+    )
+    .await;
+    let loaded = ok(
+        &client,
+        "bank_load",
+        json!({ "track": "Beat", "pack": "packs/kit", "bank": "Kit", "license": "CC-BY-4.0" }),
+    )
+    .await;
+    assert_eq!(loaded["sounds"], json!({ "bd": 2, "sd": 1 }), "{loaded}");
+    assert_eq!(loaded["newFiles"], 3);
+    assert_eq!(loaded["pattern"], "bd sd");
+    let more = ok(
+        &client,
+        "bank_load",
+        json!({ "track": "Beat", "pack": "packs/kit", "sounds": ["keys"], "add": true,
+                "license": "CC-BY-4.0" }),
+    )
+    .await;
+    assert_eq!(more["sounds"].as_object().unwrap().len(), 3);
+    ok(
+        &client,
+        "instrument_set",
+        json!({ "track": "Beat", "pitched": "keys" }),
+    )
+    .await;
+    let track = ok(&client, "track_get", json!({ "track": "Beat" })).await;
+    assert_eq!(track["instrument"]["bank"]["pitched"], "keys", "{track}");
+
+    ok(
+        &client,
+        "clip_create",
+        json!({ "track": "Beat", "start_bar": 1, "length_bars": 2, "pattern": "bd sd:1 bd:1 c4" }),
+    )
+    .await;
+    ok(&client, "set_loop", json!({ "start_bar": 1, "end_bar": 3 })).await;
+    let export = ok(
+        &client,
+        "export_loop",
+        json!({ "name": "Beat", "dir": "export" }),
+    )
+    .await;
+    assert_eq!(export["credits"], json!(["kit (CC BY 4.0)"]), "{export}");
+    assert_eq!(export["licenseWarnings"], json!([]));
+    let peak = export["asset"]["peakDbfs"].as_f64().unwrap();
+    assert!(peak > -30.0, "the bank is silent: {peak} dBFS");
+
+    // Known packs keep their license; outside folders stay closed.
+    let (text, is_error) = call(
+        &client,
+        "bank_load",
+        json!({ "track": "Beat", "pack": "vcsl", "license": "unknown" }),
+    )
+    .await;
+    assert!(is_error && text.contains("cannot be changed"), "{text}");
+    let (text, is_error) = call(
+        &client,
+        "bank_load",
+        json!({ "track": "Beat", "pack": "/elsewhere/kit" }),
+    )
+    .await;
+    assert!(
+        is_error && text.contains("outside the allowed folders"),
+        "{text}"
+    );
+
+    // Each load is one undo step: undoing the loop, the clip, the pitched
+    // sound and the second load leaves the first load's three files.
+    ok(&client, "undo", json!({ "steps": 4 })).await;
+    let summary = ok(&client, "project_summary", json!({})).await;
+    assert!(summary["tracks"][0]["instrument"]["bank"].is_object());
+    assert_eq!(summary["audioPool"].as_array().unwrap().len(), 3);
+}

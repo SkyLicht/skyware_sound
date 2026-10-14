@@ -44,6 +44,9 @@ pub enum Action {
     Save,
     SaveAs,
     ImportAudio,
+    /// Load sounds from a sample pack into the selected sample bank, or a
+    /// new one.
+    LoadSounds,
     ExportLoop,
     ExportWav,
     ToggleLoop,
@@ -427,6 +430,10 @@ impl App {
                     if matches!(kind, NewTrack::Instrument(_)) {
                         self.tab = Tab::Instrument;
                     }
+                    // A sample bank does nothing until it has sounds.
+                    if kind == NewTrack::Instrument(InstrumentType::Bank) {
+                        self.open_load_sounds(Some(id));
+                    }
                 }
             }
             Action::AddEffect { channel, kind } => {
@@ -451,6 +458,17 @@ impl App {
             }
             Action::SaveAs => self.request_path(ctx, PathPurpose::SaveAs),
             Action::ImportAudio => self.request_path(ctx, PathPurpose::ImportAudio),
+            Action::LoadSounds => {
+                let project = self.view.project.clone();
+                let bank_track = self.sel.track.filter(|t| {
+                    project.track(*t).is_ok_and(|t| {
+                        t.instrument
+                            .as_ref()
+                            .is_some_and(|i| i.kind == InstrumentType::Bank)
+                    })
+                });
+                self.open_load_sounds(bank_track);
+            }
             Action::ExportLoop => self.open_export_loop(),
             Action::ExportWav => self.open_export_wav(),
             Action::ToggleLoop => {
@@ -611,6 +629,8 @@ impl App {
                 }
             }
             JobOutput::Peaks(id, peaks) => self.waveforms.insert(id, peaks),
+            JobOutput::PackListed { map, result } => self.pack_listed(map, result),
+            JobOutput::BankLoaded(result) => self.bank_loaded(result),
         }
     }
 

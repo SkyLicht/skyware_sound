@@ -19,6 +19,7 @@ sky-io.workspace = true
 sky-game.workspace = true
 sky-session.workspace = true
 sky-check.workspace = true
+sky-library.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,6 +31,9 @@ axum.workspace = true
 rmcp = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 
 [dev-dependencies]
+sky-library.workspace = true
+sky-dsp.workspace = true
+sky-io.workspace = true
 rmcp = { workspace = true, features = ["client"] }
 sky-runtime.workspace = true
 tempfile.workspace = true

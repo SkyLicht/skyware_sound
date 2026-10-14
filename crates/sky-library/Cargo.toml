@@ -1,0 +1,29 @@
+[package]
+name = "sky-library"
+description = "Sound packs for Skyware Sound: Strudel sample maps, the default packs and a download cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+# Only sky-core and sky-runtime are meant for crates.io.
+publish = false
+
+[dependencies]
+sky-dsp.workspace = true
+sky-io.workspace = true
+sky-model.workspace = true
+sky-pattern.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

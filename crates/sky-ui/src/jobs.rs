@@ -9,6 +9,8 @@ use crate::app::Action;
 use crate::dialogs::{LoopSummary, PathPurpose, WavSummary};
 use crate::waveform::Peaks;
 use sky_core::AudioId;
+use sky_library::Pack;
+use sky_session::BankLoaded;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +37,12 @@ pub enum JobOutput {
     },
     Devices(Vec<String>),
     Peaks(AudioId, Option<Arc<Peaks>>),
+    /// A sound pack's sample map, read for the Load sounds dialog.
+    PackListed {
+        map: String,
+        result: Result<Arc<Pack>, String>,
+    },
+    BankLoaded(Result<BankLoaded, String>),
 }
 
 struct Running {

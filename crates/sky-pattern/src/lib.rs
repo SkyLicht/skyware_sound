@@ -92,7 +92,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-pub use value::drum_note;
+pub use value::{drum_names, drum_note, note_number};
 
 /// Time measured in cycles. One cycle is one pattern repetition (the DAW maps a
 /// cycle to e.g. one bar).

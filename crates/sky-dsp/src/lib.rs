@@ -17,7 +17,7 @@ pub mod util;
 
 pub use audio::AudioData;
 pub use effects::{Effect, EffectType};
-pub use instruments::{Instrument, InstrumentType};
+pub use instruments::{Instrument, InstrumentAudio, InstrumentType};
 pub use params::{ParamKind, ParamSpec};
 
 /// The largest block any processor is asked to handle at once. Callers split

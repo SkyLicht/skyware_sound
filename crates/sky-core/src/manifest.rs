@@ -104,6 +104,11 @@ pub struct LoopAsset {
     pub peak_dbfs: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Credit lines the licenses of the sounds in it ask for, such as
+    /// `Salamander Grand Piano by Alexander Holm (CC BY 3.0)`. A game shows
+    /// them in its credits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credits: Vec<String>,
 }
 
 /// How an SFX container picks the next variation.
@@ -245,6 +250,7 @@ mod tests {
             loudness_lufs: Some(-16.0),
             peak_dbfs: Some(-1.0),
             tags: vec!["battle".into()],
+            credits: vec!["Salamander Grand Piano by Alexander Holm (CC BY 3.0)".into()],
         }));
         m.upsert(Asset::Sfx(SfxAsset {
             id: AssetId::from_u128(2),
@@ -273,6 +279,7 @@ mod tests {
         assert!(json.contains("\"schemaVersion\": 1"));
         assert!(json.contains("\"kind\": \"loop\""));
         assert!(json.contains("\"loopEnd\": 96000"));
+        assert!(json.contains("\"credits\": ["));
         let back = Manifest::from_json(&json).unwrap();
         assert_eq!(back, m);
     }
