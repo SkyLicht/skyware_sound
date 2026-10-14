@@ -1,5 +1,6 @@
 [package]
 name = "sky-io"
+description = "Audio devices and file decoding and encoding for Skyware Sound"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +8,26 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["device"]
+# Audio output through cpal (WASAPI on Windows). Off for pure file work.
+device = ["dep:cpal"]
+# Steinberg ASIO through cpal; needs the ASIO SDK at build time.
+asio = ["device", "cpal/asio"]
+
 [dependencies]
+sky-dsp.workspace = true
+hound.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sky-engine.workspace = true
+assert_no_alloc.workspace = true
+# "realtime" registers the audio thread with MMCSS on Windows.
+cpal = { workspace = true, optional = true, features = ["realtime"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
