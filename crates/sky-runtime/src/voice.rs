@@ -177,7 +177,7 @@ impl Voice {
         let mut finished = region.is_none() && pos >= frames;
 
         if !finished {
-            for frame in out.chunks_exact_mut(2) {
+            for frame in out.as_chunks_mut::<2>().0 {
                 let g = gain.next() * fade.next();
                 let ip = pos.floor();
                 let t = (pos - ip) as f32;

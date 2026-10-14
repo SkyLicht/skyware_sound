@@ -429,7 +429,7 @@ impl Runtime {
         if self.master.is_settled() && self.master.value == 1.0 {
             return;
         }
-        for frame in out.chunks_exact_mut(2) {
+        for frame in out.as_chunks_mut::<2>().0 {
             let g = self.master.next();
             frame[0] *= g;
             frame[1] *= g;
