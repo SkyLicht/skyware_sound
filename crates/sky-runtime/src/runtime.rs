@@ -58,7 +58,10 @@ impl Runtime {
     /// renders. Up to `command_capacity` calls (plays, stops, gain changes)
     /// can wait for the next render; calls beyond that are held on the
     /// controller's side and sent with later ones, so none are lost.
-    pub fn split(self, command_capacity: usize) -> (Controller, Renderer) {
+    pub fn split(mut self, command_capacity: usize) -> (Controller, Renderer) {
+        // Voices that ended since the last call are not reported by the
+        // renderer, so free their slots now.
+        self.sync();
         split(self.control, self.mixer, command_capacity)
     }
 

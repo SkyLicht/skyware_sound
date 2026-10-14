@@ -7,6 +7,7 @@ use sky_core::{AudioId, ClipId, PPQ};
 use sky_dsp::{AudioData, InstrumentType, analysis};
 use sky_engine::{
     AudioCache, EngineMsg, compile, create_engine, render, render_intro_loop, render_loop,
+    render_one_shot,
 };
 use sky_model::templates::demo_project;
 use sky_model::*;
@@ -174,6 +175,26 @@ fn intro_loops_keep_the_intro_and_a_folded_body() {
     assert!(head(&out.left()[bar as usize..]) > head(from_silence.left()));
     let seam = analysis::seam_check(&out, bar as usize, out.frames());
     assert_eq!(seam.verdict, "seamless", "{seam:?}");
+}
+
+#[test]
+fn one_shots_leave_out_what_starts_after_them() {
+    // A kick on beat 1 and a snare on beat 2.
+    let p = drum_project(vec![
+        Note::new(0, PPQ / 4, 36, 110),
+        Note::new(PPQ, PPQ / 4, 38, 110),
+    ]);
+    let beat = p.tempo.tick_to_sample(PPQ, SR);
+    let frames = (beat + i64::from(SR)) as usize;
+    let plain = render(compile(&p, &AudioCache::new(), SR, 1), 0, frames, false);
+    let shot = render_one_shot(compile(&p, &AudioCache::new(), SR, 1), 0, beat, frames);
+    let b = beat as usize;
+    // The same up to the end of the range; then only the kick's decay.
+    assert_eq!(&shot.left()[..b], &plain.left()[..b]);
+    let peak = |a: &[f32]| a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let kick = peak(&shot.left()[..4_800]);
+    assert!(peak(&plain.left()[b..b + 4_800]) > 0.5 * kick);
+    assert!(peak(&shot.left()[b..]) < 0.1 * kick);
 }
 
 #[test]

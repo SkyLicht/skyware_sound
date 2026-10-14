@@ -410,18 +410,29 @@ impl Control {
             .filter(|s| s.active && s.generation == voice.generation)
     }
 
-    pub(crate) fn stop(&self, voice: VoiceId, fade_out_ms: f32) -> Option<MixCommand> {
-        self.live(voice).map(|_| MixCommand::Stop {
+    /// A stop without a fade frees the slot right away, as the mixer does,
+    /// so the next voice can take it before the mixer reports back.
+    pub(crate) fn stop(&mut self, voice: VoiceId, fade_out_ms: f32) -> Option<MixCommand> {
+        self.live(voice)?;
+        let frames = ms_to_frames(fade_out_ms, self.sample_rate);
+        if frames == 0 {
+            self.slots[voice.slot as usize].active = false;
+        }
+        Some(MixCommand::Stop {
             slot: voice.slot,
             generation: voice.generation,
-            frames: ms_to_frames(fade_out_ms, self.sample_rate),
+            frames,
         })
     }
 
-    pub(crate) fn stop_all(&self, fade_out_ms: f32) -> MixCommand {
-        MixCommand::StopAll {
-            frames: ms_to_frames(fade_out_ms, self.sample_rate),
+    pub(crate) fn stop_all(&mut self, fade_out_ms: f32) -> MixCommand {
+        let frames = ms_to_frames(fade_out_ms, self.sample_rate);
+        if frames == 0 {
+            for slot in &mut self.slots {
+                slot.active = false;
+            }
         }
+        MixCommand::StopAll { frames }
     }
 
     pub(crate) fn set_voice_gain(

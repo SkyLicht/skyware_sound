@@ -54,7 +54,8 @@ pub(crate) fn split(
 ///
 /// Created by [`Runtime::split`](crate::Runtime::split). Voice state
 /// ([`is_playing`](Self::is_playing), [`active_voices`](Self::active_voices))
-/// is what the renderer last reported.
+/// is what the renderer last reported, except that a stop without a fade
+/// counts at once.
 pub struct Controller {
     control: Control,
     commands: rtrb::Producer<MixCommand>,

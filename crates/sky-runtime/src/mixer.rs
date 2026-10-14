@@ -301,6 +301,12 @@ impl Mixer {
     }
 
     /// Keeps audio that could not be sent back, to send it later.
+    ///
+    /// The return queue is sized so that it cannot fill while the game keeps
+    /// calling the controller (see `threaded::split`), and `held` is a margin
+    /// past that. Were both full, the reference would be dropped here; the
+    /// controller still holds every loaded asset, so that frees memory only
+    /// for audio a reload already replaced.
     fn hold(&mut self, audio: Arc<AudioData>) {
         let Some(returns) = self.returns.as_mut() else {
             // Single-threaded: the caller's thread drops it.

@@ -1143,7 +1143,9 @@ impl Session {
                         Self::check_length(total_seconds)?;
                         let frames = (e - s) as usize + (tail * sr as f64) as usize;
                         let snap = compile(&project, &audio, sr, 0);
-                        let mut out = sky_engine::render(snap, s, frames, false);
+                        // Only what starts in the variation, so the tail
+                        // does not pick up the next one.
+                        let mut out = sky_engine::render_one_shot(snap, s, e, frames);
                         trim_silence(&mut out);
                         if *mono {
                             fold_to_mono(&mut out);

@@ -272,6 +272,12 @@ fn check_loop_asset(
     // Through the loop point and up to five seconds of the repeat.
     let total = end + body.min(5 * sr);
     let (left, right) = (audio.left(), audio.right());
+    // sky-runtime plays mono files centered with an equal-power pan.
+    let center = if audio.channel_count() == 1 {
+        std::f32::consts::FRAC_1_SQRT_2
+    } else {
+        1.0
+    };
     let mut buf = vec![0.0f32; BLOCK * 2];
     let (mut worst, mut worst_at, mut peak) = (0.0f32, 0usize, 0.0f32);
     let mut done = 0;
@@ -287,7 +293,9 @@ fn check_loop_asset(
                 start + (i - start) % body
             };
             peak = peak.max(frame[0].abs()).max(frame[1].abs());
-            let d = (frame[0] - left[j]).abs().max((frame[1] - right[j]).abs());
+            let d = (frame[0] - left[j] * center)
+                .abs()
+                .max((frame[1] - right[j] * center).abs());
             if d > worst {
                 worst = d;
                 worst_at = i;
@@ -319,8 +327,8 @@ fn check_loop_asset(
             ),
         );
     }
-    // The runtime mixes in f32 at unity gain; anything above rounding noise
-    // is a real difference.
+    // The runtime mixes in f32 at unity gain (or the center pan for mono);
+    // anything above rounding noise is a real difference.
     let passed = worst <= 1e-5;
     Check::new(
         "loop",
@@ -773,6 +781,42 @@ mod tests {
         assert!(!report.passed);
         assert_eq!(report.checks.len(), 1);
         assert_eq!(report.checks[0].name, "load");
+    }
+
+    #[test]
+    fn mono_loops_match_at_the_center_pan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audio = sky_dsp::AudioData {
+            sample_rate: 48_000,
+            channels: vec![(0..24_000).map(|i| (i as f32 * 0.02).sin() * 0.5).collect()],
+        };
+        let out = sky_game::export_loop(
+            tmp.path(),
+            &sky_game::LoopExport {
+                name: "drone",
+                project: "Hand made",
+                audio: &audio,
+                loop_start: 0,
+                loop_end: 24_000,
+                tempo_bpm: None,
+                time_signature: None,
+                bars: None,
+                category: sky_core::manifest::Category::Ambience,
+                tags: vec![],
+                credits: vec![],
+                format: sky_io::WavFormat::Float32,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.asset.files().next().unwrap().channels, 1);
+        let report = check_game(&GameOptions {
+            dir: tmp.path().to_path_buf(),
+            seconds: 0.0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(report.passed, "{}", report.lines().join("\n"));
+        assert_eq!(report.loops, 1);
     }
 
     #[test]

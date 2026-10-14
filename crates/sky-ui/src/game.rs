@@ -8,7 +8,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
 use egui::{Align, ComboBox, Context, DragValue, Grid, Id, Layout, RichText, TextEdit, Ui, Window};
-use sky_core::manifest::{Asset, Category, RandomRange, Selection, asset_name};
+use sky_core::manifest::{Asset, Category, MAX_ASSET_NAME, RandomRange, Selection, asset_name};
 use sky_core::{AssetId, Ticks};
 use sky_model::{
     Command, GameAsset, GameAssetKind, LicenseReport, MAX_SFX_TAIL_SECONDS, MAX_SFX_VARIATIONS,
@@ -65,14 +65,23 @@ fn key(id: AssetId, field: &str) -> u64 {
 /// `base`, or `base_2`, `base_3`... whichever no game asset uses.
 pub fn unique_asset_name(project: &Project, base: &str) -> String {
     let base = asset_name(base);
+    // Short enough for the suffix too; asset names are ASCII.
+    let fit = |room: usize| {
+        let end = base.len().min(MAX_ASSET_NAME - room);
+        base[..end].trim_end_matches('_').to_string()
+    };
     let taken = |n: &str| project.game.find(n).is_some();
-    if !taken(&base) {
-        return base;
+    let first = fit(0);
+    if !taken(&first) {
+        return first;
     }
     (2..)
-        .map(|i| format!("{base}_{i}"))
+        .map(|i| {
+            let suffix = format!("_{i}");
+            fit(suffix.len()) + &suffix
+        })
         .find(|n| !taken(n))
-        .unwrap_or(base)
+        .unwrap_or(first)
 }
 
 /// One variation per bar of the loop region, or per beat when it is a bar

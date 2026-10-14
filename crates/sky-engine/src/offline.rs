@@ -3,7 +3,7 @@
 
 use sky_dsp::AudioData;
 
-use crate::compile::EngineSnapshot;
+use crate::compile::{EngineSnapshot, SourceNode};
 use crate::engine::create_engine;
 
 /// Renders `frames` stereo frames starting at sample `start`. When `looping`
@@ -23,6 +23,38 @@ pub fn render(mut snapshot: EngineSnapshot, start: i64, frames: usize, looping: 
         sample_rate,
         channels: vec![left, right],
     }
+}
+
+/// Renders what starts in `[start, end)` as a one-shot sound, `frames`
+/// long, so it can ring out past `end`: notes and clips that start at or
+/// after `end` are left out, notes still held at `end` are released there,
+/// and audio clips still playing fade out over 10 ms. Releases and effect
+/// tails carry on into the frames after `end`.
+pub fn render_one_shot(
+    mut snapshot: EngineSnapshot,
+    start: i64,
+    end: i64,
+    frames: usize,
+) -> AudioData {
+    let fade = i64::from(snapshot.sample_rate / 100).max(1);
+    for track in snapshot.tracks.iter_mut() {
+        match &mut track.source {
+            SourceNode::Instrument { notes, .. } => {
+                notes.retain(|n| n.time < end);
+                for n in notes.iter_mut() {
+                    n.end = n.end.min(end);
+                }
+            }
+            SourceNode::Audio(clips) => {
+                clips.retain(|c| c.start < end);
+                for c in clips.iter_mut().filter(|c| c.end > end) {
+                    c.end = end;
+                    c.fade_out = c.fade_out.max(fade).min(end - c.start);
+                }
+            }
+        }
+    }
+    render(snapshot, start, frames, false)
 }
 
 /// Renders the loop `[loop_start, loop_end)` `passes` times with the

@@ -378,15 +378,20 @@ fn selection(name: &str) -> Result<Selection, String> {
     })
 }
 
-/// Resolves `.` and `..` in a path without touching the disk, so a game
-/// folder next to the project (`../game/assets/audio`) can be checked
-/// against the allowed folders.
+/// Resolves `.` and `..` in a path, so a game folder next to the project
+/// (`../game/assets/audio`) can be checked against the allowed folders.
+/// `..` goes up from where a folder that exists really is, as the file
+/// system does when one is a link; folders that do not exist yet are
+/// resolved as written.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
+                if let Ok(real) = std::fs::canonicalize(&out) {
+                    out = real;
+                }
                 out.pop();
             }
             other => out.push(other),
@@ -2442,5 +2447,37 @@ impl ServerHandler for SkywareMcp {
                     .with_title("Skyware Sound"),
             )
             .with_instructions(INSTRUCTIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_folders_resolve_as_the_file_system_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(
+            normalize(&project.join("../game/./audio")),
+            root.join("game/audio")
+        );
+        assert_eq!(
+            normalize(&project.join("new/../audio")),
+            project.join("audio")
+        );
+        #[cfg(unix)]
+        {
+            let elsewhere = root.join("elsewhere/deep");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, project.join("link")).unwrap();
+            assert_eq!(
+                normalize(&project.join("link/../audio")),
+                root.join("elsewhere/audio")
+            );
+            assert_eq!(normalize(&project.join("link/..")), root.join("elsewhere"));
+        }
     }
 }

@@ -8,9 +8,11 @@
 //!
 //! [`export_assets`] writes a set of loops and SFX sets in one go, the way a
 //! project's game assets are exported: every file first, then the manifest,
-//! then the files that the new manifest no longer uses are deleted.
+//! then the files of earlier exports that the new manifest no longer uses.
+//! It only replaces and deletes what the same project exported, and never
+//! files added by hand.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -137,10 +139,14 @@ pub struct SetExported {
 /// Writes every asset's audio into `dir`, then records them in the
 /// manifest. Files from earlier exports that the manifest no longer refers
 /// to (a renamed asset, variations that went away, pruned assets) are
-/// deleted afterwards.
+/// deleted afterwards, but only those this export owns: files of assets with
+/// the same [`ExportSet::project_id`] (both `None` for one-off exports),
+/// under the names an export gives them. Files added by hand stay.
 ///
-/// Nothing is written unless every asset is valid; a failure while writing
-/// audio leaves the manifest as it was.
+/// Nothing is written unless every asset is valid, no two assets would write
+/// the same file, no asset would overwrite a file that another asset in the
+/// manifest uses, and no asset replaces one that another project manages. A
+/// failure while writing puts the old files and manifest back.
 pub fn export_assets(
     dir: &Path,
     set: &ExportSet,
@@ -151,39 +157,22 @@ pub fn export_assets(
             "pruning needs the project's ID, so only its own assets are removed".into(),
         ));
     }
-    let mut seen = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let mut ids = BTreeSet::new();
     for a in assets {
         validate(a)?;
-        if !seen.insert(a.name.as_str()) {
+        if !names.insert(a.name.as_str()) {
             return Err(GameError::Invalid(format!(
                 "two assets are called {:?}",
                 a.name
             )));
         }
-    }
-
-    // Write the audio under temporary names, then move it into place, so a
-    // failure part way leaves the old files and manifest in step.
-    let mut entries = Vec::with_capacity(assets.len());
-    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let result = (|| {
-        for a in assets {
-            let (entry, files) = render_entry(a, set)?;
-            for (rel, audio) in files {
-                let target = dir.join(&rel);
-                let tmp = tmp_path(&target);
-                write_wav(&tmp, audio, set.format, set.format != WavFormat::Float32)?;
-                staged.push((tmp, target));
-            }
-            entries.push(entry);
+        if !ids.insert(a.id) {
+            return Err(GameError::Invalid(format!(
+                "{:?} has the ID of another asset in the set",
+                a.name
+            )));
         }
-        Ok::<_, GameError>(())
-    })();
-    if let Err(e) = result {
-        for (tmp, _) in &staged {
-            let _ = fs::remove_file(tmp);
-        }
-        return Err(e);
     }
 
     let mut manifest =
@@ -192,12 +181,22 @@ pub fn export_assets(
     manifest.project = set.project.clone();
     let before: Vec<Asset> = manifest.assets.clone();
 
-    let mut files = Vec::with_capacity(staged.len());
-    for (tmp, target) in staged {
-        fs::rename(&tmp, &target).map_err(|e| {
-            GameError::Invalid(format!("cannot move {} into place: {e}", target.display()))
-        })?;
-        files.push(target);
+    let mut entries = Vec::with_capacity(assets.len());
+    let mut writes: Files = Vec::new();
+    // Each file to write, by its normalized path, and the asset writing it.
+    let mut writers: BTreeMap<String, &str> = BTreeMap::new();
+    for a in assets {
+        let (entry, files) = render_entry(a, set)?;
+        for (rel, _) in &files {
+            if let Some(other) = writers.insert(normalize(rel), a.name.as_str()) {
+                return Err(GameError::Invalid(format!(
+                    "{other:?} and {:?} would both write {rel}; rename one of them",
+                    a.name
+                )));
+            }
+        }
+        writes.extend(files);
+        entries.push(entry);
     }
 
     let mut removed = Vec::new();
@@ -217,18 +216,130 @@ pub fn export_assets(
         }
     }
     for entry in &entries {
+        check_replace(&manifest, entry, set)?;
+    }
+    for entry in &entries {
         manifest.upsert(entry.clone());
     }
-    write_manifest(dir, &manifest)?;
+    for a in manifest.assets.iter().filter(|a| !ids.contains(&a.id())) {
+        for f in a.files() {
+            if let Some(writer) = writers.get(&normalize(&f.path)) {
+                return Err(GameError::Invalid(format!(
+                    "{writer:?} would overwrite {}, which {:?} in the manifest uses; rename one \
+                     of them",
+                    f.path,
+                    a.name()
+                )));
+            }
+        }
+    }
+    let unused = unused_files(dir, &before, &manifest, set);
 
-    let deleted = delete_unused(dir, &before, &manifest);
+    // Write the audio under temporary names, then move it into place, so a
+    // failure part way leaves the old files and manifest in step.
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(writes.len());
+    for (rel, audio) in &writes {
+        let target = dir.join(rel);
+        let tmp = with_suffix(&target, ".tmp");
+        if let Err(e) = write_wav(&tmp, audio, set.format, set.format != WavFormat::Float32) {
+            let _ = fs::remove_file(&tmp);
+            for (tmp, _) in &staged {
+                let _ = fs::remove_file(tmp);
+            }
+            return Err(e.into());
+        }
+        staged.push((tmp, target));
+    }
+    let mut moved = Vec::with_capacity(staged.len());
+    let result = move_into_place(&staged, &mut moved).and_then(|()| write_manifest(dir, &manifest));
+    if let Err(e) = result {
+        roll_back(&staged, &moved);
+        return Err(e);
+    }
+    for backup in moved.iter().filter_map(|(_, b)| b.as_ref()) {
+        let _ = fs::remove_file(backup);
+    }
+
+    let mut deleted = Vec::new();
+    for path in unused {
+        if path.is_file() && fs::remove_file(&path).is_ok() {
+            deleted.push(path);
+        }
+    }
     Ok(SetExported {
         assets: entries,
-        files,
+        files: staged.into_iter().map(|(_, target)| target).collect(),
         removed,
         deleted,
         manifest: manifest_path(dir),
     })
+}
+
+/// Refuses to replace (by ID or name) an asset that another project manages.
+/// One-off entries, without a project ID, can be taken over by a project.
+fn check_replace(manifest: &Manifest, entry: &Asset, set: &ExportSet) -> Result<(), GameError> {
+    let replaced = manifest
+        .assets
+        .iter()
+        .filter(|a| a.id() == entry.id() || a.name() == entry.name());
+    for old in replaced {
+        if let Some(owner) = old.project_id()
+            && Some(owner) != set.project_id.as_deref()
+        {
+            return Err(GameError::Invalid(format!(
+                "the manifest already has {:?} from another project; rename this asset or \
+                 remove that one from its project",
+                old.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Moves each staged file over its target, keeping any file it replaces as a
+/// backup. Records each move in `moved` as it happens.
+fn move_into_place(
+    staged: &[(PathBuf, PathBuf)],
+    moved: &mut Vec<(PathBuf, Option<PathBuf>)>,
+) -> Result<(), GameError> {
+    let fail = |target: &Path, e: std::io::Error| {
+        GameError::Invalid(format!("cannot move {} into place: {e}", target.display()))
+    };
+    for (tmp, target) in staged {
+        let backup = if target.exists() {
+            let backup = with_suffix(target, ".bak");
+            fs::rename(target, &backup).map_err(|e| fail(target, e))?;
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(e) = fs::rename(tmp, target) {
+            if let Some(backup) = &backup {
+                let _ = fs::rename(backup, target);
+            }
+            return Err(fail(target, e));
+        }
+        moved.push((target.clone(), backup));
+    }
+    Ok(())
+}
+
+/// Puts back the files that [`move_into_place`] replaced and removes the
+/// temporary files still left.
+fn roll_back(staged: &[(PathBuf, PathBuf)], moved: &[(PathBuf, Option<PathBuf>)]) {
+    for (target, backup) in moved.iter().rev() {
+        match backup {
+            Some(backup) => {
+                let _ = fs::rename(backup, target);
+            }
+            None => {
+                let _ = fs::remove_file(target);
+            }
+        }
+    }
+    for (tmp, _) in staged {
+        let _ = fs::remove_file(tmp);
+    }
 }
 
 fn validate(a: &AssetExport) -> Result<(), GameError> {
@@ -380,34 +491,60 @@ fn join(variations: &[&AudioData]) -> AudioData {
     }
 }
 
-fn tmp_path(target: &Path) -> PathBuf {
+/// `target` with `suffix` added to its file name.
+fn with_suffix(target: &Path, suffix: &str) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
+    name.push(suffix);
     target.with_file_name(name)
 }
 
-/// Deletes the audio files that `before` used and `after` does not, when
-/// they are plain relative paths inside `dir`. Returns what was deleted.
-fn delete_unused(dir: &Path, before: &[Asset], after: &Manifest) -> Vec<PathBuf> {
-    let used: BTreeSet<&str> = after
+/// A relative path in the form used to compare two of them: forward slashes,
+/// no empty or `.` parts, lowercase, since the folder may be on a file system
+/// that ignores case.
+fn normalize(rel: &str) -> String {
+    rel.replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase()
+}
+
+/// The path an export gives an asset's file: `music/battle.wav` for a
+/// loop, `sfx/hit_02.wav` for an SFX set's second variation.
+fn generated_path(asset: &Asset, index: usize) -> String {
+    let dir = category_dir(asset.category());
+    match asset {
+        Asset::Loop(_) => format!("{dir}/{}.wav", asset.name()),
+        Asset::Sfx(_) => format!("{dir}/{}_{:02}.wav", asset.name(), index + 1),
+    }
+}
+
+/// The old files this export owns that the new manifest no longer uses:
+/// files of entries in `before` with the set's project ID, at the path an
+/// export gives them, inside `dir`.
+fn unused_files(dir: &Path, before: &[Asset], after: &Manifest, set: &ExportSet) -> Vec<PathBuf> {
+    let used: BTreeSet<String> = after
         .assets
         .iter()
-        .flat_map(|a| a.files().map(|f| f.path.as_str()))
+        .flat_map(|a| a.files().map(|f| normalize(&f.path)))
         .collect();
-    let old: BTreeSet<&str> = before
+    let mut unused = BTreeSet::new();
+    let owned = before
         .iter()
-        .flat_map(|a| a.files().map(|f| f.path.as_str()))
-        .collect();
-    let mut deleted = Vec::new();
-    for rel in old.difference(&used) {
-        let Some(path) = inside(dir, rel) else {
-            continue;
-        };
-        if path.is_file() && fs::remove_file(&path).is_ok() {
-            deleted.push(path);
+        .filter(|a| a.project_id() == set.project_id.as_deref() && is_asset_name(a.name()));
+    for asset in owned {
+        for (i, f) in asset.files().enumerate() {
+            let rel = normalize(&f.path);
+            if used.contains(&rel) || rel != generated_path(asset, i) {
+                continue;
+            }
+            if let Some(path) = inside(dir, &f.path) {
+                unused.insert(path);
+            }
         }
     }
-    deleted
+    unused.into_iter().collect()
 }
 
 /// `rel` joined onto `dir` if it is a relative path to a WAV file that
@@ -740,6 +877,179 @@ mod tests {
         };
         assert!(export_assets(dir.path(), &no_id, &[sfx("hit", 1, vec![&a])]).is_err());
         assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut Manifest)) {
+        let mut m = read_manifest(dir).unwrap().unwrap();
+        edit(&mut m);
+        write_manifest(dir, &m).unwrap();
+    }
+
+    fn sfx_entry<'m>(m: &'m mut Manifest, name: &str) -> &'m mut SfxAsset {
+        m.assets
+            .iter_mut()
+            .find_map(|a| match a {
+                Asset::Sfx(s) if s.name == name => Some(s),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn other_projects_and_hand_made_files_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (tone(4_000), tone(5_000));
+        let other = ExportSet {
+            project_id: Some("p2".into()),
+            ..project_set(true)
+        };
+        export_assets(dir.path(), &other, &[sfx("door", 9, vec![&a])]).unwrap();
+
+        // Another project's asset is not replaced, by a project or by hand.
+        let err = export_assets(dir.path(), &project_set(true), &[sfx("door", 1, vec![&b])]);
+        assert!(err.is_err());
+        let one_off = LoopExport {
+            name: "door",
+            project: "Menu",
+            audio: &b,
+            loop_start: 0,
+            loop_end: 5_000,
+            tempo_bpm: None,
+            time_signature: None,
+            bars: None,
+            category: Category::Sfx,
+            tags: vec![],
+            credits: vec![],
+            format: WavFormat::Pcm16,
+        };
+        assert!(export_loop(dir.path(), &one_off).is_err());
+        let m = read_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(m.find("door").unwrap().project_id(), Some("p2"));
+        assert_eq!(m.find("door").unwrap().id(), AssetId::from_u128(9));
+
+        // An entry written by hand (no project ID) pointing at the user's
+        // own file: a project may take the name over, but the file stays.
+        let by_hand = ExportSet {
+            project_id: None,
+            ..project_set(false)
+        };
+        export_assets(dir.path(), &by_hand, &[sfx("steps", 3, vec![&a])]).unwrap();
+        fs::create_dir_all(dir.path().join("foley")).unwrap();
+        fs::write(dir.path().join("foley/steps.wav"), b"mine").unwrap();
+        edit_manifest(dir.path(), |m| {
+            sfx_entry(m, "steps").variations[0].path = "foley/steps.wav".into();
+        });
+        export_assets(
+            dir.path(),
+            &project_set(true),
+            &[sfx("steps", 3, vec![&a]), sfx("hit", 2, vec![&a])],
+        )
+        .unwrap();
+        assert!(dir.path().join("foley/steps.wav").is_file());
+        let m = read_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(m.find("steps").unwrap().project_id(), Some("p1"));
+
+        // The project's own entry, edited to use a file of the user's: when
+        // the project drops it, the entry goes but the file stays.
+        fs::write(dir.path().join("foley/hit.wav"), b"mine").unwrap();
+        edit_manifest(dir.path(), |m| {
+            sfx_entry(m, "hit").variations[0].path = "foley/hit.wav".into();
+        });
+        let out =
+            export_assets(dir.path(), &project_set(true), &[sfx("steps", 3, vec![&a])]).unwrap();
+        assert_eq!(out.removed, ["hit"]);
+        assert!(out.deleted.is_empty(), "{:?}", out.deleted);
+        assert!(dir.path().join("foley/hit.wav").is_file());
+        assert!(dir.path().join("sfx/door_01.wav").is_file());
+    }
+
+    #[test]
+    fn files_that_would_clash_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (tone(4_000), tone(5_000));
+        let mut clash = intro_loop("hit_01", 1, &b);
+        clash.category = Category::Sfx;
+
+        // Within one set: a loop called hit_01 and the first hit variation.
+        assert!(
+            export_assets(
+                dir.path(),
+                &project_set(true),
+                &[clash, sfx("hit", 2, vec![&a])],
+            )
+            .is_err()
+        );
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+
+        // With an asset already in the folder.
+        let mut clash = intro_loop("hit_01", 1, &b);
+        clash.category = Category::Sfx;
+        let other = ExportSet {
+            project_id: Some("p2".into()),
+            ..project_set(true)
+        };
+        export_assets(dir.path(), &other, &[clash]).unwrap();
+        let before = fs::read(dir.path().join("sfx/hit_01.wav")).unwrap();
+        assert!(export_assets(dir.path(), &project_set(true), &[sfx("hit", 2, vec![&a])]).is_err());
+        assert_eq!(fs::read(dir.path().join("sfx/hit_01.wav")).unwrap(), before);
+    }
+
+    #[test]
+    fn paths_spelled_differently_are_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (tone(4_000), tone(5_000));
+        export_assets(
+            dir.path(),
+            &project_set(true),
+            &[sfx("hit", 2, vec![&a, &b])],
+        )
+        .unwrap();
+        edit_manifest(dir.path(), |m| {
+            let hit = sfx_entry(m, "hit");
+            hit.variations[0].path = "sfx//hit_01.wav".into();
+            hit.variations[1].path = "sfx/./hit_02.wav".into();
+        });
+        let out =
+            export_assets(dir.path(), &project_set(true), &[sfx("hit", 2, vec![&b])]).unwrap();
+        assert!(dir.path().join("sfx/hit_01.wav").is_file());
+        assert!(!dir.path().join("sfx/hit_02.wav").exists());
+        assert_eq!(out.deleted.len(), 1, "{:?}", out.deleted);
+    }
+
+    #[test]
+    fn failed_moves_put_the_old_files_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (tone(4_000), tone(5_000), tone(6_000));
+        export_assets(
+            dir.path(),
+            &project_set(true),
+            &[sfx("hit", 2, vec![&a, &b])],
+        )
+        .unwrap();
+        let first = fs::read(dir.path().join("sfx/hit_01.wav")).unwrap();
+        let manifest = fs::read_to_string(manifest_path(dir.path())).unwrap();
+
+        // A folder where the second file's backup would go: its move fails
+        // after the first file has moved.
+        fs::create_dir_all(dir.path().join("sfx/hit_02.wav.bak/x")).unwrap();
+        let err = export_assets(
+            dir.path(),
+            &project_set(true),
+            &[sfx("hit", 2, vec![&c, &c])],
+        );
+        assert!(err.is_err());
+        assert_eq!(fs::read(dir.path().join("sfx/hit_01.wav")).unwrap(), first);
+        assert!(dir.path().join("sfx/hit_02.wav").is_file());
+        assert_eq!(
+            fs::read_to_string(manifest_path(dir.path())).unwrap(),
+            manifest
+        );
+        let mut left: Vec<String> = fs::read_dir(dir.path().join("sfx"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["hit_01.wav", "hit_02.wav", "hit_02.wav.bak"]);
     }
 
     #[test]

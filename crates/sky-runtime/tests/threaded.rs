@@ -7,6 +7,9 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use common::*;
 use sky_core::manifest::{Category, MANIFEST_FILE_NAME, RandomRange, Selection};
@@ -89,6 +92,7 @@ fn render_split(renderer: &mut Renderer, frames: usize) -> Vec<f32> {
 trait Game {
     fn play(&mut self, name: &str, params: PlayParams) -> sky_runtime::VoiceId;
     fn stop(&mut self, voice: sky_runtime::VoiceId, ms: f32);
+    fn stop_all(&mut self, ms: f32);
     fn gain(&mut self, voice: sky_runtime::VoiceId, db: f32, ms: f32);
     fn pan(&mut self, voice: sky_runtime::VoiceId, pan: f32, ms: f32);
     fn pitch(&mut self, voice: sky_runtime::VoiceId, semitones: f32);
@@ -102,6 +106,9 @@ impl Game for Runtime {
     }
     fn stop(&mut self, voice: sky_runtime::VoiceId, ms: f32) {
         Runtime::stop(self, voice, ms);
+    }
+    fn stop_all(&mut self, ms: f32) {
+        Runtime::stop_all(self, ms);
     }
     fn gain(&mut self, voice: sky_runtime::VoiceId, db: f32, ms: f32) {
         self.set_voice_gain(voice, db, ms);
@@ -126,6 +133,9 @@ impl Game for (Controller, Renderer) {
     }
     fn stop(&mut self, voice: sky_runtime::VoiceId, ms: f32) {
         self.0.stop(voice, ms);
+    }
+    fn stop_all(&mut self, ms: f32) {
+        self.0.stop_all(ms);
     }
     fn gain(&mut self, voice: sky_runtime::VoiceId, db: f32, ms: f32) {
         self.0.set_voice_gain(voice, db, ms);
@@ -191,6 +201,59 @@ fn a_split_runtime_renders_exactly_like_a_single_one() {
     assert_eq!(a, b, "the split runtime must render bit-identically");
 }
 
+/// Stops without a fade, then new voices right away: they take the same
+/// slots on both kinds of runtime, even when only loops were playing.
+fn restarts(game: &mut impl Game) -> Vec<f32> {
+    let mut out = Vec::new();
+    game.play("music", PlayParams::default());
+    game.play("hum", PlayParams::default());
+    out.extend(game.render(1_000));
+    game.stop_all(0.0);
+    game.play(
+        "hum",
+        PlayParams {
+            gain_db: -3.0,
+            ..PlayParams::default()
+        },
+    );
+    game.play("music", PlayParams::default());
+    let hit = game.play("hit", PlayParams::default());
+    out.extend(game.render(1_000));
+    game.stop(hit, 0.0);
+    game.play("blip", PlayParams::default());
+    out.extend(game.render(2_000));
+    out
+}
+
+#[test]
+fn stops_without_a_fade_free_voices_at_once_on_both() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut single = loaded(dir.path(), 3);
+    let mut split = loaded(dir.path(), 3).split(16);
+    let a = restarts(&mut single);
+    let b = restarts(&mut split);
+    assert!(a.iter().any(|s| s.abs() > 0.05));
+    assert_eq!(a, b, "the split runtime must render bit-identically");
+}
+
+#[test]
+fn voices_that_ended_before_a_split_are_free_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut rt = loaded(dir.path(), 1);
+    let hum = rt.play_by_name("hum", PlayParams::default()).unwrap();
+    rt.stop(hum, 5.0);
+    render(&mut rt, 1_000);
+    // Loading again lets go of the audio of voices that ended.
+    rt.load_manifest(dir.path()).unwrap();
+    let (mut ctl, mut rnd) = rt.split(16);
+    assert_eq!(ctl.active_voices(), 0);
+    let music = ctl.play_by_name("music", PlayParams::default()).unwrap();
+    render_split(&mut rnd, 512);
+    assert!(ctl.is_playing(music));
+}
+
 #[test]
 fn ended_voices_are_reported_back_to_the_controller() {
     let dir = tempfile::tempdir().unwrap();
@@ -203,11 +266,16 @@ fn ended_voices_are_reported_back_to_the_controller() {
     render_split(&mut rnd, 2_000);
     assert!(ctl.is_playing(hum));
     assert!(!ctl.is_playing(blip), "the 1000-frame blip ended");
-    ctl.stop(hum, 0.0);
-    // Until the renderer applies the stop, the hum still counts.
+    ctl.stop(hum, 5.0);
+    // Until the renderer has faded it out, the hum still counts.
     assert!(ctl.is_playing(hum));
     render_split(&mut rnd, 512);
     assert!(!ctl.is_playing(hum));
+    assert_eq!(ctl.active_voices(), 0);
+    // A stop without a fade counts at once, as on a single runtime.
+    let again = ctl.play_by_name("hum", PlayParams::default()).unwrap();
+    ctl.stop(again, 0.0);
+    assert!(!ctl.is_playing(again));
     assert_eq!(ctl.active_voices(), 0);
     // Stale ids do nothing.
     ctl.stop(hum, 10.0);
@@ -380,15 +448,17 @@ fn the_halves_run_on_their_own_threads() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
     let (mut ctl, mut rnd) = loaded(dir.path(), 16).split(64);
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let blocks = Arc::new(AtomicUsize::new(0));
     let audio = {
-        let done = done.clone();
+        let (done, blocks) = (done.clone(), blocks.clone());
         std::thread::spawn(move || {
             let mut block = vec![0.0f32; 2 * 128];
             let mut loudest = 0.0f32;
-            while !done.load(std::sync::atomic::Ordering::Acquire) {
+            while !done.load(Ordering::Acquire) {
                 rnd.render(&mut block);
                 loudest = block.iter().fold(loudest, |m, s| m.max(s.abs()));
+                blocks.fetch_add(1, Ordering::Release);
                 std::thread::yield_now();
             }
             (rnd, loudest)
@@ -400,18 +470,26 @@ fn the_halves_run_on_their_own_threads() {
         ctl.set_category_gain(Category::Sfx, -3.0, 5.0);
         std::thread::yield_now();
     }
+    // However the threads were scheduled, let the renderer run a while
+    // with the music playing.
+    let first = blocks.load(Ordering::Acquire);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while blocks.load(Ordering::Acquire) < first + 50 && Instant::now() < deadline {
+        ctl.update();
+        std::thread::yield_now();
+    }
     ctl.stop_all(0.0);
-    done.store(true, std::sync::atomic::Ordering::Release);
+    done.store(true, Ordering::Release);
     let (mut rnd, loudest) = audio.join().unwrap();
     assert!(loudest > 0.01);
-    // Calls that waited for room in the queue still arrive, in order.
+    // Calls that waited for room in the queue still arrive, in order: the
+    // stop comes last and silences everything.
     let mut block = vec![0.0f32; 2 * 128];
     for _ in 0..100 {
-        if ctl.active_voices() == 0 {
-            break;
-        }
+        ctl.update();
         rnd.render(&mut block);
     }
+    assert!(block.iter().all(|s| *s == 0.0));
     assert!(!ctl.is_playing(music));
     assert_eq!(ctl.active_voices(), 0);
 }

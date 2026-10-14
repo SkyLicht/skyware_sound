@@ -1342,6 +1342,18 @@ fn game_assets_are_added_edited_and_exported() {
         game::unique_asset_name(&p, "Demo loop SFX"),
         "demo_loop_sfx_2"
     );
+    // Long project names are cut to fit, suffix and all.
+    let long = "A very long project name ".repeat(4);
+    let name = game::unique_asset_name(&p, &long);
+    assert!(sky_core::manifest::is_asset_name(&name), "{name}");
+    let mut taken = (*p).clone();
+    let mut asset = added.clone();
+    asset.id = sky_core::AssetId::new();
+    asset.name = name.clone();
+    taken.game.assets.push(asset);
+    let second = game::unique_asset_name(&taken, &long);
+    assert!(sky_core::manifest::is_asset_name(&second), "{second}");
+    assert!(second.ends_with("_2") && second != name, "{second}");
 
     // A bad name is refused and the asset keeps its own.
     let mut bad = p.game.asset(sfx).expect("sfx").clone();

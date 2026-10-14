@@ -107,7 +107,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 "{} bars, seam: {}{}",
                 out.bars,
                 out.seam.verdict,
-                out.seam.note.map(|n| format!(" ({n})")).unwrap_or_default()
+                out.seam
+                    .note
+                    .map(|n| format!(". Note: {n}"))
+                    .unwrap_or_default()
             );
             print_licenses(&out.licenses, "Credit in the manifest");
             Ok(())
@@ -129,7 +132,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             s.verdict,
                             s.note
                                 .as_ref()
-                                .map(|n| format!(" ({n})"))
+                                .map(|n| format!(". Note: {n}"))
                                 .unwrap_or_default()
                         )
                     })
