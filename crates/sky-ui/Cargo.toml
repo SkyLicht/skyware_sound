@@ -1,5 +1,6 @@
 [package]
 name = "sky-ui"
+description = "The desktop interface for Skyware Sound"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,33 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+sky-core.workspace = true
+sky-dsp.workspace = true
+sky-pattern.workspace = true
+sky-model.workspace = true
+sky-engine.workspace = true
+sky-io = { workspace = true, features = ["device"] }
+sky-game.workspace = true
+sky-session.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+directories.workspace = true
+egui.workspace = true
+# OpenGL through glow works on both Linux and Windows without a GPU driver
+# stack beyond OpenGL 2+, and keeps the build light.
+eframe = { workspace = true, features = ["default_fonts", "glow", "x11", "wayland"] }
+# Native file dialogs. The portal backend talks to the desktop through a
+# runtime-loaded libdbus (falling back to zenity), so no GTK is needed to build.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# eframe without default features leaves out winit's runtime-loaded Wayland
+# client and its window decorations; ask for both so the build needs no
+# Wayland development files and windows get a title bar on GNOME.
+winit = { version = "0.30", default-features = false, features = ["wayland-dlopen", "wayland-csd-adwaita"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
