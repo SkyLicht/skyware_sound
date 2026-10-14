@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Built-in instruments.
+
+use std::any::Any;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::AudioData;
+use crate::params::ParamSpec;
+
+mod drums;
+mod envelope;
+mod sampler;
+mod synth;
+
+pub use drums::DrumKit;
+pub use envelope::Adsr;
+pub use sampler::Sampler;
+pub use synth::Synth;
+
+/// A note-driven sound source. `render` adds into the buffers.
+pub trait Instrument: Send + 'static {
+    /// Sets a parameter by its spec name. Returns false for unknown names.
+    fn set_param(&mut self, name: &str, value: f32) -> bool;
+    fn note_on(&mut self, pitch: u8, velocity: u8);
+    fn note_off(&mut self, pitch: u8);
+    /// Releases every held note, letting release tails ring out.
+    fn all_notes_off(&mut self);
+    /// Silences everything immediately.
+    fn reset(&mut self);
+    /// Adds one block of output into `left` and `right`. Must not allocate.
+    fn render(&mut self, left: &mut [f32], right: &mut [f32]);
+    /// Takes over the voices of `previous` when it is the same kind of
+    /// instrument, so a graph rebuild does not cut notes off.
+    fn adopt(&mut self, previous: &mut dyn Instrument) -> bool;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+macro_rules! instrument_state {
+    ($($field:ident),*) => {
+        fn adopt(&mut self, previous: &mut dyn $crate::instruments::Instrument) -> bool {
+            match previous.as_any_mut().downcast_mut::<Self>() {
+                Some(_prev) => {
+                    $(std::mem::swap(&mut self.$field, &mut _prev.$field);)*
+                    true
+                }
+                None => false,
+            }
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    };
+}
+pub(crate) use instrument_state;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstrumentType {
+    /// Polyphonic subtractive synth.
+    Synth,
+    /// Synthesized drum machine in 808 and 909 styles, on General MIDI notes.
+    Drums,
+    /// Plays one sample from the audio pool across the keyboard.
+    Sampler,
+}
+
+impl InstrumentType {
+    pub const ALL: [InstrumentType; 3] = [
+        InstrumentType::Synth,
+        InstrumentType::Drums,
+        InstrumentType::Sampler,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            InstrumentType::Synth => "synth",
+            InstrumentType::Drums => "drums",
+            InstrumentType::Sampler => "sampler",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InstrumentType::Synth => "Subtractive synth",
+            InstrumentType::Drums => "Drum machine",
+            InstrumentType::Sampler => "Sampler",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            InstrumentType::Synth => {
+                "16-voice synth: two detuned oscillators, resonant low-pass filter with envelope, ADSR"
+            }
+            InstrumentType::Drums => {
+                "Synthesized kit on General MIDI notes: 36 kick, 37 rim, 38 snare, 39 clap, 42 closed hat, \
+                 46 open hat, 41/45/48 toms, 49 crash, 51 ride, 56 cowbell"
+            }
+            InstrumentType::Sampler => {
+                "Plays one audio-pool sample, pitched relative to its root note"
+            }
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    pub fn params(self) -> &'static [ParamSpec] {
+        match self {
+            InstrumentType::Synth => synth::SYNTH_PARAMS,
+            InstrumentType::Drums => drums::DRUM_PARAMS,
+            InstrumentType::Sampler => sampler::SAMPLER_PARAMS,
+        }
+    }
+
+    /// A new instance with default parameters. `sample` is the audio the
+    /// sampler plays; other instruments ignore it.
+    pub fn create(self, sample_rate: f32, sample: Option<Arc<AudioData>>) -> Box<dyn Instrument> {
+        self.create_with(sample_rate, sample, std::iter::empty())
+    }
+
+    /// A new instance with the given parameter values (others default).
+    pub fn create_with<'a>(
+        self,
+        sample_rate: f32,
+        sample: Option<Arc<AudioData>>,
+        values: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> Box<dyn Instrument> {
+        let mut inst: Box<dyn Instrument> = match self {
+            InstrumentType::Synth => Box::new(Synth::new(sample_rate)),
+            InstrumentType::Drums => Box::new(DrumKit::new(sample_rate)),
+            InstrumentType::Sampler => Box::new(Sampler::new(sample_rate, sample)),
+        };
+        for spec in self.params() {
+            inst.set_param(spec.name, spec.default);
+        }
+        for (name, value) in values {
+            inst.set_param(name, value);
+        }
+        inst
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_seconds(inst: &mut dyn Instrument, seconds: f32) -> (Vec<f32>, Vec<f32>) {
+        let frames = (48_000.0 * seconds) as usize;
+        let mut l = vec![0.0; frames];
+        let mut r = vec![0.0; frames];
+        for (lc, rc) in l.chunks_mut(256).zip(r.chunks_mut(256)) {
+            inst.render(lc, rc);
+        }
+        (l, r)
+    }
+
+    fn peak(buf: &[f32]) -> f32 {
+        buf.iter().fold(0.0, |m, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn instruments_make_sound_and_stop() {
+        let sample = Arc::new(AudioData {
+            sample_rate: 48_000,
+            channels: vec![(0..4_800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect()],
+        });
+        for t in InstrumentType::ALL {
+            let mut inst = t.create(48_000.0, Some(sample.clone()));
+            for spec in t.params() {
+                assert!(
+                    inst.set_param(spec.name, spec.default),
+                    "{} {}",
+                    t.name(),
+                    spec.name
+                );
+            }
+            let note = if t == InstrumentType::Drums { 38 } else { 60 };
+            inst.note_on(note, 100);
+            let (l, r) = render_seconds(inst.as_mut(), 0.1);
+            assert!(peak(&l) > 0.01 && peak(&r) > 0.01, "{} silent", t.name());
+            assert!(l.iter().all(|s| s.is_finite()));
+            inst.all_notes_off();
+            let _ = render_seconds(inst.as_mut(), 4.0);
+            let (l, _) = render_seconds(inst.as_mut(), 0.1);
+            assert!(peak(&l) < 1e-3, "{} did not stop: {}", t.name(), peak(&l));
+        }
+    }
+
+    #[test]
+    fn every_drum_note_sounds() {
+        for note in [
+            35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 56, 57, 59,
+        ] {
+            let mut kit = InstrumentType::Drums.create(48_000.0, None);
+            kit.note_on(note, 127);
+            let (l, _) = render_seconds(kit.as_mut(), 0.05);
+            assert!(peak(&l) > 0.01, "drum note {note} silent");
+        }
+    }
+
+    #[test]
+    fn voices_survive_adopt() {
+        let mut a = InstrumentType::Synth.create(48_000.0, None);
+        a.note_on(60, 100);
+        let _ = render_seconds(a.as_mut(), 0.05);
+        let mut b = InstrumentType::Synth.create(48_000.0, None);
+        assert!(b.adopt(a.as_mut()));
+        let (l, _) = render_seconds(b.as_mut(), 0.05);
+        assert!(peak(&l) > 0.01, "held note lost across adopt");
+        let mut c = InstrumentType::Drums.create(48_000.0, None);
+        assert!(!c.adopt(b.as_mut()));
+    }
+}

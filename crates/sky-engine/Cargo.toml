@@ -1,0 +1,25 @@
+[package]
+name = "sky-engine"
+description = "Real-time audio graph, scheduler and offline renderer for Skyware Sound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+# Only sky-core and sky-runtime are meant for crates.io.
+publish = false
+
+[dependencies]
+sky-core.workspace = true
+sky-dsp.workspace = true
+sky-model.workspace = true
+sky-pattern.workspace = true
+rtrb.workspace = true
+num-rational.workspace = true
+
+[dev-dependencies]
+assert_no_alloc.workspace = true
+
+[lints]
+workspace = true

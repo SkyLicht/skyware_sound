@@ -1,0 +1,27 @@
+[package]
+name = "sky-model"
+description = "Project model, undoable commands, file format and migrations for Skyware Sound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+# Only sky-core and sky-runtime are meant for crates.io.
+publish = false
+
+[dependencies]
+sky-core.workspace = true
+sky-dsp.workspace = true
+sky-pattern.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

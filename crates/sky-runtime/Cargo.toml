@@ -1,0 +1,26 @@
+[package]
+name = "sky-runtime"
+description = "Plays Skyware Sound exports (seamless loops and randomized SFX containers) inside games"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+authors.workspace = true
+repository.workspace = true
+# Permissive on purpose: this crate ships inside games. It must never depend
+# on GPL, AGPL, LGPL or MPL code.
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["audio", "gamedev", "music", "sfx", "loop"]
+categories = ["multimedia::audio", "game-development"]
+
+[dependencies]
+sky-core.workspace = true
+hound.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_no_alloc.workspace = true
+
+[lints]
+workspace = true

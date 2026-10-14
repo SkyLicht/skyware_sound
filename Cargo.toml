@@ -1,0 +1,109 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sky-core",
+    "crates/sky-dsp",
+    "crates/sky-pattern",
+    "crates/sky-model",
+    "crates/sky-engine",
+    "crates/sky-io",
+    "crates/sky-game",
+    "crates/sky-session",
+    "crates/sky-check",
+    "crates/sky-mcp",
+    "crates/sky-ui",
+    "crates/sky-runtime",
+    "crates/skyware",
+]
+default-members = [
+    "crates/sky-core",
+    "crates/sky-dsp",
+    "crates/sky-pattern",
+    "crates/sky-model",
+    "crates/sky-engine",
+    "crates/sky-io",
+    "crates/sky-game",
+    "crates/sky-session",
+    "crates/sky-check",
+    "crates/sky-mcp",
+    "crates/sky-ui",
+    "crates/sky-runtime",
+    "crates/skyware",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+# egui and eframe 0.36 need 1.95. sky-core and sky-runtime, which games
+# embed, keep a lower minimum of their own.
+rust-version = "1.95"
+authors = ["Jorge Ortiz"]
+repository = "https://github.com/SkyLicht/skyware_sound"
+# Every crate is GPL-3.0-or-later except sky-core and sky-runtime, which set
+# their own MIT OR Apache-2.0 license so games can embed them.
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+sky-core = { path = "crates/sky-core", version = "0.1.0-alpha.1" }
+sky-dsp = { path = "crates/sky-dsp" }
+sky-pattern = { path = "crates/sky-pattern" }
+sky-model = { path = "crates/sky-model" }
+sky-engine = { path = "crates/sky-engine" }
+sky-io = { path = "crates/sky-io", default-features = false }
+sky-game = { path = "crates/sky-game" }
+sky-session = { path = "crates/sky-session" }
+sky-check = { path = "crates/sky-check" }
+sky-mcp = { path = "crates/sky-mcp" }
+sky-ui = { path = "crates/sky-ui" }
+sky-runtime = { path = "crates/sky-runtime" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1.18", features = ["v4", "v7", "serde"] }
+num-rational = { version = "0.4", default-features = false, features = ["std"] }
+num-integer = "0.1"
+rtrb = "0.3"
+arc-swap = "1.7"
+crossbeam-channel = "0.5"
+hound = "3.5"
+symphonia = { version = "0.5", default-features = false, features = ["wav", "flac", "ogg", "vorbis", "mp3", "pcm"] }
+cpal = "0.18"
+ebur128 = "0.1"
+# Default features turn the checker off in release builds; keep it on so
+# the no-allocation tests also run in release. The audio callback only
+# calls it in debug builds.
+assert_no_alloc = { version = "1.1", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-std", "signal", "time"] }
+tokio-util = "0.7"
+axum = "0.8"
+rmcp = { version = "3.5", default-features = false }
+schemars = "1"
+egui = "0.36"
+eframe = { version = "0.36", default-features = false }
+egui_dock = "0.21"
+proptest = "1.7"
+tempfile = "3"
+directories = "6"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.dev]
+# Audio code is unusable unoptimized; keep debug assertions but optimize a bit.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

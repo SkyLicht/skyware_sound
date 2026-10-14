@@ -1,0 +1,47 @@
+[package]
+name = "sky-io"
+description = "Audio devices and file decoding and encoding for Skyware Sound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+# Only sky-core and sky-runtime are meant for crates.io.
+publish = false
+
+[features]
+default = ["device"]
+# Audio output through cpal (WASAPI on Windows). Off for pure file work.
+device = ["dep:cpal", "dep:windows"]
+# Steinberg ASIO through cpal; needs the ASIO SDK at build time.
+asio = ["device", "cpal/asio"]
+
+[dependencies]
+sky-dsp.workspace = true
+hound.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sky-engine.workspace = true
+assert_no_alloc.workspace = true
+# "realtime" registers the audio thread with MMCSS on Windows.
+cpal = { workspace = true, optional = true, features = ["realtime"] }
+
+# Asks Windows which buffer periods a device supports. cpal already
+# depends on this version.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

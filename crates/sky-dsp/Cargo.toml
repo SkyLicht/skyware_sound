@@ -1,0 +1,21 @@
+[package]
+name = "sky-dsp"
+description = "Built-in instruments, effects and analysis for Skyware Sound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+# Only sky-core and sky-runtime are meant for crates.io.
+publish = false
+
+[dependencies]
+serde.workspace = true
+ebur128.workspace = true
+
+[dev-dependencies]
+assert_no_alloc.workspace = true
+
+[lints]
+workspace = true

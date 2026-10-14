@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows (fmt, clippy, test, release build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release -p skyware
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyware-windows
+          path: target/release/skyware.exe
+
+  linux:
+    name: Linux (test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test --workspace
+      # Release mode catches timing and overflow behaviour debug builds hide.
+      - run: cargo test --release -p sky-engine -p sky-pattern -p sky-runtime
+
+  runtime-msrv:
+    name: sky-runtime on Rust 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      # Games may use an older compiler than the app needs.
+      - run: cargo test -p sky-runtime -p sky-core
+
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SPDX headers
+        shell: bash
+        run: |
+          missing=$(find crates -name '*.rs' -print0 | xargs -0 grep -L 'SPDX-License-Identifier' || true)
+          if [ -n "$missing" ]; then echo "Files without an SPDX header:"; echo "$missing"; exit 1; fi
+          wrong=$(grep -rL 'SPDX-License-Identifier: MIT OR Apache-2.0' crates/sky-core crates/sky-runtime --include='*.rs' || true)
+          if [ -n "$wrong" ]; then echo "sky-core and sky-runtime files must be MIT OR Apache-2.0:"; echo "$wrong"; exit 1; fi
+      # The app: GPL-3.0-or-later, with GPL-compatible dependencies.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+      # The game runtime and its core types must stay permissive (no GPL,
+      # LGPL, AGPL or MPL code) so games can ship them. Their deny.toml is
+      # stricter than the app's.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: crates/sky-runtime/Cargo.toml
+          command: check licenses
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: crates/sky-core/Cargo.toml
+          command: check licenses
