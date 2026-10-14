@@ -185,7 +185,10 @@ fn the_journal_recovers_unsaved_changes() {
 #[test]
 fn save_needs_a_folder() {
     let session = headless(demo_project());
-    assert!(matches!(session.save(None), Err(SessionError::NoProjectPath)));
+    assert!(matches!(
+        session.save(None),
+        Err(SessionError::NoProjectPath)
+    ));
 }
 
 #[test]
@@ -215,7 +218,10 @@ fn live_engine_follows_changes_and_transport() {
         engine.process_planar(&mut l, &mut r);
     }
     engine.process_planar(&mut l, &mut r);
-    assert!(l.iter().all(|s| s.abs() < 1e-4), "muting the master silences it");
+    assert!(
+        l.iter().all(|s| s.abs() < 1e-4),
+        "muting the master silences it"
+    );
 
     session.stop().unwrap();
     engine.process_planar(&mut l, &mut r);

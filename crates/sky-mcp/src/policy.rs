@@ -57,7 +57,10 @@ impl Policy {
         if given.as_os_str().is_empty() {
             return Err("the path is empty".into());
         }
-        if given.components().any(|c| matches!(c, Component::ParentDir)) {
+        if given
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
             return Err("paths may not contain \"..\"".into());
         }
         let joined = if given.is_absolute() {
@@ -116,9 +119,17 @@ mod tests {
         let policy = Policy::new(Permission::Files, vec![root.clone()]);
         let root = std::fs::canonicalize(&root).unwrap();
         assert_eq!(policy.resolve("a/b.wav").unwrap(), root.join("a/b.wav"));
-        assert!(policy.resolve(root.join("x.skyproj").to_str().unwrap()).is_ok());
+        assert!(
+            policy
+                .resolve(root.join("x.skyproj").to_str().unwrap())
+                .is_ok()
+        );
         assert!(policy.resolve("../escape.wav").is_err());
-        assert!(policy.resolve(tmp.path().join("other.wav").to_str().unwrap()).is_err());
+        assert!(
+            policy
+                .resolve(tmp.path().join("other.wav").to_str().unwrap())
+                .is_err()
+        );
         let none = Policy::new(Permission::Files, vec![]);
         assert!(none.resolve("a.wav").is_err());
     }

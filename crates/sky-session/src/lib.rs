@@ -19,7 +19,9 @@ use sky_core::manifest::Category;
 use sky_core::{AudioId, Ticks};
 use sky_dsp::AudioData;
 use sky_dsp::analysis::{self, SeamReport};
-use sky_engine::{AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, compile, create_engine};
+use sky_engine::{
+    AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, compile, create_engine,
+};
 use sky_game::{Exported, LoopExport};
 use sky_io::{WavFormat, read_audio, write_wav};
 use sky_model::file::{self, Journal};
@@ -576,7 +578,10 @@ impl Session {
         st.dirty = replayed > 0;
         let mut status = format!("Opened {}", dir.display());
         if replayed > 0 {
-            status = format!("Recovered {replayed} unsaved change(s) in {}", dir.display());
+            status = format!(
+                "Recovered {replayed} unsaved change(s) in {}",
+                dir.display()
+            );
         }
         if !missing.is_empty() {
             status.push_str(&format!("; missing audio: {}", missing.join(", ")));
@@ -699,7 +704,9 @@ impl Session {
             None => {
                 let end = self.project().content_end();
                 if end <= 0 {
-                    return Err(SessionError::Invalid("the project has no clips to export".into()));
+                    return Err(SessionError::Invalid(
+                        "the project has no clips to export".into(),
+                    ));
                 }
                 (0, end)
             }

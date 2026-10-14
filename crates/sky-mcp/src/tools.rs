@@ -73,8 +73,8 @@ pub struct SkywareMcp {
 /// The permission each tool needs.
 fn required(tool: &str) -> Permission {
     match tool {
-        "project_summary" | "track_get" | "clip_get" | "catalog" | "history"
-        | "pattern_query" | "analyze" | "loop_check_seam" => Permission::ReadOnly,
+        "project_summary" | "track_get" | "clip_get" | "catalog" | "history" | "pattern_query"
+        | "analyze" | "loop_check_seam" => Permission::ReadOnly,
         "project_open" | "project_save" | "audio_import" | "export_wav" | "export_loop" => {
             Permission::Files
         }
@@ -127,9 +127,7 @@ fn find_track(project: &Project, r: &str) -> Result<TrackId, String> {
             "no track is named {r:?}; the tracks are: {}",
             names(project.tracks.iter().map(|t| t.name.as_str()))
         )),
-        _ => Err(format!(
-            "several tracks are named {r:?}; use the track ID"
-        )),
+        _ => Err(format!("several tracks are named {r:?}; use the track ID")),
     }
 }
 
@@ -312,7 +310,8 @@ fn parse_color(text: &str) -> Result<[u8; 3], String> {
     if hex.len() != 6 {
         return Err(bad());
     }
-    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2).unwrap_or(""), 16).map_err(|_| bad());
+    let byte =
+        |i: usize| u8::from_str_radix(hex.get(i..i + 2).unwrap_or(""), 16).map_err(|_| bad());
     Ok([byte(0)?, byte(2)?, byte(4)?])
 }
 
@@ -322,18 +321,20 @@ fn wav_format(bits: Option<u16>) -> Result<WavFormat, String> {
 }
 
 fn category(name: Option<&str>) -> Result<Category, String> {
-    Ok(match name.unwrap_or("music").to_ascii_lowercase().as_str() {
-        "music" => Category::Music,
-        "sfx" => Category::Sfx,
-        "ui" => Category::Ui,
-        "voice" => Category::Voice,
-        "ambience" => Category::Ambience,
-        other => {
-            return Err(format!(
-                "category {other:?} is not one of music, sfx, ui, voice, ambience"
-            ));
-        }
-    })
+    Ok(
+        match name.unwrap_or("music").to_ascii_lowercase().as_str() {
+            "music" => Category::Music,
+            "sfx" => Category::Sfx,
+            "ui" => Category::Ui,
+            "voice" => Category::Voice,
+            "ambience" => Category::Ambience,
+            other => {
+                return Err(format!(
+                    "category {other:?} is not one of music, sfx, ui, voice, ambience"
+                ));
+            }
+        },
+    )
 }
 
 /// Shortens long arrays in a JSON value so results stay small.
@@ -630,7 +631,11 @@ pub struct ExportLoopArgs {
 impl SkywareMcp {
     pub fn new(session: Session, policy: Policy) -> Self {
         let mut router = Self::tool_router();
-        let names: Vec<String> = router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let names: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
         for name in names {
             if required(&name) > policy.permission {
                 router.remove_route(&name);
@@ -656,7 +661,13 @@ impl SkywareMcp {
             .collect()
     }
 
-    fn apply(&self, ctx: &RequestContext<RoleServer>, tool: &str, label: String, commands: Vec<Command>) -> Result<u64, String> {
+    fn apply(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        tool: &str,
+        label: String,
+        commands: Vec<Command>,
+    ) -> Result<u64, String> {
         self.session
             .apply(Transaction::new(label, origin(ctx, tool), commands))
             .map_err(|e| e.to_string())
@@ -664,9 +675,11 @@ impl SkywareMcp {
 
     fn check_unsaved(&self, discard: Option<bool>) -> Result<(), String> {
         if self.session.view().dirty && discard != Some(true) {
-            return Err("the open project has unsaved changes; save it first, or pass \
+            return Err(
+                "the open project has unsaved changes; save it first, or pass \
                         discard_unsaved: true"
-                .into());
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -784,7 +797,10 @@ impl SkywareMcp {
                 })
             })
             .collect();
-        let silent = events.iter().filter(|e| e.value.midi_note().is_none()).count();
+        let silent = events
+            .iter()
+            .filter(|e| e.value.midi_note().is_none())
+            .count();
         let mut v = json!({ "cycles": cycles, "eventCount": events.len(), "events": list });
         if silent > 0 {
             v["warning"] = json!(format!(
@@ -812,7 +828,8 @@ impl SkywareMcp {
                 session.render_range(s, e, a.tail_seconds.unwrap_or(2.0))
             }
             .map_err(|e| e.to_string())?;
-            let mut v = serde_json::to_value(analysis::analyze(&audio)).map_err(|e| e.to_string())?;
+            let mut v =
+                serde_json::to_value(analysis::analyze(&audio)).map_err(|e| e.to_string())?;
             trim_arrays(&mut v, 32);
             Ok(v.to_string())
         })
@@ -854,7 +871,11 @@ impl SkywareMcp {
                 s.seek(tick)
             }
             "status" => Ok(()),
-            other => return Err(format!("action {other:?} is not play, stop, seek or status")),
+            other => {
+                return Err(format!(
+                    "action {other:?} is not play, stop, seek or status"
+                ));
+            }
         }
         .map_err(|e| e.to_string())?;
         let t = s.transport();
@@ -869,8 +890,17 @@ impl SkywareMcp {
     }
 
     #[tool(description = "Sets the project tempo.")]
-    async fn set_tempo(&self, Parameters(a): Parameters<TempoArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
-        self.apply(&ctx, "set_tempo", format!("Set tempo to {} BPM", a.bpm), vec![Command::SetTempo { bpm: a.bpm }])?;
+    async fn set_tempo(
+        &self,
+        Parameters(a): Parameters<TempoArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        self.apply(
+            &ctx,
+            "set_tempo",
+            format!("Set tempo to {} BPM", a.bpm),
+            vec![Command::SetTempo { bpm: a.bpm }],
+        )?;
         Ok(format!("Tempo is now {} BPM.", a.bpm))
     }
 
@@ -889,13 +919,21 @@ impl SkywareMcp {
                 denominator: a.denominator,
             }],
         )?;
-        Ok(format!("Time signature is now {}/{}.", a.numerator, a.denominator))
+        Ok(format!(
+            "Time signature is now {}/{}.",
+            a.numerator, a.denominator
+        ))
     }
 
     #[tool(description = "Sets the loop region in bars and turns looping on (or off).")]
-    async fn set_loop(&self, Parameters(a): Parameters<LoopArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    async fn set_loop(
+        &self,
+        Parameters(a): Parameters<LoopArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
-        let (s, e) = bar_range(&project, Some(a.start_bar), Some(a.end_bar))?.ok_or("empty range")?;
+        let (s, e) =
+            bar_range(&project, Some(a.start_bar), Some(a.end_bar))?.ok_or("empty range")?;
         let enabled = a.enabled.unwrap_or(true);
         self.apply(
             &ctx,
@@ -915,10 +953,22 @@ impl SkywareMcp {
         ))
     }
 
-    #[tool(description = "Adds a track: an instrument track with a synth, drum kit or sampler, or an audio track. Returns its ID.")]
-    async fn track_create(&self, Parameters(a): Parameters<TrackCreateArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Adds a track: an instrument track with a synth, drum kit or sampler, or an audio track. Returns its ID."
+    )]
+    async fn track_create(
+        &self,
+        Parameters(a): Parameters<TrackCreateArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
-        let mut track = match a.kind.as_deref().unwrap_or("instrument").to_ascii_lowercase().as_str() {
+        let mut track = match a
+            .kind
+            .as_deref()
+            .unwrap_or("instrument")
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "audio" => Track::new_audio(a.name.clone()),
             "instrument" | "midi" => {
                 let name = a.instrument.as_deref().unwrap_or("synth");
@@ -957,17 +1007,38 @@ impl SkywareMcp {
         Ok(json!({ "track": id.to_string(), "name": a.name }).to_string())
     }
 
-    #[tool(description = "Deletes a track and its clips.", annotations(destructive_hint = true))]
-    async fn track_delete(&self, Parameters(a): Parameters<TrackArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Deletes a track and its clips.",
+        annotations(destructive_hint = true)
+    )]
+    async fn track_delete(
+        &self,
+        Parameters(a): Parameters<TrackArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let id = find_track(&project, &a.track)?;
-        let name = project.track(id).map(|t| t.name.clone()).unwrap_or_default();
-        self.apply(&ctx, "track_delete", format!("Delete track {name}"), vec![Command::RemoveTrack { id }])?;
+        let name = project
+            .track(id)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        self.apply(
+            &ctx,
+            "track_delete",
+            format!("Delete track {name}"),
+            vec![Command::RemoveTrack { id }],
+        )?;
         Ok(format!("Deleted track {name}."))
     }
 
-    #[tool(description = "Changes a track's name, color, position, or its mixer volume, pan, mute and solo. Use track \"master\" for the master volume.")]
-    async fn track_set(&self, Parameters(a): Parameters<TrackSetArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Changes a track's name, color, position, or its mixer volume, pan, mute and solo. Use track \"master\" for the master volume."
+    )]
+    async fn track_set(
+        &self,
+        Parameters(a): Parameters<TrackSetArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let channel = find_channel(&project, &a.track)?;
         let mut cmds = Vec::new();
@@ -979,10 +1050,16 @@ impl SkywareMcp {
             }
             ChannelRef::Track(id) => {
                 if let Some(name) = &a.name {
-                    cmds.push(Command::SetTrackName { id, name: name.clone() });
+                    cmds.push(Command::SetTrackName {
+                        id,
+                        name: name.clone(),
+                    });
                 }
                 if let Some(c) = &a.color {
-                    cmds.push(Command::SetTrackColor { id, color: parse_color(c)? });
+                    cmds.push(Command::SetTrackColor {
+                        id,
+                        color: parse_color(c)?,
+                    });
                 }
                 if let Some(index) = a.index {
                     cmds.push(Command::MoveTrack { id, index });
@@ -1012,18 +1089,29 @@ impl SkywareMcp {
         })
     }
 
-    #[tool(description = "Changes a track's instrument: replace it with another type, set parameters (null restores a default), or choose the sampler's audio.")]
-    async fn instrument_set(&self, Parameters(a): Parameters<InstrumentSetArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Changes a track's instrument: replace it with another type, set parameters (null restores a default), or choose the sampler's audio."
+    )]
+    async fn instrument_set(
+        &self,
+        Parameters(a): Parameters<InstrumentSetArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let id = find_track(&project, &a.track)?;
         let track = project.track(id).map_err(|e| e.to_string())?;
         if track.kind != TrackKind::Instrument {
-            return Err(format!("{} is an audio track and has no instrument", track.name));
+            return Err(format!(
+                "{} is an audio track and has no instrument",
+                track.name
+            ));
         }
         let mut slot = match &a.kind {
-            Some(name) => InstrumentSlot::new(InstrumentType::from_name(name).ok_or_else(|| {
-                format!("instrument {name:?} is not one of synth, drums, sampler")
-            })?),
+            Some(name) => {
+                InstrumentSlot::new(InstrumentType::from_name(name).ok_or_else(|| {
+                    format!("instrument {name:?} is not one of synth, drums, sampler")
+                })?)
+            }
             None => track
                 .instrument
                 .clone()
@@ -1046,7 +1134,10 @@ impl SkywareMcp {
             &ctx,
             "instrument_set",
             format!("Change {} instrument", track.name),
-            vec![Command::SetInstrument { track: id, instrument: Some(slot) }],
+            vec![Command::SetInstrument {
+                track: id,
+                instrument: Some(slot),
+            }],
         )?;
         let project = self.session.project();
         let t = project.track(id).map_err(|e| e.to_string())?;
@@ -1054,7 +1145,11 @@ impl SkywareMcp {
     }
 
     #[tool(description = "Inserts an effect on a track or the master. Returns its ID.")]
-    async fn effect_insert(&self, Parameters(a): Parameters<EffectInsertArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    async fn effect_insert(
+        &self,
+        Parameters(a): Parameters<EffectInsertArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let channel = find_channel(&project, &a.channel)?;
         let kind = EffectType::from_name(&a.kind).ok_or_else(|| {
@@ -1075,13 +1170,23 @@ impl SkywareMcp {
             &ctx,
             "effect_insert",
             format!("Add {} on {}", kind.label(), a.channel),
-            vec![Command::AddEffect { channel, effect: slot, index: a.index }],
+            vec![Command::AddEffect {
+                channel,
+                effect: slot,
+                index: a.index,
+            }],
         )?;
         Ok(json!({ "effect": id.to_string(), "type": kind.name() }).to_string())
     }
 
-    #[tool(description = "Sets an effect's parameters (null restores a default) or turns it on or off.")]
-    async fn effect_set(&self, Parameters(a): Parameters<EffectSetArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Sets an effect's parameters (null restores a default) or turns it on or off."
+    )]
+    async fn effect_set(
+        &self,
+        Parameters(a): Parameters<EffectSetArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let channel = find_channel(&project, &a.channel)?;
         let effect = find_effect(&project, channel, &a.effect)?;
@@ -1093,31 +1198,63 @@ impl SkywareMcp {
         let mut cmds = Vec::new();
         for (k, v) in a.params.iter().flatten() {
             let value = param_value(kind.params(), kind.name(), k, v)?;
-            cmds.push(Command::SetEffectParam { channel, effect, param: k.clone(), value });
+            cmds.push(Command::SetEffectParam {
+                channel,
+                effect,
+                param: k.clone(),
+                value,
+            });
         }
         if let Some(enabled) = a.enabled {
-            cmds.push(Command::SetEffectEnabled { channel, effect, enabled });
+            cmds.push(Command::SetEffectEnabled {
+                channel,
+                effect,
+                enabled,
+            });
         }
         if cmds.is_empty() {
             return Err("nothing to change: give params or enabled".into());
         }
-        self.apply(&ctx, "effect_set", format!("Change {} on {}", kind.label(), a.channel), cmds)?;
+        self.apply(
+            &ctx,
+            "effect_set",
+            format!("Change {} on {}", kind.label(), a.channel),
+            cmds,
+        )?;
         let project = self.session.project();
-        let slot = channel_effects(&project, channel).iter().find(|e| e.id == effect).cloned();
+        let slot = channel_effects(&project, channel)
+            .iter()
+            .find(|e| e.id == effect)
+            .cloned();
         Ok(json!(slot.map(|s| json!({ "effect": s.id.to_string(), "type": s.kind.name(), "enabled": s.enabled, "params": s.params }))).to_string())
     }
 
     #[tool(description = "Removes an effect from a track or the master.")]
-    async fn effect_remove(&self, Parameters(a): Parameters<EffectRemoveArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    async fn effect_remove(
+        &self,
+        Parameters(a): Parameters<EffectRemoveArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let channel = find_channel(&project, &a.channel)?;
         let id = find_effect(&project, channel, &a.effect)?;
-        self.apply(&ctx, "effect_remove", format!("Remove effect from {}", a.channel), vec![Command::RemoveEffect { channel, id }])?;
+        self.apply(
+            &ctx,
+            "effect_remove",
+            format!("Remove effect from {}", a.channel),
+            vec![Command::RemoveEffect { channel, id }],
+        )?;
         Ok("Removed.".into())
     }
 
-    #[tool(description = "Adds a clip: a MIDI clip (notes in the compact list), a pattern clip (mini-notation) on an instrument track, or an audio clip on an audio track. Returns the clip.")]
-    async fn clip_create(&self, Parameters(a): Parameters<ClipCreateArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Adds a clip: a MIDI clip (notes in the compact list), a pattern clip (mini-notation) on an instrument track, or an audio clip on an audio track. Returns the clip."
+    )]
+    async fn clip_create(
+        &self,
+        Parameters(a): Parameters<ClipCreateArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let track = find_track(&project, &a.track)?;
         let start = bar_tick(&project, a.start_bar)?;
@@ -1131,7 +1268,10 @@ impl SkywareMcp {
         }
         let (content, default_name) = if let Some(audio) = &a.audio {
             let source = find_audio(&project, audio)?;
-            let name = project.pool_entry(source).map(|e| e.name.clone()).unwrap_or_default();
+            let name = project
+                .pool_entry(source)
+                .map(|e| e.name.clone())
+                .unwrap_or_default();
             (
                 ClipContent::Audio {
                     source,
@@ -1145,11 +1285,16 @@ impl SkywareMcp {
         } else if let Some(p) = &a.pattern {
             let cycle = bars_len(&project, a.cycle_bars.unwrap_or(1.0))?;
             (
-                ClipContent::Pattern { source: p.clone(), seed: a.seed.unwrap_or(0), cycle },
+                ClipContent::Pattern {
+                    source: p.clone(),
+                    seed: a.seed.unwrap_or(0),
+                    cycle,
+                },
                 "Pattern".to_string(),
             )
         } else {
-            let notes = parse_note_list(a.notes.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
+            let notes =
+                parse_note_list(a.notes.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
             (ClipContent::Midi { notes }, "Clip".to_string())
         };
         let clip = Clip {
@@ -1164,7 +1309,10 @@ impl SkywareMcp {
             &ctx,
             "clip_create",
             format!("Add clip {}", clip.name),
-            vec![Command::AddClip { track, clip: Box::new(clip) }],
+            vec![Command::AddClip {
+                track,
+                clip: Box::new(clip),
+            }],
         )?;
         let project = self.session.project();
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
@@ -1172,15 +1320,30 @@ impl SkywareMcp {
     }
 
     #[tool(description = "Deletes a clip.", annotations(destructive_hint = true))]
-    async fn clip_delete(&self, Parameters(a): Parameters<ClipArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    async fn clip_delete(
+        &self,
+        Parameters(a): Parameters<ClipArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let id = find_clip(&project, &a.clip)?;
-        self.apply(&ctx, "clip_delete", "Delete clip".into(), vec![Command::RemoveClip { id }])?;
+        self.apply(
+            &ctx,
+            "clip_delete",
+            "Delete clip".into(),
+            vec![Command::RemoveClip { id }],
+        )?;
         Ok("Deleted.".into())
     }
 
-    #[tool(description = "Moves a clip to another bar or track, changes its length, or renames it.")]
-    async fn clip_move(&self, Parameters(a): Parameters<ClipMoveArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Moves a clip to another bar or track, changes its length, or renames it."
+    )]
+    async fn clip_move(
+        &self,
+        Parameters(a): Parameters<ClipMoveArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let id = find_clip(&project, &a.clip)?;
         let (track, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
@@ -1197,34 +1360,58 @@ impl SkywareMcp {
             cmds.push(Command::MoveClip { id, track, start });
         }
         if let Some(l) = a.length_bars {
-            cmds.push(Command::SetClipLength { id, length: bars_len(&project, l)? });
+            cmds.push(Command::SetClipLength {
+                id,
+                length: bars_len(&project, l)?,
+            });
         }
         if let Some(n) = &a.name {
-            cmds.push(Command::SetClipName { id, name: n.clone() });
+            cmds.push(Command::SetClipName {
+                id,
+                name: n.clone(),
+            });
         }
         if cmds.is_empty() {
             return Err("nothing to change: give start_bar, track, length_bars or name".into());
         }
-        self.apply(&ctx, "clip_move", format!("Change clip {}", clip.name), cmds)?;
+        self.apply(
+            &ctx,
+            "clip_move",
+            format!("Change clip {}", clip.name),
+            cmds,
+        )?;
         let project = self.session.project();
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
         Ok(clip_json(&project, clip, false).to_string())
     }
 
-    #[tool(description = "Writes notes into a MIDI clip from the compact note list, replacing its notes (default) or adding to them. Note positions are relative to the clip start.")]
-    async fn notes_write(&self, Parameters(a): Parameters<NotesWriteArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Writes notes into a MIDI clip from the compact note list, replacing its notes (default) or adding to them. Note positions are relative to the clip start."
+    )]
+    async fn notes_write(
+        &self,
+        Parameters(a): Parameters<NotesWriteArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let id = find_clip(&project, &a.clip)?;
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
         let ClipContent::Midi { notes: old } = &clip.content else {
-            return Err(format!("{} is a {} clip, not a MIDI clip", clip.name, clip.kind_name()));
+            return Err(format!(
+                "{} is a {} clip, not a MIDI clip",
+                clip.name,
+                clip.kind_name()
+            ));
         };
         let notes = parse_note_list(&a.notes).map_err(|e| e.to_string())?;
         let mut cmds = Vec::new();
         match a.mode.as_deref().unwrap_or("replace") {
             "replace" => {
                 if !old.is_empty() {
-                    cmds.push(Command::RemoveNotes { clip: id, ids: old.iter().map(|n| n.id).collect() });
+                    cmds.push(Command::RemoveNotes {
+                        clip: id,
+                        ids: old.iter().map(|n| n.id).collect(),
+                    });
                 }
             }
             "add" => {}
@@ -1237,27 +1424,45 @@ impl SkywareMcp {
         if cmds.is_empty() {
             return Err("there are no notes to write".into());
         }
-        self.apply(&ctx, "notes_write", format!("Write notes in {}", clip.name), cmds)?;
+        self.apply(
+            &ctx,
+            "notes_write",
+            format!("Write notes in {}", clip.name),
+            cmds,
+        )?;
         let project = self.session.project();
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
         let ClipContent::Midi { notes } = &clip.content else {
             return Err("the clip changed type".into());
         };
         let beyond = notes.iter().filter(|n| n.start >= clip.length).count();
-        let mut v = json!({ "written": count, "noteCount": notes.len(), "notes": format_note_list(notes) });
+        let mut v =
+            json!({ "written": count, "noteCount": notes.len(), "notes": format_note_list(notes) });
         if beyond > 0 {
-            v["warning"] = json!(format!("{beyond} note(s) start after the clip ends and will not play; lengthen the clip with clip_move"));
+            v["warning"] = json!(format!(
+                "{beyond} note(s) start after the clip ends and will not play; lengthen the clip with clip_move"
+            ));
         }
         Ok(v.to_string())
     }
 
-    #[tool(description = "Replaces a pattern clip's mini-notation, and optionally its cycle length or seed.")]
-    async fn pattern_set(&self, Parameters(a): Parameters<PatternSetArgs>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Replaces a pattern clip's mini-notation, and optionally its cycle length or seed."
+    )]
+    async fn pattern_set(
+        &self,
+        Parameters(a): Parameters<PatternSetArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let project = self.session.project();
         let id = find_clip(&project, &a.clip)?;
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
         let ClipContent::Pattern { seed, cycle, .. } = &clip.content else {
-            return Err(format!("{} is a {} clip, not a pattern clip", clip.name, clip.kind_name()));
+            return Err(format!(
+                "{} is a {} clip, not a pattern clip",
+                clip.name,
+                clip.kind_name()
+            ));
         };
         let cycle = match a.cycle_bars {
             Some(b) => bars_len(&project, b)?,
@@ -1267,7 +1472,12 @@ impl SkywareMcp {
             &ctx,
             "pattern_set",
             format!("Change pattern {}", clip.name),
-            vec![Command::SetPattern { clip: id, source: a.pattern.clone(), seed: a.seed.unwrap_or(*seed), cycle }],
+            vec![Command::SetPattern {
+                clip: id,
+                source: a.pattern.clone(),
+                seed: a.seed.unwrap_or(*seed),
+                cycle,
+            }],
         )?;
         Ok(format!("Pattern is now {:?}.", a.pattern))
     }
@@ -1292,7 +1502,10 @@ impl SkywareMcp {
         Ok(format!("Redid: {label}."))
     }
 
-    #[tool(description = "Starts a new project, empty or from the demo template. The open project must be saved first unless discard_unsaved is true.", annotations(destructive_hint = true))]
+    #[tool(
+        description = "Starts a new project, empty or from the demo template. The open project must be saved first unless discard_unsaved is true.",
+        annotations(destructive_hint = true)
+    )]
     async fn project_new(&self, Parameters(a): Parameters<ProjectNewArgs>) -> ToolResult {
         self.check_unsaved(a.discard_unsaved)?;
         let name = a.name.unwrap_or_else(|| "Untitled".into());
@@ -1306,7 +1519,9 @@ impl SkywareMcp {
         Ok(project_summary(&self.session.project()).to_string())
     }
 
-    #[tool(description = "Opens a .skyproj project folder. Changes a crash left unsaved are recovered.")]
+    #[tool(
+        description = "Opens a .skyproj project folder. Changes a crash left unsaved are recovered."
+    )]
     async fn project_open(&self, Parameters(a): Parameters<ProjectOpenArgs>) -> ToolResult {
         self.check_unsaved(a.discard_unsaved)?;
         let path = self.policy.resolve(&a.path)?;
@@ -1324,7 +1539,9 @@ impl SkywareMcp {
         let path = match &a.path {
             Some(p) => {
                 let mut p = PathBuf::from(p);
-                if p.extension().is_none_or(|e| e != sky_model::file::EXTENSION) {
+                if p.extension()
+                    .is_none_or(|e| e != sky_model::file::EXTENSION)
+                {
                     p.set_extension(sky_model::file::EXTENSION);
                 }
                 Some(self.policy.resolve(&p.to_string_lossy())?)
@@ -1338,16 +1555,28 @@ impl SkywareMcp {
             }
         };
         let session = self.session.clone();
-        let dir = blocking(move || session.save(path.as_deref()).map_err(|e| e.to_string())).await?;
+        let dir =
+            blocking(move || session.save(path.as_deref()).map_err(|e| e.to_string())).await?;
         Ok(format!("Saved to {}.", dir.display()))
     }
 
-    #[tool(description = "Imports an audio file (WAV, FLAC, OGG, MP3) into the project's audio pool, for audio clips or the sampler. Returns its ID.")]
-    async fn audio_import(&self, Parameters(a): Parameters<PathArg>, ctx: RequestContext<RoleServer>) -> ToolResult {
+    #[tool(
+        description = "Imports an audio file (WAV, FLAC, OGG, MP3) into the project's audio pool, for audio clips or the sampler. Returns its ID."
+    )]
+    async fn audio_import(
+        &self,
+        Parameters(a): Parameters<PathArg>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
         let path = self.policy.resolve(&a.path)?;
         let session = self.session.clone();
         let origin = origin(&ctx, "audio_import");
-        let id = blocking(move || session.import_audio(&path, origin).map_err(|e| e.to_string())).await?;
+        let id = blocking(move || {
+            session
+                .import_audio(&path, origin)
+                .map_err(|e| e.to_string())
+        })
+        .await?;
         let project = self.session.project();
         let entry = project.pool_entry(id).map_err(|e| e.to_string())?;
         Ok(json!({
@@ -1359,7 +1588,9 @@ impl SkywareMcp {
         .to_string())
     }
 
-    #[tool(description = "Renders the arrangement (or the given bars) with a tail and writes a WAV file.")]
+    #[tool(
+        description = "Renders the arrangement (or the given bars) with a tail and writes a WAV file."
+    )]
     async fn export_wav(&self, Parameters(a): Parameters<ExportWavArgs>) -> ToolResult {
         let path = self.policy.resolve(&a.path)?;
         let format = wav_format(a.bits)?;
@@ -1382,12 +1613,17 @@ impl SkywareMcp {
         .await
     }
 
-    #[tool(description = "Renders the loop region (or the given bars) as a seamless game loop, writes the WAV into the export folder and records it in skyware-manifest.json for the game runtime. Exporting the same name again replaces it and keeps its ID.")]
+    #[tool(
+        description = "Renders the loop region (or the given bars) as a seamless game loop, writes the WAV into the export folder and records it in skyware-manifest.json for the game runtime. Exporting the same name again replaces it and keeps its ID."
+    )]
     async fn export_loop(&self, Parameters(a): Parameters<ExportLoopArgs>) -> ToolResult {
         let dir = match &a.dir {
             Some(d) => Some(self.policy.resolve(d)?),
             None => match &self.session.view().path {
-                Some(p) => Some(self.policy.resolve(&p.join("renders").join("export").to_string_lossy())?),
+                Some(p) => Some(
+                    self.policy
+                        .resolve(&p.join("renders").join("export").to_string_lossy())?,
+                ),
                 None => return Err("save the project first, or give an export dir".into()),
             },
         };

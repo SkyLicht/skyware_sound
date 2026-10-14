@@ -94,9 +94,13 @@ pub async fn serve_http(
         .enforce_origin_validation();
     let service: StreamableHttpService<SkywareMcp, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(make()), Default::default(), config);
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(Arc::new(token), require_token));
+    let router =
+        axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn_with_state(
+                Arc::new(token),
+                require_token,
+            ));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     let ct = cancel.clone();

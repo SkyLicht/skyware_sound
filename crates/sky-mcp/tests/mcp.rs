@@ -71,21 +71,61 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
     assert!(tools.len() >= 30, "{} tools", tools.len());
 
     ok(&client, "set_tempo", json!({ "bpm": 100 })).await;
-    ok(&client, "track_create", json!({ "name": "Drums", "instrument": "drums" })).await;
-    ok(&client, "track_create", json!({ "name": "Bass", "params": { "wave": "square", "cutoff": 900 } })).await;
-    ok(&client, "clip_create", json!({
-        "track": "Drums", "start_bar": 1, "length_bars": 16,
-        "pattern": "bd*4, ~ sd ~ sd, hh*8", "name": "Beat"
-    })).await;
-    let clip = ok(&client, "clip_create", json!({
-        "track": "Bass", "start_bar": 1, "length_bars": 16, "name": "Bassline",
-        "notes": "A1 1/4, A1 1/8, C2 1/8, E2 1/4, G1 1/4"
-    })).await;
+    ok(
+        &client,
+        "track_create",
+        json!({ "name": "Drums", "instrument": "drums" }),
+    )
+    .await;
+    ok(
+        &client,
+        "track_create",
+        json!({ "name": "Bass", "params": { "wave": "square", "cutoff": 900 } }),
+    )
+    .await;
+    ok(
+        &client,
+        "clip_create",
+        json!({
+            "track": "Drums", "start_bar": 1, "length_bars": 16,
+            "pattern": "bd*4, ~ sd ~ sd, hh*8", "name": "Beat"
+        }),
+    )
+    .await;
+    let clip = ok(
+        &client,
+        "clip_create",
+        json!({
+            "track": "Bass", "start_bar": 1, "length_bars": 16, "name": "Bassline",
+            "notes": "A1 1/4, A1 1/8, C2 1/8, E2 1/4, G1 1/4"
+        }),
+    )
+    .await;
     assert_eq!(clip["noteCount"], 5);
-    ok(&client, "effect_insert", json!({ "channel": "master", "type": "limiter" })).await;
-    ok(&client, "effect_insert", json!({ "channel": "Bass", "type": "reverb", "params": { "mix": 0.3 } })).await;
-    ok(&client, "track_set", json!({ "track": "Bass", "volume_db": -4, "pan": -0.2 })).await;
-    ok(&client, "set_loop", json!({ "start_bar": 1, "end_bar": 17 })).await;
+    ok(
+        &client,
+        "effect_insert",
+        json!({ "channel": "master", "type": "limiter" }),
+    )
+    .await;
+    ok(
+        &client,
+        "effect_insert",
+        json!({ "channel": "Bass", "type": "reverb", "params": { "mix": 0.3 } }),
+    )
+    .await;
+    ok(
+        &client,
+        "track_set",
+        json!({ "track": "Bass", "volume_db": -4, "pan": -0.2 }),
+    )
+    .await;
+    ok(
+        &client,
+        "set_loop",
+        json!({ "start_bar": 1, "end_bar": 17 }),
+    )
+    .await;
 
     let summary = ok(&client, "project_summary", json!({})).await;
     assert_eq!(summary["tempoBpm"], 100.0);
@@ -95,7 +135,12 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
     let seam = ok(&client, "loop_check_seam", json!({})).await;
     assert_eq!(seam["seam"]["verdict"], "seamless", "{seam}");
 
-    let export = ok(&client, "export_loop", json!({ "name": "Battle Loop", "dir": "game/audio", "bits": 24 })).await;
+    let export = ok(
+        &client,
+        "export_loop",
+        json!({ "name": "Battle Loop", "dir": "game/audio", "bits": 24 }),
+    )
+    .await;
     assert_eq!(export["bars"], 16.0);
     assert_eq!(export["seam"]["verdict"], "seamless");
 
@@ -114,7 +159,9 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
     assert!(rt.is_playing(voice));
     assert!(buf.iter().any(|s| s.abs() > 0.01));
     // 16 bars of 4/4 at 100 BPM is 38.4 seconds.
-    let sky_core::manifest::Asset::Loop(asset) = rt.asset_info(rt.asset("battle_loop").unwrap()).unwrap() else {
+    let sky_core::manifest::Asset::Loop(asset) =
+        rt.asset_info(rt.asset("battle_loop").unwrap()).unwrap()
+    else {
         panic!("expected a loop");
     };
     assert_eq!(asset.loop_end, (38.4 * 48_000.0) as u64);
@@ -125,15 +172,24 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mistakes_come_back_as_tool_errors_and_undo_works() {
     let (session, _) = Session::new(sky_model::templates::demo_project(), None);
-    let client = connect(SkywareMcp::new(session.clone(), Policy::new(Permission::Edit, vec![]))).await;
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Edit, vec![]),
+    ))
+    .await;
 
     let (text, is_error) = call(&client, "set_tempo", json!({ "bpm": 5000 })).await;
     assert!(is_error);
     assert!(text.contains("tempo"), "{text}");
 
-    let (text, is_error) = call(&client, "clip_create", json!({
-        "track": "Bass", "start_bar": 1, "length_bars": 1, "notes": "C4 1/4, H4 1/4"
-    })).await;
+    let (text, is_error) = call(
+        &client,
+        "clip_create",
+        json!({
+            "track": "Bass", "start_bar": 1, "length_bars": 1, "notes": "C4 1/4, H4 1/4"
+        }),
+    )
+    .await;
     assert!(is_error);
     assert!(text.contains("entry 2"), "{text}");
 
@@ -142,7 +198,10 @@ async fn mistakes_come_back_as_tool_errors_and_undo_works() {
 
     let (text, is_error) = call(&client, "track_get", json!({ "track": "Nope" })).await;
     assert!(is_error);
-    assert!(text.contains("Drums"), "the error lists the real tracks: {text}");
+    assert!(
+        text.contains("Drums"),
+        "the error lists the real tracks: {text}"
+    );
 
     let before = session.project();
     ok(&client, "set_tempo", json!({ "bpm": 140 })).await;
@@ -152,7 +211,13 @@ async fn mistakes_come_back_as_tool_errors_and_undo_works() {
     assert_eq!(*session.project(), *before);
 
     // File tools are not offered without the Files permission.
-    let names: Vec<String> = client.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
     assert!(names.contains(&"notes_write".to_string()));
     assert!(!names.contains(&"export_loop".to_string()));
     assert!(!names.contains(&"project_save".to_string()));
@@ -175,11 +240,25 @@ async fn read_only_clients_cannot_edit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn notes_and_patterns_round_trip() {
     let (session, _) = Session::new(sky_model::templates::demo_project(), None);
-    let client = connect(SkywareMcp::new(session.clone(), Policy::new(Permission::Edit, vec![]))).await;
-    let written = ok(&client, "notes_write", json!({ "clip": "Bass line", "notes": "C2 1/4, r 1/4, G2 1/2 v70" })).await;
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Edit, vec![]),
+    ))
+    .await;
+    let written = ok(
+        &client,
+        "notes_write",
+        json!({ "clip": "Bass line", "notes": "C2 1/4, r 1/4, G2 1/2 v70" }),
+    )
+    .await;
     // Rests come back as an @ position.
     assert_eq!(written["notes"], "C2 1/4, G2 1/2 v70 @2");
-    ok(&client, "pattern_set", json!({ "clip": "Beat", "pattern": "bd sd, hh*4" })).await;
+    ok(
+        &client,
+        "pattern_set",
+        json!({ "clip": "Beat", "pattern": "bd sd, hh*4" }),
+    )
+    .await;
     let clip = ok(&client, "clip_get", json!({ "clip": "Beat" })).await;
     assert_eq!(clip["pattern"], "bd sd, hh*4");
     client.cancel().await.unwrap();
@@ -187,7 +266,9 @@ async fn notes_and_patterns_round_trip() {
 
 async fn http_status(addr: std::net::SocketAddr, token: Option<&str>) -> String {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
-    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    let auth = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     let req = format!(
         "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         addr.port(),
@@ -196,8 +277,15 @@ async fn http_status(addr: std::net::SocketAddr, token: Option<&str>) -> String 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut buf = vec![0u8; 512];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await.unwrap().unwrap();
-    String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -208,7 +296,11 @@ async fn http_needs_the_token() {
         .await
         .unwrap();
     assert!(http_status(server.addr, None).await.contains("401"));
-    assert!(http_status(server.addr, Some("wrong")).await.contains("401"));
+    assert!(
+        http_status(server.addr, Some("wrong"))
+            .await
+            .contains("401")
+    );
     let ok = http_status(server.addr, Some("secret-token")).await;
     assert!(ok.contains("200"), "{ok}");
     server.shutdown();
