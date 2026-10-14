@@ -22,3 +22,5 @@ allow = [
     "Unicode-DFS-2016",
 ]
 confidence-threshold = 0.9
+# The lists are deliberately broader than what is used today.
+unused-allowed-license = "allow"
