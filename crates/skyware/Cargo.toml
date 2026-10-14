@@ -23,6 +23,7 @@ sky-model.workspace = true
 sky-engine.workspace = true
 sky-io = { workspace = true, features = ["device"] }
 sky-session.workspace = true
+sky-game.workspace = true
 sky-mcp.workspace = true
 sky-ui = { workspace = true, optional = true }
 anyhow.workspace = true

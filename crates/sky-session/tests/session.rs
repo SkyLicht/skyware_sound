@@ -183,6 +183,22 @@ fn the_journal_recovers_unsaved_changes() {
 }
 
 #[test]
+fn save_copy_leaves_the_session_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = headless(demo_project());
+    session
+        .apply(Transaction::single(Command::SetTempo { bpm: 99.0 }))
+        .unwrap();
+    let copy = tmp.path().join("autosave.skyproj");
+    session.save_copy(&copy).unwrap();
+    let view = session.view();
+    assert!(view.dirty && view.path.is_none());
+    let other = headless(empty_project("x"));
+    other.open(&copy).unwrap();
+    assert_eq!(*other.project(), *session.project());
+}
+
+#[test]
 fn save_needs_a_folder() {
     let session = headless(demo_project());
     assert!(matches!(

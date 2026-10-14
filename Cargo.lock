@@ -1959,6 +1959,7 @@ dependencies = [
  "sky-core",
  "sky-dsp",
  "sky-engine",
+ "sky-game",
  "sky-io",
  "sky-mcp",
  "sky-model",

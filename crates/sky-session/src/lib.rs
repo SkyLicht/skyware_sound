@@ -525,16 +525,7 @@ impl Session {
             .map(Path::to_path_buf)
             .or_else(|| st.path.clone())
             .ok_or(SessionError::NoProjectPath)?;
-        for entry in &st.project.audio_pool {
-            let path = dir.join(&entry.file);
-            if path.exists() {
-                continue;
-            }
-            let data = st.audio.get(&entry.id).ok_or_else(|| {
-                SessionError::Invalid(format!("audio \"{}\" is not loaded", entry.name))
-            })?;
-            write_wav(&path, data, WavFormat::Float32, false)?;
-        }
+        write_pool_audio(&st.project, &st.audio, &dir)?;
         // Close the journal first: saving deletes it.
         st.journal = None;
         file::save_project(&st.project, &dir)?;
@@ -543,6 +534,19 @@ impl Session {
         st.status = Some(format!("Saved {}", dir.display()));
         self.publish(&mut st, false);
         Ok(dir)
+    }
+
+    /// Writes a copy of the project and its audio into `dir` without
+    /// changing where the session saves or whether it has unsaved changes.
+    /// Used for autosave; the session stays responsive while it writes.
+    pub fn save_copy(&self, dir: &Path) -> Result<(), SessionError> {
+        let (project, audio) = {
+            let st = lock(&self.inner.state);
+            (st.project.clone(), st.audio.clone())
+        };
+        write_pool_audio(&project, &audio, dir)?;
+        file::save_project(&project, dir)?;
+        Ok(())
     }
 
     /// Opens a project folder, replaying any changes a crash left in its
@@ -761,6 +765,21 @@ impl Session {
             sample_rate: audio.sample_rate,
         })
     }
+}
+
+/// Writes pool audio that is not in `dir` yet.
+fn write_pool_audio(project: &Project, audio: &AudioCache, dir: &Path) -> Result<(), SessionError> {
+    for entry in &project.audio_pool {
+        let path = dir.join(&entry.file);
+        if path.exists() {
+            continue;
+        }
+        let data = audio.get(&entry.id).ok_or_else(|| {
+            SessionError::Invalid(format!("audio \"{}\" is not loaded", entry.name))
+        })?;
+        write_wav(&path, data, WavFormat::Float32, false)?;
+    }
+    Ok(())
 }
 
 /// Moves queued messages to the audio thread and frees snapshots it has

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Skyware Sound: the app, its headless MCP server and command-line tools.
 
+mod autosave;
 mod cli;
 mod config;
 mod crash;
@@ -180,6 +181,7 @@ fn policy(mcp: &McpArgs, project: Option<&Path>) -> anyhow::Result<Policy> {
 
 fn run_mcp_stdio(project: Option<&Path>, mcp: &McpArgs) -> anyhow::Result<()> {
     let session = open_session(project, None)?;
+    autosave::spawn(session.clone());
     let server = SkywareMcp::new(session, policy(mcp, project)?);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(sky_mcp::serve_stdio(server))
@@ -206,6 +208,7 @@ fn run_headless(
     no_audio: bool,
 ) -> anyhow::Result<()> {
     let session = open_session(project, None)?;
+    autosave::spawn(session.clone());
     let _stream = if no_audio {
         None
     } else {
@@ -276,6 +279,7 @@ fn run_app(
     stress_ui: Option<usize>,
 ) -> anyhow::Result<()> {
     let session = open_session(project, None)?;
+    autosave::spawn(session.clone());
     // The MCP server runs on a background runtime for as long as the window is open.
     let rt = tokio::runtime::Runtime::new()?;
     let mut server = None;
