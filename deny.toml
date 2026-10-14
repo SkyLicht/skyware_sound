@@ -1,0 +1,38 @@
+# cargo-deny settings for the Skyware Sound app (GPL-3.0-or-later).
+# sky-runtime and sky-core have their own, stricter deny.toml.
+
+[graph]
+all-features = false
+
+[licenses]
+# Licenses compatible with distributing the app under GPL-3.0-or-later.
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
