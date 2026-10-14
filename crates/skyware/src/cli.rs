@@ -131,5 +131,39 @@ pub enum Cmd {
         minutes: f64,
         #[arg(long)]
         project: Option<PathBuf>,
+        #[command(flatten)]
+        report: ReportArgs,
     },
+    /// The system check: play through the audio device at a buffer size and
+    /// count dropouts, then export a loop for the game and verify the export.
+    Check {
+        #[command(flatten)]
+        output: OutputArgs,
+        /// Minutes to play through the device; 0 skips the device check.
+        #[arg(long, default_value_t = 0.5)]
+        minutes: f64,
+        /// Bars in the generated test loop; 0 skips the loop check.
+        #[arg(long, default_value_t = 16)]
+        bars: u32,
+        /// Check this project instead of the generated loop: it plays, and
+        /// its loop region is exported.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Keep the exported loop in this folder. Default: a temporary
+        /// folder that is deleted afterwards.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        report: ReportArgs,
+    },
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ReportArgs {
+    /// Run the engine but send silence to the device, for unattended runs.
+    #[arg(long)]
+    pub silent: bool,
+    /// Print the report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }

@@ -1,0 +1,29 @@
+[package]
+name = "sky-check"
+description = "The system check: device dropouts at a buffer size, and seamless game loop exports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+# Only sky-core and sky-runtime are meant for crates.io.
+publish = false
+
+[dependencies]
+sky-core.workspace = true
+sky-dsp.workspace = true
+sky-model.workspace = true
+sky-engine.workspace = true
+sky-io = { workspace = true, features = ["device"] }
+sky-game.workspace = true
+sky-session.workspace = true
+sky-runtime.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

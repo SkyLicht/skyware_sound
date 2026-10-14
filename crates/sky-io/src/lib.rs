@@ -4,5 +4,7 @@
 pub mod codec;
 #[cfg(feature = "device")]
 pub mod device;
+#[cfg(feature = "device")]
+pub mod periods;
 
 pub use codec::{IoError, WavFormat, read_audio, write_wav};

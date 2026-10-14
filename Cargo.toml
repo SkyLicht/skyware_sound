@@ -9,6 +9,7 @@ members = [
     "crates/sky-io",
     "crates/sky-game",
     "crates/sky-session",
+    "crates/sky-check",
     "crates/sky-mcp",
     "crates/sky-ui",
     "crates/sky-runtime",
@@ -23,6 +24,7 @@ default-members = [
     "crates/sky-io",
     "crates/sky-game",
     "crates/sky-session",
+    "crates/sky-check",
     "crates/sky-mcp",
     "crates/sky-ui",
     "crates/sky-runtime",
@@ -50,6 +52,7 @@ sky-engine = { path = "crates/sky-engine" }
 sky-io = { path = "crates/sky-io", default-features = false }
 sky-game = { path = "crates/sky-game" }
 sky-session = { path = "crates/sky-session" }
+sky-check = { path = "crates/sky-check" }
 sky-mcp = { path = "crates/sky-mcp" }
 sky-ui = { path = "crates/sky-ui" }
 sky-runtime = { path = "crates/sky-runtime" }

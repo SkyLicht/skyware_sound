@@ -18,6 +18,7 @@ sky-model.workspace = true
 sky-io.workspace = true
 sky-game.workspace = true
 sky-session.workspace = true
+sky-check.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

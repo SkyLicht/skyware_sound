@@ -25,6 +25,7 @@ sky-io = { workspace = true, features = ["device"] }
 sky-session.workspace = true
 sky-game.workspace = true
 sky-mcp.workspace = true
+sky-check.workspace = true
 sky-ui = { workspace = true, optional = true }
 anyhow.workspace = true
 assert_no_alloc.workspace = true

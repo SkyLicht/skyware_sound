@@ -8,7 +8,7 @@ mod crash;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::Parser;
@@ -144,7 +144,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             output,
             minutes,
             project,
-        }) => latency_test(&output, minutes, project.as_deref()),
+            report,
+        }) => system_check(&CheckPlan {
+            output,
+            minutes: minutes.max(1.0 / 60.0),
+            bars: None,
+            project,
+            out: None,
+            silent: report.silent,
+            json: report.json,
+        }),
+        Some(Cmd::Check {
+            mut output,
+            minutes,
+            bars,
+            project,
+            out,
+            report,
+        }) => {
+            // The release gate is 128 frames.
+            output.buffer = output.buffer.or(Some(128));
+            system_check(&CheckPlan {
+                output,
+                minutes,
+                bars: (bars > 0).then_some(bars),
+                project,
+                out,
+                silent: report.silent,
+                json: report.json,
+            })
+        }
     }
 }
 
@@ -197,6 +226,7 @@ fn output_config(output: &OutputArgs) -> sky_io::device::OutputConfig {
         sample_rate: output.sample_rate,
         buffer_frames: output.buffer,
         asio: output.asio,
+        silent: false,
     }
 }
 
@@ -348,75 +378,95 @@ fn wav_format(bits: u16) -> anyhow::Result<sky_io::WavFormat> {
     sky_io::WavFormat::from_bits(bits).context("--bits must be 16, 24 or 32")
 }
 
-/// Plays a project through the device for a while and counts dropouts, so
-/// the buffer size can be checked on real hardware.
-fn latency_test(output: &OutputArgs, minutes: f64, project: Option<&Path>) -> anyhow::Result<()> {
-    let session = open_session(project, None)?;
-    let cfg = output_config(output);
-    let Some(stream) = start_audio(&session, &cfg) else {
-        bail!("no audio output could be started");
+/// What `skyware check` and `skyware latency-test` run.
+struct CheckPlan {
+    output: OutputArgs,
+    /// Minutes through the device; 0 skips the device check.
+    minutes: f64,
+    /// Bars of the generated loop to export; `None` skips the loop check.
+    bars: Option<u32>,
+    project: Option<std::path::PathBuf>,
+    out: Option<std::path::PathBuf>,
+    silent: bool,
+    json: bool,
+}
+
+/// Plays through the device and counts dropouts, so a buffer size can be
+/// checked on real hardware, then exports a loop and verifies it. Plays and
+/// exports `plan.project`, or the generated check loop.
+fn system_check(plan: &CheckPlan) -> anyhow::Result<()> {
+    let bars = plan.bars.unwrap_or(16).clamp(1, sky_check::MAX_BARS);
+    let session = match &plan.project {
+        Some(dir) => open_session(Some(dir), None)?,
+        None => Session::new(sky_check::check_project(bars), None).0,
     };
-    let shared = session
-        .engine_shared()
-        .context("the engine did not start")?;
-    let sr = stream.info.sample_rate as f64;
-    if let Some(frames) = stream.info.buffer_frames {
-        println!(
-            "Device {} ({}), {} Hz, buffer {frames} frames = {:.2} ms",
-            stream.info.name,
-            stream.info.host,
-            stream.info.sample_rate,
-            frames as f64 / sr * 1000.0
-        );
+    let say = |line: String| {
+        if !plan.json {
+            println!("{line}");
+        }
+    };
+
+    let device = (plan.minutes > 0.0).then(|| {
+        let mut output = output_config(&plan.output);
+        output.silent = plan.silent;
+        let opts = sky_check::DeviceOptions {
+            output,
+            duration: Duration::from_secs_f64(plan.minutes * 60.0),
+            ..Default::default()
+        };
+        say(format!(
+            "Playing \"{}\" through the {} for {:.1} min at {}{}...",
+            session.project().name,
+            plan.output
+                .device
+                .as_deref()
+                .map_or("default output".to_string(), |d| format!("output {d:?}")),
+            plan.minutes,
+            opts.output
+                .buffer_frames
+                .map_or("the default buffer".to_string(), |b| format!("{b} frames")),
+            if plan.silent { ", silently" } else { "" }
+        ));
+        sky_check::check_device(&session, &opts, &mut |p| {
+            say(format!(
+                "{:>5.0} s  callbacks {}  dropouts {}  overruns {}  load avg {:.1}% max {:.1}%",
+                p.elapsed.as_secs_f64(),
+                p.callbacks,
+                p.dropouts,
+                p.overruns,
+                p.load_avg * 100.0,
+                p.load_max * 100.0
+            ));
+        })
+    });
+
+    let loop_export = plan.bars.map(|_| {
+        let name = match &plan.project {
+            Some(_) => session.project().name.clone(),
+            None => sky_check::LoopOptions::default().name,
+        };
+        say(format!("Exporting and checking the loop \"{name}\"..."));
+        sky_check::check_loop(
+            &session,
+            &sky_check::LoopOptions {
+                dir: plan.out.clone(),
+                name,
+                ..Default::default()
+            },
+        )
+    });
+
+    let report = sky_check::Report::new(device, loop_export);
+    if plan.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!(
-            "Device {} ({}), {} Hz, default buffer",
-            stream.info.name, stream.info.host, stream.info.sample_rate
-        );
-    }
-    session.play()?;
-    let total = Duration::from_secs_f64((minutes * 60.0).max(1.0));
-    let start = Instant::now();
-    let mut max_load = 0.0f32;
-    let mut sum_load = 0.0f64;
-    let mut samples = 0u64;
-    let mut last_report = Instant::now();
-    use std::sync::atomic::Ordering::Relaxed;
-    while start.elapsed() < total {
-        std::thread::sleep(Duration::from_millis(50));
-        let load = shared.load();
-        max_load = max_load.max(load);
-        sum_load += load as f64;
-        samples += 1;
-        if stream.is_lost() {
-            bail!("the device went away during the test");
-        }
-        if last_report.elapsed() >= Duration::from_secs(10) {
-            last_report = Instant::now();
-            println!(
-                "{:>5.0} s  dropouts {}  overruns {}  load avg {:.0}% max {:.0}%",
-                start.elapsed().as_secs_f64(),
-                shared.dropouts.load(Relaxed),
-                shared.overruns.load(Relaxed),
-                sum_load / samples.max(1) as f64 * 100.0,
-                max_load * 100.0
-            );
+        for line in report.lines() {
+            println!("{line}");
         }
     }
-    session.stop()?;
-    let dropouts = shared.dropouts.load(Relaxed);
-    let overruns = shared.overruns.load(Relaxed);
-    println!(
-        "Done: {:.1} min, {} callbacks, dropouts {dropouts}, overruns {overruns}, load avg {:.0}% max {:.0}%",
-        start.elapsed().as_secs_f64() / 60.0,
-        shared.callbacks.load(Relaxed),
-        sum_load / samples.max(1) as f64 * 100.0,
-        max_load * 100.0
-    );
-    if dropouts == 0 && overruns == 0 {
-        println!("PASS: no dropouts");
+    if report.passed {
         Ok(())
     } else {
-        bail!("FAIL: {dropouts} dropout(s), {overruns} overrun(s)")
+        bail!("the check failed")
     }
 }

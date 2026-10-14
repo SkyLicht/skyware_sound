@@ -3288,6 +3288,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sky-check"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "serde",
+ "sky-core",
+ "sky-dsp",
+ "sky-engine",
+ "sky-game",
+ "sky-io",
+ "sky-model",
+ "sky-runtime",
+ "sky-session",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "sky-core"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -3343,6 +3360,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "windows",
 ]
 
 [[package]]
@@ -3355,6 +3373,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sky-check",
  "sky-core",
  "sky-dsp",
  "sky-game",
@@ -3454,6 +3473,7 @@ dependencies = [
  "clap",
  "directories",
  "serde_json",
+ "sky-check",
  "sky-core",
  "sky-dsp",
  "sky-engine",

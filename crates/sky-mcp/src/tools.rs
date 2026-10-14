@@ -75,9 +75,8 @@ fn required(tool: &str) -> Permission {
     match tool {
         "project_summary" | "track_get" | "clip_get" | "catalog" | "history" | "pattern_query"
         | "analyze" | "loop_check_seam" => Permission::ReadOnly,
-        "project_open" | "project_save" | "audio_import" | "export_wav" | "export_loop" => {
-            Permission::Files
-        }
+        "project_open" | "project_save" | "audio_import" | "export_wav" | "export_loop"
+        | "system_check" => Permission::Files,
         _ => Permission::Edit,
     }
 }
@@ -624,6 +623,23 @@ pub struct ExportLoopArgs {
     pub tags: Option<Vec<String>>,
     /// 16, 24 (default) or 32 (float).
     pub bits: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SystemCheckArgs {
+    /// Seconds to play through the default audio device, 0 to 600; 0 skips
+    /// the device check. Default 20.
+    pub device_seconds: Option<f64>,
+    /// Buffer size to ask the device for, in frames. Default 128.
+    pub buffer_frames: Option<u32>,
+    /// Let the device check be heard. Default false: the engine runs as
+    /// usual but the device gets silence.
+    pub audible: Option<bool>,
+    /// Bars in the test loop, 1 to 64; 0 skips the loop check. Default 16.
+    pub bars: Option<u32>,
+    /// Folder to keep the exported test loop in. Default: a temporary
+    /// folder that is deleted afterwards.
+    pub dir: Option<String>,
 }
 
 // ----- the server -----
@@ -1651,6 +1667,65 @@ impl SkywareMcp {
                 "seam": out.seam,
             })
             .to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Checks this machine and build for game audio work, without touching the open project. Plays a test loop through the default audio device at a buffer size (silently unless audible) and counts dropouts and overruns, and whether the device really used that buffer size; then exports a 16-bar test loop and verifies the file's length, manifest, seam and seamless playback in the game runtime. Takes device_seconds plus a few seconds."
+    )]
+    async fn system_check(&self, Parameters(a): Parameters<SystemCheckArgs>) -> ToolResult {
+        let seconds = a.device_seconds.unwrap_or(20.0);
+        if !(0.0..=600.0).contains(&seconds) {
+            return Err(format!("device_seconds must be 0 to 600, got {seconds}"));
+        }
+        let bars = a.bars.unwrap_or(16);
+        if bars > sky_check::MAX_BARS {
+            return Err(format!(
+                "bars must be 0 to {}, got {bars}",
+                sky_check::MAX_BARS
+            ));
+        }
+        if seconds == 0.0 && bars == 0 {
+            return Err("device_seconds and bars are both 0, so there is nothing to check".into());
+        }
+        let buffer = a.buffer_frames.unwrap_or(128);
+        if !(16..=8_192).contains(&buffer) {
+            return Err(format!("buffer_frames must be 16 to 8192, got {buffer}"));
+        }
+        let dir = a
+            .dir
+            .as_deref()
+            .map(|d| self.policy.resolve(d))
+            .transpose()?;
+        let silent = a.audible != Some(true);
+        blocking(move || {
+            // A session of its own, so the open project and its undo history
+            // are left alone.
+            let (session, _) = Session::new(sky_check::check_project(bars.max(1)), None);
+            let device = (seconds > 0.0).then(|| {
+                let opts = sky_check::DeviceOptions {
+                    output: sky_check::OutputConfig {
+                        buffer_frames: Some(buffer),
+                        silent,
+                        ..Default::default()
+                    },
+                    duration: std::time::Duration::from_secs_f64(seconds),
+                    ..Default::default()
+                };
+                sky_check::check_device(&session, &opts, &mut |_| {})
+            });
+            let loop_export = (bars > 0).then(|| {
+                sky_check::check_loop(
+                    &session,
+                    &sky_check::LoopOptions {
+                        dir,
+                        ..Default::default()
+                    },
+                )
+            });
+            let report = sky_check::Report::new(device, loop_export);
+            serde_json::to_string(&report).map_err(|e| e.to_string())
         })
         .await
     }

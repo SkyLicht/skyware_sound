@@ -170,6 +170,41 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_system_check_exports_and_verifies_a_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (session, _) = Session::new(empty_project("Open"), None);
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Files, vec![tmp.path().to_path_buf()]),
+    ))
+    .await;
+    // No audio device in CI, so only the loop half.
+    let report = ok(
+        &client,
+        "system_check",
+        json!({ "device_seconds": 0, "dir": "check" }),
+    )
+    .await;
+    assert_eq!(report["passed"], true, "{report}");
+    assert!(report.get("device").is_none());
+    assert_eq!(report["loop"]["bars"], 16.0);
+    assert_eq!(report["loop"]["checks"].as_array().unwrap().len(), 5);
+    assert!(tmp.path().join("check/skyware-manifest.json").exists());
+    // The open project is left alone.
+    assert!(session.view().history.is_empty());
+    assert!(session.project().tracks.is_empty());
+
+    let (text, is_error) = call(
+        &client,
+        "system_check",
+        json!({ "device_seconds": 0, "bars": 0 }),
+    )
+    .await;
+    assert!(is_error, "{text}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mistakes_come_back_as_tool_errors_and_undo_works() {
     let (session, _) = Session::new(sky_model::templates::demo_project(), None);
     let client = connect(SkywareMcp::new(
