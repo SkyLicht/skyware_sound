@@ -217,6 +217,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -403,6 +409,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rtrb"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fae8ee26b0371a29a77d2b2d6b3ae13aa81def6f9bf1b1b92a32d279a5e709b7"
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -498,6 +510,15 @@ dependencies = [
 [[package]]
 name = "sky-engine"
 version = "0.1.0-alpha.1"
+dependencies = [
+ "assert_no_alloc",
+ "num-rational",
+ "rtrb",
+ "sky-core",
+ "sky-dsp",
+ "sky-model",
+ "sky-pattern",
+]
 
 [[package]]
 name = "sky-game"
@@ -538,7 +559,11 @@ dependencies = [
 name = "sky-runtime"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "assert_no_alloc",
+ "hound",
  "sky-core",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
