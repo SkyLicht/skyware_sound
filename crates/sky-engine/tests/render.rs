@@ -192,3 +192,54 @@ fn swaps_keep_held_notes_sounding() {
     assert!(peak > 0.01, "note was cut by the swap");
     assert_eq!(handle.collect_garbage(), 1);
 }
+
+#[test]
+fn pattern_clips_play_on_the_grid() {
+    // "~ bd" over a one-bar cycle at 120 BPM: the kick lands half way
+    // through each bar, at 48 000 and 144 000 samples.
+    let project = |bars: i64| {
+        let mut p = Project::new("t");
+        p.loop_enabled = false;
+        let mut t = Track::new_instrument("Drums", InstrumentType::Drums);
+        t.clips.push(Clip {
+            id: ClipId::new(),
+            name: "p".into(),
+            start: 0,
+            length: PPQ * 4 * bars,
+            content: ClipContent::Pattern {
+                source: "~ bd".into(),
+                seed: 0,
+                cycle: PPQ * 4,
+            },
+        });
+        p.tracks.push(t);
+        p
+    };
+    let frames = SR as usize * 4;
+    let one = render(
+        compile(&project(1), &AudioCache::new(), SR, 1),
+        0,
+        frames,
+        false,
+    );
+    let two = render(
+        compile(&project(2), &AudioCache::new(), SR, 1),
+        0,
+        frames,
+        false,
+    );
+    let first = first_sound(one.left()).unwrap();
+    assert!((48_000..=48_001).contains(&first), "first kick at {first}");
+    // The second bar's kick is what the two-bar render adds.
+    let diff: Vec<f32> = two
+        .left()
+        .iter()
+        .zip(one.left())
+        .map(|(a, b)| a - b)
+        .collect();
+    let second = first_sound(&diff).unwrap();
+    assert!(
+        (144_000..=144_001).contains(&second),
+        "second kick at {second}"
+    );
+}
