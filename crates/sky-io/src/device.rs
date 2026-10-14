@@ -892,6 +892,8 @@ mod tests {
         assert_eq!(p.low_latency_period(4_096), 480);
         assert!(p.has_low_latency());
         assert!(!headset().has_low_latency());
+        assert_eq!(p.shortest(), 128);
+        assert_eq!(headset().shortest(), 144);
     }
 
     #[test]

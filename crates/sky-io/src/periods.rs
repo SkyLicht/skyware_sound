@@ -26,6 +26,18 @@ impl DevicePeriods {
         self.shared_min > 0 && self.shared_min < self.shared_default
     }
 
+    /// The shortest period any mode can run this device at.
+    pub fn shortest(&self) -> u32 {
+        let mut least = self.shared_default;
+        if self.has_low_latency() {
+            least = least.min(self.shared_min);
+        }
+        if self.exclusive_min > 0 {
+            least = least.min(self.exclusive_min);
+        }
+        least
+    }
+
     /// The period a low-latency shared-mode stream uses for a request of
     /// `frames`: the largest one the driver allows that is not longer, or
     /// the shortest it allows if the request is below that.

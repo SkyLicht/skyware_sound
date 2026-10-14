@@ -48,7 +48,7 @@ Useful commands:
 
 ## Testing on Windows
 
-`skyware check` is the release check on real hardware. It plays a test loop through the audio device at a 128-frame buffer (`--buffer`) for `--minutes` and fails on any dropout, on any callback that took longer than its buffer, or if the device did not really run at the buffer size asked for. Then it exports a 16-bar loop (`--bars`) and verifies the export as a game would use it: exact length, the manifest entry, a clean seam after quantizing to 24-bit, no clipping, and sample-exact playback in `sky-runtime` across the loop point. `--silent` runs the engine as usual but sends silence to the device, `--json` prints the report as JSON, and `--project` checks one of your projects instead of the test loop. MCP clients can run the same check with the `system_check` tool; it uses a project of its own and leaves the open one alone.
+`skyware check` is the release check on real hardware. It plays a test loop through the audio device at a 128-frame buffer (`--buffer`) for `--minutes` and fails on any dropout, on any callback that took longer than its buffer, or if the device did not really run at the buffer size asked for (or at its shortest possible period, when the request is below that; see [Output modes](#output-modes)). Then it exports a 16-bar loop (`--bars`) and verifies the export as a game would use it: exact length, the manifest entry, a clean seam after quantizing to 24-bit, no clipping, and sample-exact playback in `sky-runtime` across the loop point. `--silent` runs the engine as usual but sends silence to the device, `--json` prints the report as JSON, and `--project` checks one of your projects instead of the test loop. MCP clients can run the same check with the `system_check` tool; it uses a project of its own and leaves the open one alone.
 
 A dropout is a hand-off of audio to the device that comes later than the device's buffer lasts. On WASAPI the device buffer is measured from the first callback, which fills it while it is empty.
 
@@ -71,7 +71,7 @@ Windows shared mode runs at the audio engine's period, 10 ms (480 frames at 48 k
 | `low-latency` | Through the Windows mixer at a shorter period (`IAudioClient3`, Windows 10 and later) where the driver allows one; other programs keep playing |
 | `exclusive` | The app takes the device for itself: the shortest period the hardware can do, but other programs go silent while it plays. Windows must allow it ("Allow applications to take exclusive control" in the device's Advanced properties) |
 
-A request below what the hardware can do runs at the hardware's shortest period, and the check fails the buffer size and says what that period is (a headset whose exclusive minimum is 3 ms runs 144-frame buffers at 48 kHz). The check reports the mode it used. ASIO (`--asio`) has no modes; the driver sets them.
+A request below what the hardware can do runs at the hardware's shortest period. The check's buffer size passes when the device ran at the size asked for, or, for a request below anything the device can do in any mode, at that shortest period (a headset whose exclusive minimum is 3 ms passes a 128-frame check with 144-frame buffers at 48 kHz, but not in shared mode at 480). The check reports the mode it used and the device's shortest period. ASIO (`--asio`) has no modes; the driver sets them.
 
 ## Connecting an AI assistant
 
