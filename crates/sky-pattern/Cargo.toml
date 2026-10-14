@@ -1,5 +1,6 @@
 [package]
 name = "sky-pattern"
+description = "Pattern engine with Tidal-style mini-notation for Skyware Sound"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +9,12 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-num-rational.workspace = true
-thiserror.workspace = true
+num-rational = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true
