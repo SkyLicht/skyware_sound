@@ -16,16 +16,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use serde::Serialize;
 use sky_core::manifest::Category;
-use sky_core::{AudioId, Ticks};
+use sky_core::{AudioId, Ticks, TrackId};
 use sky_dsp::AudioData;
+use sky_dsp::InstrumentType;
 use sky_dsp::analysis::{self, SeamReport};
 use sky_engine::{
     AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, compile, create_engine,
 };
 use sky_game::{Exported, LoopExport};
 use sky_io::{WavFormat, read_audio, write_wav};
+use sky_library::{Library, LibraryError, PackSource};
 use sky_model::file::{self, Journal};
-use sky_model::{Command, History, ModelError, Origin, PoolEntry, Project, Transaction};
+use sky_model::{
+    AudioSource, BankSample, Command, History, InstrumentSlot, License, LicenseReport, ModelError,
+    Origin, PoolEntry, Project, SampleBank, TrackKind, Transaction,
+};
 use thiserror::Error;
 
 /// Longest render the session will make in one call.
@@ -43,6 +48,8 @@ pub enum SessionError {
     Io(#[from] sky_io::IoError),
     #[error("{0}")]
     Export(#[from] sky_game::GameError),
+    #[error("{0}")]
+    Library(#[from] LibraryError),
     #[error("the project has not been saved yet; give a folder to save it in")]
     NoProjectPath,
     #[error("no audio device is running")]
@@ -142,6 +149,44 @@ pub struct LoopExported {
     pub bars: f64,
     pub frames: usize,
     pub sample_rate: u32,
+    /// Credits written into the manifest, and license warnings.
+    pub licenses: LicenseReport,
+}
+
+/// Which sounds [`Session::load_bank`] loads, and from where.
+#[derive(Clone, Debug)]
+pub struct BankRequest {
+    pub source: PackSource,
+    /// A bank such as `RolandTR808`; without one, the pack's plain sounds.
+    pub bank: Option<String>,
+    /// Sound names to load; empty loads all of the bank's.
+    pub sounds: Vec<String>,
+    /// Add to the track's sounds instead of replacing them.
+    pub add: bool,
+    /// The sound notes play. Without one, a bank of a single pitched sound
+    /// (such as `piano`) plays it, and other banks play drums by note.
+    pub pitched: Option<String>,
+}
+
+/// What [`Session::load_bank`] did.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BankLoaded {
+    pub track: TrackId,
+    pub bank: String,
+    pub pack: String,
+    pub license: License,
+    /// Each sound in the track's bank and its variation count.
+    pub sounds: Vec<(String, usize)>,
+    pub pitched: Option<String>,
+    /// Files fetched and added to the pool this time.
+    pub new_files: usize,
+    /// Files already in the pool from an earlier load.
+    pub reused_files: usize,
+    /// Files that could not be loaded.
+    pub failed: Vec<String>,
+    /// True when the network failed and a saved copy of the map was used.
+    pub offline: bool,
 }
 
 struct State {
@@ -160,6 +205,8 @@ struct State {
 
 struct Inner {
     state: Mutex<State>,
+    /// Where sound packs come from; never locked with `state`.
+    library: Mutex<Library>,
     /// Locked after `state` when both are needed, never before.
     engine: Mutex<Option<EngineHandle>>,
     shared: ArcSwapOption<EngineShared>,
@@ -277,6 +324,7 @@ impl Session {
         let view = build_view(&state);
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
+            library: Mutex::new(Library::default()),
             engine: Mutex::new(handle_out),
             shared: ArcSwapOption::new(shared_out),
             view: ArcSwap::from_pointee(view),
@@ -617,6 +665,7 @@ impl Session {
             channels: data.channel_count() as u16,
             sample_rate: data.sample_rate,
             frames: data.frames() as u64,
+            source: None,
         };
         let mut st = lock(&self.inner.state);
         if let Some(dir) = &st.path {
@@ -630,6 +679,167 @@ impl Session {
         );
         self.apply_locked(&mut st, tx)?;
         Ok(id)
+    }
+
+    /// The sound-pack library used by [`Session::load_bank`].
+    pub fn library(&self) -> Library {
+        lock(&self.inner.library).clone()
+    }
+
+    /// Uses `library` for sound packs from now on, such as one with its
+    /// cache in another folder.
+    pub fn set_library(&self, library: Library) {
+        *lock(&self.inner.library) = library;
+    }
+
+    /// Loads sounds from a pack into a track's sample bank, as one undo
+    /// step. The track becomes a sample bank if it was another instrument.
+    /// Downloads happen first, with nothing locked, so this can take a
+    /// while; files already in the pool from the same address are reused.
+    pub fn load_bank(
+        &self,
+        track: TrackId,
+        request: &BankRequest,
+        origin: Origin,
+    ) -> Result<BankLoaded, SessionError> {
+        {
+            let project = self.project();
+            if project.track(track)?.kind != TrackKind::Instrument {
+                return Err(ModelError::NotAnInstrumentTrack(track).into());
+            }
+        }
+        let library = self.library();
+        let pack = library.open(&request.source)?;
+        let selection = pack.select(request.bank.as_deref(), &request.sounds)?;
+        let loaded = library.load(&pack, &selection)?;
+
+        let mut st = lock(&self.inner.state);
+        let t = st.project.track(track)?;
+        if t.kind != TrackKind::Instrument {
+            return Err(ModelError::NotAnInstrumentTrack(track).into());
+        }
+        let mut slot = match &t.instrument {
+            Some(s) if s.kind == InstrumentType::Bank => s.clone(),
+            _ => InstrumentSlot::new(InstrumentType::Bank),
+        };
+        let previous = slot.bank.take().filter(|_| request.add);
+        let mut sounds = previous
+            .as_ref()
+            .map(|b| b.sounds.clone())
+            .unwrap_or_default();
+        let source = &loaded.source;
+        let mut commands = Vec::new();
+        let mut added = Vec::new();
+        let (mut new_files, mut reused_files) = (0, 0);
+        for (name, samples) in &loaded.sounds {
+            let mut variations = Vec::with_capacity(samples.len());
+            for (i, sample) in samples.iter().enumerate() {
+                let existing = st
+                    .project
+                    .audio_pool
+                    .iter()
+                    .find(|e| e.source.as_ref().is_some_and(|s| s.url == sample.location))
+                    .map(|e| e.id);
+                let id = match existing {
+                    Some(id) => {
+                        reused_files += 1;
+                        st.audio.entry(id).or_insert_with(|| sample.audio.clone());
+                        id
+                    }
+                    None => {
+                        new_files += 1;
+                        let id = AudioId::new();
+                        let entry = PoolEntry {
+                            id,
+                            name: format!("{} {name}:{i}", selection.name),
+                            file: format!("{}/{id}.wav", file::AUDIO_DIR),
+                            channels: sample.audio.channel_count() as u16,
+                            sample_rate: sample.audio.sample_rate,
+                            frames: sample.audio.frames() as u64,
+                            source: Some(AudioSource {
+                                pack: source.name.clone(),
+                                url: sample.location.clone(),
+                                license: source.license,
+                                credit: source.credit.clone(),
+                            }),
+                        };
+                        if let Some(dir) = &st.path {
+                            write_wav(
+                                &dir.join(&entry.file),
+                                &sample.audio,
+                                WavFormat::Float32,
+                                false,
+                            )?;
+                        }
+                        st.audio.insert(id, sample.audio.clone());
+                        added.push(id);
+                        commands.push(Command::AddPoolAudio { entry, index: None });
+                        id
+                    }
+                };
+                variations.push(BankSample {
+                    audio: id,
+                    root: sample.root,
+                });
+            }
+            sounds.insert(name.clone(), variations);
+        }
+        let pitched = match &request.pitched {
+            Some(p) => Some(p.clone()),
+            None => match &previous {
+                Some(prev) => prev.pitched.clone(),
+                None if loaded.sounds.len() == 1 => loaded
+                    .sounds
+                    .iter()
+                    .find(|(_, s)| s.iter().all(|x| x.root.is_some()))
+                    .map(|(n, _)| n.clone()),
+                None => None,
+            },
+        };
+        let name = match &previous {
+            Some(prev) if prev.name != selection.name => {
+                format!("{} + {}", prev.name, selection.name)
+            }
+            _ => selection.name.clone(),
+        };
+        let bank = SampleBank {
+            name: name.clone(),
+            sounds,
+            pitched,
+        };
+        slot.bank = Some(bank.clone());
+        commands.push(Command::SetInstrument {
+            track,
+            instrument: Some(slot),
+        });
+        let tx = Transaction::new(format!("Load {} sounds", selection.name), origin, commands);
+        if let Err(e) = self.apply_locked(&mut st, tx) {
+            for id in added {
+                st.audio.remove(&id);
+            }
+            return Err(e);
+        }
+        Ok(BankLoaded {
+            track,
+            bank: name,
+            pack: source.name.clone(),
+            license: source.license,
+            sounds: bank
+                .sounds
+                .iter()
+                .map(|(n, v)| (n.clone(), v.len()))
+                .collect(),
+            pitched: bank.pitched,
+            new_files,
+            reused_files,
+            failed: loaded.failed,
+            offline: pack.offline,
+        })
+    }
+
+    /// Credits and warnings for the pack audio an export would contain.
+    pub fn license_report(&self) -> LicenseReport {
+        sky_model::license_report(&self.project())
     }
 
     /// Decoded audio from the pool.
@@ -738,6 +948,7 @@ impl Session {
         let bars = (end - start) as f64 / project.ticks_per_bar() as f64;
         let constant_tempo = project.tempo.points().len() == 1;
         let name = opts.name.clone().unwrap_or_else(|| project.name.clone());
+        let licenses = sky_model::license_report(&project);
         let exported = sky_game::export_loop(
             &dir,
             &LoopExport {
@@ -754,6 +965,7 @@ impl Session {
                 bars: Some(bars),
                 category: opts.category,
                 tags: opts.tags.clone(),
+                credits: licenses.credits.clone(),
                 format: opts.format,
             },
         )?;
@@ -763,6 +975,7 @@ impl Session {
             bars,
             frames,
             sample_rate: audio.sample_rate,
+            licenses,
         })
     }
 }

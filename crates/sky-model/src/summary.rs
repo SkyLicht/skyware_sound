@@ -93,6 +93,46 @@ pub fn track_json(project: &Project, track: &Track, detail: bool) -> Value {
             "params": inst.params,
             "sample": inst.sample.map(|s| s.to_string()),
         });
+        if let Some(bank) = &inst.bank {
+            v["instrument"]["bank"] = bank_json(project, bank, detail);
+        }
+    }
+    v
+}
+
+/// Sound names listed in a summary before the rest are only counted.
+const SUMMARY_SOUNDS: usize = 48;
+
+/// A bank's sounds with their variation counts, and the packs they came from.
+pub fn bank_json(project: &Project, bank: &SampleBank, detail: bool) -> Value {
+    let limit = if detail { usize::MAX } else { SUMMARY_SOUNDS };
+    let sounds: serde_json::Map<String, Value> = bank
+        .sounds
+        .iter()
+        .take(limit)
+        .map(|(name, samples)| (name.clone(), json!(samples.len())))
+        .collect();
+    let mut packs: Vec<Value> = Vec::new();
+    for id in bank.audio_ids() {
+        let Some(src) = project.pool_entry(id).ok().and_then(|e| e.source.as_ref()) else {
+            continue;
+        };
+        let pack = json!({ "pack": src.pack, "license": src.license.id() });
+        if !packs.contains(&pack) {
+            packs.push(pack);
+        }
+    }
+    let mut v = json!({
+        "name": bank.name,
+        "sounds": sounds,
+        "samples": bank.sample_count(),
+        "packs": packs,
+    });
+    if bank.sounds.len() > limit {
+        v["moreSounds"] = json!(bank.sounds.len() - limit);
+    }
+    if let Some(p) = &bank.pitched {
+        v["pitched"] = json!(p);
     }
     v
 }
@@ -118,6 +158,8 @@ pub fn project_summary(project: &Project) -> Value {
             "name": e.name,
             "channels": e.channels,
             "seconds": round(e.frames as f64 / e.sample_rate.max(1) as f64, 3),
+            "pack": e.source.as_ref().map(|s| s.pack.clone()),
+            "license": e.source.as_ref().map(|s| s.license.id()),
         })).collect::<Vec<_>>(),
     })
 }

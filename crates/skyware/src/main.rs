@@ -81,6 +81,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 out.display(),
                 audio.duration_seconds()
             );
+            print_licenses(&session.license_report(), "Credit");
             Ok(())
         }
         Some(Cmd::ExportLoop {
@@ -108,6 +109,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 out.seam.verdict,
                 out.seam.note.map(|n| format!(" ({n})")).unwrap_or_default()
             );
+            print_licenses(&out.licenses, "Credit in the manifest");
             Ok(())
         }
         Some(Cmd::Analyze { file }) => {
@@ -367,6 +369,16 @@ fn run_app(
     _stress_ui: Option<usize>,
 ) -> anyhow::Result<()> {
     bail!("this build has no window; use a subcommand such as `skyware serve` (see --help)")
+}
+
+/// Prints the credits an export's sounds ask for, and warnings about them.
+fn print_licenses(report: &sky_model::LicenseReport, credit: &str) {
+    for c in &report.credits {
+        println!("{credit}: {c}");
+    }
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
 }
 
 fn bar_range(

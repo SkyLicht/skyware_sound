@@ -23,14 +23,15 @@ use sky_dsp::analysis;
 use sky_dsp::params::{self, ParamKind, ParamSpec};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_io::WavFormat;
+use sky_library::{PACKS, PackSource};
 use sky_model::notes::{format_note_list, parse_note_list};
 use sky_model::summary::{clip_json, project_summary, track_json};
 use sky_model::templates::{demo_project, empty_project};
 use sky_model::{
-    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Origin, Project, Track,
-    TrackKind, Transaction,
+    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, License, Origin, Project,
+    Track, TrackKind, Transaction,
 };
-use sky_session::{LoopExportOptions, Session};
+use sky_session::{BankRequest, LoopExportOptions, Session};
 
 use crate::policy::{Permission, Policy};
 
@@ -60,6 +61,14 @@ stacks layers, bd(3,8) is a Euclidean rhythm, ? drops events at random, and \
 note names or numbers (c3 e3 g3) play pitches. Drum names: bd sd hh oh cp rim \
 lt mt ht cr rd cb. Use pattern_query to check a pattern before writing it.\n\
 \n\
+Strudel's sample packs: a track with the \"bank\" instrument plays named sounds \
+from a pack, as Strudel's s(\"bd sd:2\").bank(\"RolandTR808\") does: sd:2 is the \
+third sd. sound_packs lists the packs and their banks; bank_load downloads a \
+bank or some sounds into a track. MIDI notes on a bank track play its drums by \
+General MIDI number, or its pitched sound (piano) when it has one. Packs keep \
+their license: exports list the credits they need and warn about unknown \
+licenses.\n\
+\n\
 For a game loop: set_loop to the bars, loop_check_seam to confirm it repeats \
 cleanly, then export_loop writes the WAV and the manifest the game reads.";
 
@@ -76,7 +85,7 @@ fn required(tool: &str) -> Permission {
         "project_summary" | "track_get" | "clip_get" | "catalog" | "history" | "pattern_query"
         | "analyze" | "loop_check_seam" => Permission::ReadOnly,
         "project_open" | "project_save" | "audio_import" | "export_wav" | "export_loop"
-        | "system_check" => Permission::Files,
+        | "system_check" | "sound_packs" | "bank_load" => Permission::Files,
         _ => Permission::Edit,
     }
 }
@@ -441,7 +450,7 @@ pub struct TrackCreateArgs {
     pub name: String,
     /// instrument (default) or audio.
     pub kind: Option<String>,
-    /// For instrument tracks: synth (default), drums or sampler.
+    /// For instrument tracks: synth (default), drums, sampler or bank.
     pub instrument: Option<String>,
     /// Instrument parameters, such as {"wave": "square", "cutoff": 800}.
     pub params: Option<BTreeMap<String, Value>>,
@@ -474,13 +483,47 @@ pub struct TrackSetArgs {
 pub struct InstrumentSetArgs {
     /// Track ID or name.
     pub track: String,
-    /// Replace the instrument: synth, drums or sampler. Parameters reset.
+    /// Replace the instrument: synth, drums, sampler or bank. Parameters reset.
     #[serde(rename = "type")]
     pub kind: Option<String>,
     /// Parameters to set; null restores a default.
     pub params: Option<BTreeMap<String, Value>>,
     /// For a sampler: the imported audio it plays (ID or name).
     pub sample: Option<String>,
+    /// For a sample bank: the sound MIDI notes play, pitched (such as
+    /// piano). An empty string plays drums by note number again.
+    pub pitched: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SoundPacksArgs {
+    /// A pack to look into: a name from the list, a strudel.json URL, a
+    /// github:user/repo shortcut, or a folder in the allowed folders.
+    /// Without one, lists the known packs.
+    pub pack: Option<String>,
+    /// List this bank's sounds instead of the pack's banks.
+    pub bank: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BankLoadArgs {
+    /// Track ID or name. It becomes a sample bank if it is another instrument.
+    pub track: String,
+    /// A name from sound_packs, a strudel.json URL, a github:user/repo
+    /// shortcut, or a folder in the allowed folders.
+    pub pack: String,
+    /// A bank such as RolandTR808. Without one, the pack's plain sounds.
+    pub bank: Option<String>,
+    /// Sounds to load, such as ["bd", "sd", "hh"]. Default: all of the bank's.
+    pub sounds: Option<Vec<String>>,
+    /// Add to the track's sounds instead of replacing them. Default false.
+    pub add: Option<bool>,
+    /// The sound MIDI notes play, pitched. Default: the sound, when a single
+    /// pitched sound is loaded.
+    pub pitched: Option<String>,
+    /// For a pack that is not in the list: its license, such as CC0-1.0,
+    /// CC-BY-4.0 or unknown (the default). Only say what the pack states.
+    pub license: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -692,6 +735,41 @@ impl SkywareMcp {
         self.session
             .apply(Transaction::new(label, origin(ctx, tool), commands))
             .map_err(|e| e.to_string())
+    }
+
+    /// The pack a client named: a known pack, an http(s) URL or github:
+    /// shortcut, or a folder or file inside the allowed folders.
+    fn pack_source(&self, pack: &str, license: Option<&str>) -> Result<PackSource, String> {
+        let license = license
+            .map(|l| {
+                License::parse(l).ok_or_else(|| {
+                    format!(
+                        "license {l:?} is not one of: {}",
+                        names(License::ALL.iter().map(|l| l.id()))
+                    )
+                })
+            })
+            .transpose()?;
+        let text = pack.trim();
+        if let Some(known) = sky_library::packs::find(text) {
+            if license.is_some_and(|l| l != known.license) {
+                return Err(format!(
+                    "{} is {}; its license cannot be changed",
+                    known.name,
+                    known.license.label()
+                ));
+            }
+            return Ok(PackSource::from(known));
+        }
+        let lower = text.to_ascii_lowercase();
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("github:")
+        {
+            return Ok(PackSource::parse(text, license));
+        }
+        let path = self.policy.resolve(text)?;
+        Ok(PackSource::parse(&path.to_string_lossy(), license))
     }
 
     fn check_unsaved(&self, discard: Option<bool>) -> Result<(), String> {
@@ -975,7 +1053,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Adds a track: an instrument track with a synth, drum kit or sampler, or an audio track. Returns its ID."
+        description = "Adds a track: an instrument track with a synth, drum kit, sampler or sample bank, or an audio track. Returns its ID. Load sounds into a bank track with bank_load."
     )]
     async fn track_create(
         &self,
@@ -994,7 +1072,7 @@ impl SkywareMcp {
             "instrument" | "midi" => {
                 let name = a.instrument.as_deref().unwrap_or("synth");
                 let kind = InstrumentType::from_name(name).ok_or_else(|| {
-                    format!("instrument {name:?} is not one of synth, drums, sampler")
+                    format!("instrument {name:?} is not one of synth, drums, sampler, bank")
                 })?;
                 Track::new_instrument(a.name.clone(), kind)
             }
@@ -1130,7 +1208,7 @@ impl SkywareMcp {
         let mut slot = match &a.kind {
             Some(name) => {
                 InstrumentSlot::new(InstrumentType::from_name(name).ok_or_else(|| {
-                    format!("instrument {name:?} is not one of synth, drums, sampler")
+                    format!("instrument {name:?} is not one of synth, drums, sampler, bank")
                 })?)
             }
             None => track
@@ -1150,6 +1228,23 @@ impl SkywareMcp {
         }
         if let Some(s) = &a.sample {
             slot.sample = Some(find_audio(&project, s)?);
+        }
+        if let Some(p) = &a.pitched {
+            let bank = slot.bank.as_mut().ok_or_else(|| {
+                format!("{} has no sample bank; load one with bank_load", track.name)
+            })?;
+            bank.pitched =
+                match p.trim() {
+                    "" => None,
+                    name => Some(bank.resolve(name).map(|(n, _)| n.to_string()).ok_or_else(
+                        || {
+                            format!(
+                                "the bank has no sound {name:?}; it has: {}",
+                                names(bank.sounds.keys().map(String::as_str))
+                            )
+                        },
+                    )?),
+                };
         }
         self.apply(
             &ctx,
@@ -1610,6 +1705,133 @@ impl SkywareMcp {
     }
 
     #[tool(
+        description = "Lists Strudel's sample packs and their licenses, or looks into one pack: its banks (such as RolandTR808) and plain sounds, or one bank's sounds, each with its number of variations.",
+        annotations(read_only_hint = true)
+    )]
+    async fn sound_packs(&self, Parameters(a): Parameters<SoundPacksArgs>) -> ToolResult {
+        let Some(pack) = a.pack else {
+            let packs: Vec<Value> = PACKS
+                .iter()
+                .map(|p| {
+                    json!({
+                        "pack": p.id,
+                        "name": p.name,
+                        "license": p.license.id(),
+                        "credit": p.credit,
+                        "about": p.about,
+                        "homepage": p.homepage,
+                    })
+                })
+                .collect();
+            return Ok(json!({
+                "packs": packs,
+                "note": "Only VCSL is CC0. Packs whose license is unknown can be used, but \
+                         their terms must be checked before a game ships their sounds.",
+            })
+            .to_string());
+        };
+        let source = self.pack_source(&pack, None)?;
+        let library = self.session.library();
+        blocking(move || {
+            let opened = library.open(&source).map_err(|e| e.to_string())?;
+            let counts = |sounds: std::collections::BTreeMap<String, &[sky_library::MapFile]>| {
+                sounds
+                    .into_iter()
+                    .take(300)
+                    .map(|(name, files)| (name, json!(files.len())))
+                    .collect::<serde_json::Map<String, Value>>()
+            };
+            let banks = opened.map.banks();
+            let mut v = json!({
+                "pack": source.name,
+                "license": source.license.id(),
+                "map": opened.location,
+                "offline": opened.offline,
+            });
+            match a.bank.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                Some(bank) => {
+                    let sounds = opened.map.bank_sounds(Some(bank));
+                    if sounds.is_empty() {
+                        return Err(format!(
+                            "{} has no bank {bank:?}; its banks are: {}",
+                            source.name,
+                            names(banks.keys().map(String::as_str))
+                        ));
+                    }
+                    v["bank"] = json!(bank);
+                    v["sounds"] = json!(counts(sounds));
+                }
+                None => {
+                    v["banks"] = json!(banks);
+                    v["sounds"] = json!(counts(opened.map.plain_sounds()));
+                }
+            }
+            Ok(v.to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Downloads sounds from a sample pack into a track's sample bank, as one undo step: a whole bank such as RolandTR808, or named sounds. Pattern clips on the track then play them by name (bd sd:1 hh). Downloads are cached, and sounds already in the project are reused."
+    )]
+    async fn bank_load(
+        &self,
+        Parameters(a): Parameters<BankLoadArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let project = self.session.project();
+        let track = find_track(&project, &a.track)?;
+        let request = BankRequest {
+            source: self.pack_source(&a.pack, a.license.as_deref())?,
+            bank: a.bank,
+            sounds: a.sounds.unwrap_or_default(),
+            add: a.add.unwrap_or(false),
+            pitched: a.pitched,
+        };
+        let session = self.session.clone();
+        let origin = origin(&ctx, "bank_load");
+        let loaded = blocking(move || {
+            session
+                .load_bank(track, &request, origin)
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+        let sounds: serde_json::Map<String, Value> = loaded
+            .sounds
+            .iter()
+            .map(|(name, n)| (name.clone(), json!(n)))
+            .collect();
+        let example: Vec<&str> = loaded
+            .sounds
+            .iter()
+            .take(3)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let mut v = json!({
+            "track": track.to_string(),
+            "bank": loaded.bank,
+            "pack": loaded.pack,
+            "license": loaded.license.id(),
+            "sounds": sounds,
+            "pitched": loaded.pitched,
+            "newFiles": loaded.new_files,
+            "reusedFiles": loaded.reused_files,
+            "offline": loaded.offline,
+            "pattern": example.join(" "),
+        });
+        if !loaded.failed.is_empty() {
+            v["failedFiles"] = json!(loaded.failed.len());
+            v["failed"] = json!(loaded.failed.iter().take(5).collect::<Vec<_>>());
+        }
+        if loaded.license == License::Unknown {
+            v["licenseNote"] = json!(
+                "This pack does not state a license; exports will warn until its terms are checked."
+            );
+        }
+        Ok(v.to_string())
+    }
+
+    #[tool(
         description = "Renders the arrangement (or the given bars) with a tail and writes a WAV file."
     )]
     async fn export_wav(&self, Parameters(a): Parameters<ExportWavArgs>) -> ToolResult {
@@ -1623,11 +1845,14 @@ impl SkywareMcp {
                 .export_wav(&path, range, a.tail_seconds.unwrap_or(2.0), format)
                 .map_err(|e| e.to_string())?;
             let stats = analysis::analyze(&audio);
+            let licenses = session.license_report();
             Ok(json!({
                 "file": path.display().to_string(),
                 "seconds": round(audio.duration_seconds(), 3),
                 "integratedLufs": stats.integrated_lufs,
                 "truePeakDbfs": stats.true_peak_dbfs,
+                "credits": licenses.credits,
+                "licenseWarnings": licenses.warnings,
             })
             .to_string())
         })
@@ -1670,6 +1895,8 @@ impl SkywareMcp {
                 "manifest": out.exported.manifest.display().to_string(),
                 "bars": out.bars,
                 "seam": out.seam,
+                "credits": out.licenses.credits,
+                "licenseWarnings": out.licenses.warnings,
             })
             .to_string())
         })

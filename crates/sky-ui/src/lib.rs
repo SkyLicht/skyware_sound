@@ -22,6 +22,7 @@ mod palette;
 mod params;
 mod pattern_editor;
 mod piano_roll;
+mod sounds;
 mod theme;
 mod tracks;
 mod transport;

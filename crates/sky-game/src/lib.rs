@@ -95,6 +95,8 @@ pub struct LoopExport<'a> {
     pub bars: Option<f64>,
     pub category: Category,
     pub tags: Vec<String>,
+    /// Credit lines for the manifest, from the licenses of the sounds used.
+    pub credits: Vec<String>,
     pub format: WavFormat,
 }
 
@@ -150,6 +152,7 @@ pub fn export_loop(dir: &Path, export: &LoopExport) -> Result<Exported, GameErro
         loudness_lufs: stats.integrated_lufs,
         peak_dbfs: Some(stats.peak_dbfs as f64),
         tags: export.tags.clone(),
+        credits: export.credits.clone(),
     });
     manifest.upsert(asset.clone());
     write_manifest(dir, &manifest)?;
@@ -193,6 +196,7 @@ mod tests {
             bars: Some(0.5),
             category: Category::Music,
             tags: vec!["battle".into()],
+            credits: vec!["Piano by Someone (CC BY 3.0)".into()],
             format: WavFormat::Pcm24,
         };
         let first = export_loop(dir.path(), &export).unwrap();
@@ -206,6 +210,7 @@ mod tests {
         };
         assert_eq!(l.loop_end, 48_000);
         assert!(l.loudness_lufs.is_some());
+        assert_eq!(l.credits, ["Piano by Someone (CC BY 3.0)"]);
         let bad = LoopExport {
             loop_end: 99_999,
             ..export

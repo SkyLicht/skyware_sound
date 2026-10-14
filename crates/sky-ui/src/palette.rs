@@ -109,6 +109,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Save", "Ctrl+S", Action::Save),
         entry("Save as…", "Ctrl+Shift+S", Action::SaveAs),
         entry("Import audio…", "", Action::ImportAudio),
+        entry("Load sounds from a sample pack…", "", Action::LoadSounds),
         entry("Export loop for a game…", "", Action::ExportLoop),
         entry("Export WAV…", "", Action::ExportWav),
         entry("Audio settings…", "", Action::OpenSettings),

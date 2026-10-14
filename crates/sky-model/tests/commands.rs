@@ -361,3 +361,112 @@ fn random_sequences_mostly_apply() {
     }
     assert!(ok * 3 > total, "only {ok} of {total} transactions applied");
 }
+
+fn pool_audio(project: &mut Project, name: &str) -> sky_core::AudioId {
+    let id = sky_core::AudioId::new();
+    project.audio_pool.push(PoolEntry {
+        id,
+        name: name.into(),
+        file: format!("audio/{id}.wav"),
+        channels: 1,
+        sample_rate: 48_000,
+        frames: 100,
+        source: Some(AudioSource {
+            pack: "Test pack".into(),
+            url: format!("https://example.com/{name}.wav"),
+            license: License::Cc0,
+            credit: None,
+        }),
+    });
+    id
+}
+
+fn bank_of(sounds: &[(&str, &[sky_core::AudioId])]) -> SampleBank {
+    SampleBank {
+        name: "Test".into(),
+        sounds: sounds
+            .iter()
+            .map(|(name, ids)| {
+                (
+                    name.to_string(),
+                    ids.iter()
+                        .map(|&audio| BankSample { audio, root: None })
+                        .collect(),
+                )
+            })
+            .collect(),
+        pitched: None,
+    }
+}
+
+#[test]
+fn sample_banks_are_validated_and_keep_their_audio() {
+    let mut project = Project::new("Banks");
+    let a = pool_audio(&mut project, "bd");
+    let b = pool_audio(&mut project, "sn");
+    let track = Track::new_instrument("Kit", InstrumentType::Bank);
+    let id = track.id;
+    let mut history = History::new();
+    history
+        .apply(
+            &mut project,
+            tx(vec![Command::AddTrack {
+                track: Box::new(track),
+                index: None,
+            }]),
+        )
+        .unwrap();
+    let mut slot = InstrumentSlot::new(InstrumentType::Bank);
+    slot.bank = Some(bank_of(&[("bd", &[a]), ("sn", &[b, a])]));
+    let set = |slot: &InstrumentSlot| Command::SetInstrument {
+        track: id,
+        instrument: Some(slot.clone()),
+    };
+    history.apply(&mut project, tx(vec![set(&slot)])).unwrap();
+
+    // The audio stays while the bank uses it.
+    let err = history
+        .apply(&mut project, tx(vec![Command::RemovePoolAudio { id: a }]))
+        .unwrap_err();
+    assert!(err.to_string().contains("sample bank"), "{err}");
+
+    let mut bad = slot.clone();
+    bad.kind = InstrumentType::Synth;
+    assert!(history.apply(&mut project, tx(vec![set(&bad)])).is_err());
+    let mut bad = slot.clone();
+    bad.bank = Some(bank_of(&[("bd", &[sky_core::AudioId::new()])]));
+    assert!(history.apply(&mut project, tx(vec![set(&bad)])).is_err());
+    let mut bad = slot.clone();
+    bad.bank = Some(bank_of(&[("bad name", &[a])]));
+    assert!(history.apply(&mut project, tx(vec![set(&bad)])).is_err());
+    let mut bad = slot.clone();
+    bad.bank = Some(bank_of(&[("bd", &[])]));
+    assert!(history.apply(&mut project, tx(vec![set(&bad)])).is_err());
+    let mut bad = slot.clone();
+    bad.bank.as_mut().unwrap().pitched = Some("piano".into());
+    assert!(history.apply(&mut project, tx(vec![set(&bad)])).is_err());
+
+    // Saving and loading keeps the bank and the sources.
+    let json = serde_json::to_string(&project).unwrap();
+    let back: Project = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, project);
+    assert!(json.contains("\"license\":\"CC0-1.0\""), "{json}");
+}
+
+#[test]
+fn bank_sounds_resolve_by_name_case_and_drum_alias() {
+    let a = sky_core::AudioId::new();
+    let b = sky_core::AudioId::new();
+    let bank = bank_of(&[("bd", &[a]), ("SN", &[b]), ("casio", &[a, b])]);
+    assert_eq!(
+        bank.resolve("bd").map(|(n, s)| (n, s.len())),
+        Some(("bd", 1))
+    );
+    assert_eq!(bank.resolve("casio").map(|(_, s)| s.len()), Some(2));
+    // A different case, then another name for the same drum.
+    assert_eq!(bank.resolve("sn").map(|(n, _)| n), Some("SN"));
+    assert_eq!(bank.resolve("sd").map(|(n, _)| n), Some("SN"));
+    assert_eq!(bank.resolve("kick").map(|(n, _)| n), Some("bd"));
+    assert_eq!(bank.resolve("hh"), None);
+    assert_eq!(bank.sample_count(), 4);
+}

@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::AudioData;
 use crate::params::ParamSpec;
 
+mod bank;
 mod drums;
 mod envelope;
 mod sampler;
 mod synth;
 
+pub use bank::{Bank, BankMap, KeyZone};
 pub use drums::DrumKit;
 pub use envelope::Adsr;
 pub use sampler::Sampler;
@@ -25,6 +27,9 @@ pub trait Instrument: Send + 'static {
     fn set_param(&mut self, name: &str, value: f32) -> bool;
     fn note_on(&mut self, pitch: u8, velocity: u8);
     fn note_off(&mut self, pitch: u8);
+    /// Starts sound number `sound` of a sample bank as a one-shot; it
+    /// rings out and takes no note-off. Other instruments ignore it.
+    fn sound_on(&mut self, _sound: u32, _velocity: u8) {}
     /// Releases every held note, letting release tails ring out.
     fn all_notes_off(&mut self);
     /// Silences everything immediately.
@@ -65,13 +70,27 @@ pub enum InstrumentType {
     Drums,
     /// Plays one sample from the audio pool across the keyboard.
     Sampler,
+    /// Plays named sounds, with variations, from loaded sample packs.
+    Bank,
+}
+
+/// The audio an instrument plays.
+#[derive(Clone, Debug, Default)]
+pub enum InstrumentAudio {
+    #[default]
+    None,
+    /// The sampler's one sample.
+    Sample(Arc<AudioData>),
+    /// A sample bank's sounds and key map.
+    Bank(Arc<BankMap>),
 }
 
 impl InstrumentType {
-    pub const ALL: [InstrumentType; 3] = [
+    pub const ALL: [InstrumentType; 4] = [
         InstrumentType::Synth,
         InstrumentType::Drums,
         InstrumentType::Sampler,
+        InstrumentType::Bank,
     ];
 
     pub fn name(self) -> &'static str {
@@ -79,6 +98,7 @@ impl InstrumentType {
             InstrumentType::Synth => "synth",
             InstrumentType::Drums => "drums",
             InstrumentType::Sampler => "sampler",
+            InstrumentType::Bank => "bank",
         }
     }
 
@@ -87,6 +107,7 @@ impl InstrumentType {
             InstrumentType::Synth => "Subtractive synth",
             InstrumentType::Drums => "Drum machine",
             InstrumentType::Sampler => "Sampler",
+            InstrumentType::Bank => "Sample bank",
         }
     }
 
@@ -102,6 +123,10 @@ impl InstrumentType {
             InstrumentType::Sampler => {
                 "Plays one audio-pool sample, pitched relative to its root note"
             }
+            InstrumentType::Bank => {
+                "Plays named sounds from a loaded sample pack, such as bd, sd:2 or piano; \
+                 notes play the drums on General MIDI notes, or one pitched sound"
+            }
         }
     }
 
@@ -116,26 +141,35 @@ impl InstrumentType {
             InstrumentType::Synth => synth::SYNTH_PARAMS,
             InstrumentType::Drums => drums::DRUM_PARAMS,
             InstrumentType::Sampler => sampler::SAMPLER_PARAMS,
+            InstrumentType::Bank => bank::BANK_PARAMS,
         }
     }
 
-    /// A new instance with default parameters. `sample` is the audio the
-    /// sampler plays; other instruments ignore it.
-    pub fn create(self, sample_rate: f32, sample: Option<Arc<AudioData>>) -> Box<dyn Instrument> {
-        self.create_with(sample_rate, sample, std::iter::empty())
+    /// A new instance with default parameters. `audio` is what the sampler
+    /// or sample bank plays; other instruments ignore it, and each ignores
+    /// the other's kind of audio.
+    pub fn create(self, sample_rate: f32, audio: InstrumentAudio) -> Box<dyn Instrument> {
+        self.create_with(sample_rate, audio, std::iter::empty())
     }
 
     /// A new instance with the given parameter values (others default).
     pub fn create_with<'a>(
         self,
         sample_rate: f32,
-        sample: Option<Arc<AudioData>>,
+        audio: InstrumentAudio,
         values: impl IntoIterator<Item = (&'a str, f32)>,
     ) -> Box<dyn Instrument> {
-        let mut inst: Box<dyn Instrument> = match self {
-            InstrumentType::Synth => Box::new(Synth::new(sample_rate)),
-            InstrumentType::Drums => Box::new(DrumKit::new(sample_rate)),
-            InstrumentType::Sampler => Box::new(Sampler::new(sample_rate, sample)),
+        let mut inst: Box<dyn Instrument> = match (self, audio) {
+            (InstrumentType::Synth, _) => Box::new(Synth::new(sample_rate)),
+            (InstrumentType::Drums, _) => Box::new(DrumKit::new(sample_rate)),
+            (InstrumentType::Sampler, InstrumentAudio::Sample(sample)) => {
+                Box::new(Sampler::new(sample_rate, Some(sample)))
+            }
+            (InstrumentType::Sampler, _) => Box::new(Sampler::new(sample_rate, None)),
+            (InstrumentType::Bank, InstrumentAudio::Bank(map)) => {
+                Box::new(Bank::new(sample_rate, map))
+            }
+            (InstrumentType::Bank, _) => Box::new(Bank::new(sample_rate, Arc::default())),
         };
         for spec in self.params() {
             inst.set_param(spec.name, spec.default);
@@ -165,14 +199,34 @@ mod tests {
         buf.iter().fold(0.0, |m, s| m.max(s.abs()))
     }
 
-    #[test]
-    fn instruments_make_sound_and_stop() {
+    /// Audio that makes each kind of instrument sound: a sine for the
+    /// sampler, and the same sine on key 60 and as sound 0 for a bank.
+    pub(crate) fn test_audio(kind: InstrumentType) -> InstrumentAudio {
         let sample = Arc::new(AudioData {
             sample_rate: 48_000,
             channels: vec![(0..4_800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect()],
         });
+        match kind {
+            InstrumentType::Sampler => InstrumentAudio::Sample(sample),
+            InstrumentType::Bank => {
+                let mut keys = vec![None; 128];
+                keys[60] = Some(KeyZone {
+                    sample: 0,
+                    semitones: 0.0,
+                });
+                InstrumentAudio::Bank(Arc::new(BankMap {
+                    samples: vec![sample],
+                    keys,
+                }))
+            }
+            _ => InstrumentAudio::None,
+        }
+    }
+
+    #[test]
+    fn instruments_make_sound_and_stop() {
         for t in InstrumentType::ALL {
-            let mut inst = t.create(48_000.0, Some(sample.clone()));
+            let mut inst = t.create(48_000.0, test_audio(t));
             for spec in t.params() {
                 assert!(
                     inst.set_param(spec.name, spec.default),
@@ -198,7 +252,7 @@ mod tests {
         for note in [
             35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 56, 57, 59,
         ] {
-            let mut kit = InstrumentType::Drums.create(48_000.0, None);
+            let mut kit = InstrumentType::Drums.create(48_000.0, InstrumentAudio::None);
             kit.note_on(note, 127);
             let (l, _) = render_seconds(kit.as_mut(), 0.05);
             assert!(peak(&l) > 0.01, "drum note {note} silent");
@@ -207,14 +261,14 @@ mod tests {
 
     #[test]
     fn voices_survive_adopt() {
-        let mut a = InstrumentType::Synth.create(48_000.0, None);
+        let mut a = InstrumentType::Synth.create(48_000.0, InstrumentAudio::None);
         a.note_on(60, 100);
         let _ = render_seconds(a.as_mut(), 0.05);
-        let mut b = InstrumentType::Synth.create(48_000.0, None);
+        let mut b = InstrumentType::Synth.create(48_000.0, InstrumentAudio::None);
         assert!(b.adopt(a.as_mut()));
         let (l, _) = render_seconds(b.as_mut(), 0.05);
         assert!(peak(&l) > 0.01, "held note lost across adopt");
-        let mut c = InstrumentType::Drums.create(48_000.0, None);
+        let mut c = InstrumentType::Drums.create(48_000.0, InstrumentAudio::None);
         assert!(!c.adopt(b.as_mut()));
     }
 }

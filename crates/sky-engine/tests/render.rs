@@ -78,6 +78,7 @@ fn audio_clips_play_sample_exact() {
         channels: 1,
         sample_rate: SR,
         frames: 10_000,
+        source: None,
     });
     let mut t = Track::new_audio("Audio");
     t.clips.push(Clip {
@@ -242,4 +243,134 @@ fn pattern_clips_play_on_the_grid() {
         (144_000..=144_001).contains(&second),
         "second kick at {second}"
     );
+}
+
+/// A pool file of constant `level`, `frames` long, in `audio` and `p`.
+fn dc_audio(p: &mut Project, audio: &mut AudioCache, level: f32, frames: usize) -> AudioId {
+    let id = AudioId::new();
+    audio.insert(
+        id,
+        Arc::new(AudioData {
+            sample_rate: SR,
+            channels: vec![vec![level; frames]],
+        }),
+    );
+    p.audio_pool.push(PoolEntry {
+        id,
+        name: format!("dc {level}"),
+        file: format!("audio/{id}.wav"),
+        channels: 1,
+        sample_rate: SR,
+        frames: frames as u64,
+        source: None,
+    });
+    id
+}
+
+fn bank_project(clip: ClipContent, pitched: Option<&str>) -> (Project, AudioCache) {
+    let mut p = Project::new("bank");
+    p.loop_enabled = false;
+    let mut audio = AudioCache::new();
+    let mut sound = |p: &mut Project, levels: &[(f32, Option<u8>)]| -> Vec<BankSample> {
+        levels
+            .iter()
+            .map(|&(level, root)| BankSample {
+                audio: dc_audio(p, &mut audio, level, 4_800),
+                root,
+            })
+            .collect()
+    };
+    let mut sounds = std::collections::BTreeMap::new();
+    sounds.insert("bd".to_string(), sound(&mut p, &[(0.1, None)]));
+    sounds.insert("sn".to_string(), sound(&mut p, &[(0.2, None), (0.3, None)]));
+    sounds.insert(
+        "piano".to_string(),
+        sound(&mut p, &[(0.4, Some(60)), (0.5, Some(72))]),
+    );
+    let mut t = Track::new_instrument("Bank", InstrumentType::Bank);
+    t.instrument.as_mut().unwrap().bank = Some(SampleBank {
+        name: "Test".into(),
+        sounds,
+        pitched: pitched.map(str::to_string),
+    });
+    t.clips.push(Clip {
+        id: ClipId::new(),
+        name: "c".into(),
+        start: 0,
+        length: PPQ * 4,
+        content: clip,
+    });
+    p.tracks.push(t);
+    (p, audio)
+}
+
+/// The level a sound settles at, a little after `onset`.
+fn level_at(buf: &[f32], onset: usize) -> f32 {
+    buf[onset + 200]
+}
+
+#[test]
+fn bank_patterns_play_named_sounds_and_variations() {
+    // One bar of four steps, a quarter note (24 000 samples) each.
+    let (p, audio) = bank_project(
+        ClipContent::Pattern {
+            source: "bd sd:1 zz sn:2".into(),
+            seed: 0,
+            cycle: PPQ * 4,
+        },
+        None,
+    );
+    let out = render(compile(&p, &audio, SR, 1), 0, SR as usize * 2, false);
+    let l = out.left();
+    let base = level_at(l, 0);
+    assert!(base > 0.01, "bd is silent");
+    // `sd` finds the bank's `sn`; `:1` is its second variation.
+    assert!((level_at(l, 24_000) / base - 3.0).abs() < 0.01);
+    // An unknown sound plays nothing.
+    assert!(l[48_000..72_000].iter().all(|s| s.abs() < 1e-6));
+    // Index 2 of two variations wraps to the first.
+    assert!((level_at(l, 72_000) / base - 2.0).abs() < 0.01);
+    // Each sound plays its 4800-frame sample once, right on its step.
+    assert!(first_sound(l).is_some_and(|i| i <= 1));
+    assert!(l[5_000..24_000].iter().all(|s| s.abs() < 1e-6));
+}
+
+#[test]
+fn bank_notes_play_drums_by_number_or_the_pitched_sound() {
+    let notes = vec![Note::new(0, PPQ / 4, 38, 100)];
+    let (p, audio) = bank_project(
+        ClipContent::Midi {
+            notes: notes.clone(),
+        },
+        None,
+    );
+    let drums = render(compile(&p, &audio, SR, 1), 0, SR as usize / 2, false);
+    let (p2, audio2) = bank_project(
+        ClipContent::Pattern {
+            source: "bd".into(),
+            seed: 0,
+            cycle: PPQ * 4,
+        },
+        None,
+    );
+    let bd = render(compile(&p2, &audio2, SR, 1), 0, SR as usize / 2, false);
+    // Note 38 is the snare: the first `sn`, twice the level of `bd`.
+    assert!((level_at(drums.left(), 0) / level_at(bd.left(), 0) - 2.0).abs() < 0.01);
+
+    // With `piano` pitched, note 62 plays the C4 sample two semitones up,
+    // so the 4800 frames go by faster.
+    let (p, audio) = bank_project(
+        ClipContent::Midi {
+            notes: vec![Note::new(0, PPQ, 62, 100)],
+        },
+        Some("piano"),
+    );
+    let out = render(compile(&p, &audio, SR, 1), 0, SR as usize / 2, false);
+    let sounding = out.left().iter().filter(|s| s.abs() > 1e-4).count();
+    let expected = 4_800.0 / 2f64.powf(2.0 / 12.0);
+    assert!(
+        (sounding as f64 - expected).abs() < 4.0,
+        "{sounding} frames"
+    );
+    assert!((level_at(out.left(), 0) / level_at(bd.left(), 0) - 4.0).abs() < 0.01);
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Dialogs: choosing paths (native dialogs with a typed fallback), unsaved
-//! changes, loop and WAV export, and audio settings.
+//! changes, loop and WAV export, and audio settings. The Load sounds dialog
+//! is in [`crate::sounds`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,12 +13,13 @@ use sky_core::Ticks;
 use sky_core::manifest::{Asset, Category};
 use sky_io::WavFormat;
 use sky_io::device::OutputMode;
-use sky_model::Origin;
+use sky_model::{LicenseReport, Origin};
 use sky_session::LoopExportOptions;
 
 use crate::app::{Action, App};
 use crate::audio::{self, BUFFER_SIZES, SAMPLE_RATES};
 use crate::jobs::JobOutput;
+use crate::sounds::{LoadSoundsDialog, license_report_ui};
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +29,7 @@ pub enum PathPurpose {
     ImportAudio,
     ExportLoopFolder,
     ExportWavFile,
+    SoundPack,
 }
 
 impl PathPurpose {
@@ -37,6 +40,7 @@ impl PathPurpose {
             PathPurpose::ImportAudio => "Import audio",
             PathPurpose::ExportLoopFolder => "Export folder",
             PathPurpose::ExportWavFile => "Export WAV to",
+            PathPurpose::SoundPack => "Sound pack folder",
         }
     }
 
@@ -49,6 +53,7 @@ impl PathPurpose {
                 "The folder that holds skyware-manifest.json for your game"
             }
             PathPurpose::ExportWavFile => "A .wav file",
+            PathPurpose::SoundPack => "A folder with a strudel.json sample map in it",
         }
     }
 }
@@ -80,6 +85,8 @@ pub struct LoopSummary {
     pub peak_dbfs: Option<f64>,
     pub bars: f64,
     pub seconds: f64,
+    /// Credits written into the manifest, and warnings.
+    pub licenses: LicenseReport,
 }
 
 pub struct WavSummary {
@@ -87,6 +94,7 @@ pub struct WavSummary {
     pub seconds: f64,
     pub peak_dbfs: f32,
     pub lufs: Option<f64>,
+    pub licenses: LicenseReport,
 }
 
 pub struct ExportLoopDialog {
@@ -94,6 +102,8 @@ pub struct ExportLoopDialog {
     pub folder: String,
     pub bits: u16,
     pub category: Category,
+    /// What the sounds in the export ask for, as of when the dialog opened.
+    pub licenses: LicenseReport,
     pub running: bool,
     pub result: Option<Result<LoopSummary, String>>,
 }
@@ -103,6 +113,7 @@ pub struct ExportWavDialog {
     pub bits: u16,
     pub whole_song: bool,
     pub tail: f64,
+    pub licenses: LicenseReport,
     pub running: bool,
     pub result: Option<Result<WavSummary, String>>,
 }
@@ -122,6 +133,7 @@ pub struct Dialogs {
     pub native: Option<NativeWait>,
     pub export_loop: Option<ExportLoopDialog>,
     pub export_wav: Option<ExportWavDialog>,
+    pub load_sounds: Option<LoadSoundsDialog>,
     pub settings: Option<SettingsDialog>,
     /// An action to run once a "Save as" from the unsaved-changes dialog succeeds.
     pub after_save_as: Option<Action>,
@@ -136,6 +148,7 @@ impl Dialogs {
             || self.native.is_some()
             || self.export_loop.is_some()
             || self.export_wav.is_some()
+            || self.load_sounds.is_some()
     }
 }
 
@@ -225,7 +238,9 @@ fn native_pick(purpose: PathPurpose, default: &Path) -> Option<PathBuf> {
         d = d.set_file_name(n);
     }
     match purpose {
-        PathPurpose::OpenProject | PathPurpose::ExportLoopFolder => d.pick_folder(),
+        PathPurpose::OpenProject | PathPurpose::ExportLoopFolder | PathPurpose::SoundPack => {
+            d.pick_folder()
+        }
         PathPurpose::SaveAs => d.save_file(),
         PathPurpose::ImportAudio => d
             .add_filter("Audio", &["wav", "flac", "ogg", "mp3"])
@@ -254,6 +269,13 @@ impl App {
                 Some(p) => p.join("renders").join(format!("{stem}.wav")),
                 None => default_dir().join(format!("{stem}.wav")),
             },
+            PathPurpose::SoundPack => self
+                .dialogs
+                .load_sounds
+                .as_ref()
+                .map(|d| PathBuf::from(d.address.trim()))
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(default_dir),
         }
     }
 
@@ -281,8 +303,10 @@ impl App {
 
     fn open_path_prompt(&mut self, purpose: PathPurpose, default: &Path) {
         let mut text = default.display().to_string();
-        if matches!(purpose, PathPurpose::OpenProject | PathPurpose::ImportAudio)
-            && !text.ends_with(std::path::MAIN_SEPARATOR)
+        if matches!(
+            purpose,
+            PathPurpose::OpenProject | PathPurpose::ImportAudio | PathPurpose::SoundPack
+        ) && !text.ends_with(std::path::MAIN_SEPARATOR)
         {
             text.push(std::path::MAIN_SEPARATOR);
         }
@@ -402,6 +426,15 @@ impl App {
                     d.path = with_extension(path, "wav").display().to_string();
                 }
             }
+            PathPurpose::SoundPack => {
+                if let Some(d) = self.dialogs.load_sounds.as_mut() {
+                    d.pack = None;
+                    d.address = path.display().to_string();
+                    d.bank = None;
+                    d.chosen.clear();
+                }
+                self.read_pack(ctx);
+            }
         }
         None
     }
@@ -416,6 +449,7 @@ impl App {
             folder,
             bits: 24,
             category: Category::Music,
+            licenses: self.session.license_report(),
             running: false,
             result: None,
         });
@@ -428,6 +462,7 @@ impl App {
             bits: 24,
             whole_song: true,
             tail: 2.0,
+            licenses: self.session.license_report(),
             running: false,
             result: None,
         });
@@ -490,6 +525,7 @@ impl App {
                             peak_dbfs: peak,
                             bars: x.bars,
                             seconds: x.frames as f64 / x.sample_rate.max(1) as f64,
+                            licenses: x.licenses,
                         }
                     });
                 JobOutput::LoopExported(result)
@@ -529,6 +565,7 @@ impl App {
                         seconds: audio.duration_seconds(),
                         peak_dbfs: stats.peak_dbfs,
                         lufs: stats.integrated_lufs,
+                        licenses: session.license_report(),
                     }
                 });
             JobOutput::WavExported(result)
@@ -541,6 +578,7 @@ pub fn show(app: &mut App, ctx: &Context) {
     settings_window(app, ctx);
     export_loop_dialog(app, ctx);
     export_wav_dialog(app, ctx);
+    crate::sounds::load_sounds_dialog(app, ctx);
     confirm_dialog(app, ctx);
     path_prompt(app, ctx);
     native_wait(app, ctx);
@@ -777,6 +815,11 @@ fn export_loop_dialog(app: &mut App, ctx: &Context) {
                 });
         });
         ui.add_space(6.0);
+        let licenses = match &d.result {
+            Some(Ok(s)) => &s.licenses,
+            _ => &d.licenses,
+        };
+        license_report_ui(ui, licenses, "These credits go into the manifest:");
         match &d.result {
             Some(Ok(s)) => {
                 ui.label(RichText::new("Exported").strong().color(theme::OK));
@@ -891,6 +934,11 @@ fn export_wav_dialog(app: &mut App, ctx: &Context) {
                 });
         });
         ui.add_space(6.0);
+        let licenses = match &d.result {
+            Some(Ok(s)) => &s.licenses,
+            _ => &d.licenses,
+        };
+        license_report_ui(ui, licenses, "Credit these wherever the audio is used:");
         match &d.result {
             Some(Ok(s)) => {
                 ui.label(RichText::new("Exported").strong().color(theme::OK));

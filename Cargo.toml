@@ -8,6 +8,7 @@ members = [
     "crates/sky-engine",
     "crates/sky-io",
     "crates/sky-game",
+    "crates/sky-library",
     "crates/sky-session",
     "crates/sky-check",
     "crates/sky-mcp",
@@ -23,6 +24,7 @@ default-members = [
     "crates/sky-engine",
     "crates/sky-io",
     "crates/sky-game",
+    "crates/sky-library",
     "crates/sky-session",
     "crates/sky-check",
     "crates/sky-mcp",
@@ -51,6 +53,7 @@ sky-model = { path = "crates/sky-model" }
 sky-engine = { path = "crates/sky-engine" }
 sky-io = { path = "crates/sky-io", default-features = false }
 sky-game = { path = "crates/sky-game" }
+sky-library = { path = "crates/sky-library" }
 sky-session = { path = "crates/sky-session" }
 sky-check = { path = "crates/sky-check" }
 sky-mcp = { path = "crates/sky-mcp" }
@@ -89,6 +92,8 @@ egui_dock = "0.21"
 proptest = "1.7"
 tempfile = "3"
 directories = "6"
+# Downloads sound packs. Its default TLS is rustls with Mozilla's roots.
+ureq = "3.4"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

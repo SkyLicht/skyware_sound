@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use num_rational::Rational64;
 use sky_core::{AudioId, EffectId, TempoMap, Ticks, TrackId};
+use sky_dsp::instruments::{BankMap, KeyZone};
 use sky_dsp::util::db_to_gain;
-use sky_dsp::{AudioData, Effect, Instrument, MAX_BLOCK};
-use sky_model::{Channel, Clip, ClipContent, Project, Track, TrackKind};
+use sky_dsp::{AudioData, Effect, Instrument, InstrumentAudio, InstrumentType, MAX_BLOCK};
+use sky_model::{Channel, Clip, ClipContent, Project, SampleBank, Track, TrackKind};
+use sky_pattern::Value;
 
 /// Decoded audio-pool files, shared between snapshots.
 pub type AudioCache = HashMap<AudioId, Arc<AudioData>>;
@@ -21,6 +23,9 @@ pub struct NoteEvent {
     pub end: i64,
     pub pitch: u8,
     pub velocity: u8,
+    /// For a sample bank: the sound to start as a one-shot instead of the
+    /// key `pitch`.
+    pub sound: Option<u32>,
 }
 
 pub struct AudioClipNode {
@@ -125,7 +130,16 @@ fn ticks_to_samples(tempo: &TempoMap, tick: Ticks, sr: u32) -> i64 {
     tempo.tick_to_sample(tick, sr)
 }
 
-fn pattern_notes(tempo: &TempoMap, sr: u32, clip: &Clip, out: &mut Vec<NoteEvent>) {
+/// What a pattern value plays on a track: a key, or a bank sound.
+type Resolve<'a> = dyn Fn(&Value) -> Option<(u8, Option<u32>)> + 'a;
+
+fn pattern_notes(
+    tempo: &TempoMap,
+    sr: u32,
+    clip: &Clip,
+    resolve: &Resolve,
+    out: &mut Vec<NoteEvent>,
+) {
     let ClipContent::Pattern {
         source,
         seed,
@@ -143,7 +157,7 @@ fn pattern_notes(tempo: &TempoMap, sr: u32, clip: &Clip, out: &mut Vec<NoteEvent
     }
     let to = Rational64::new(clip_len, cycle);
     for ev in pattern.query(Rational64::from_integer(0), to, seed) {
-        let Some(pitch) = ev.value.midi_note() else {
+        let Some((pitch, sound)) = resolve(&ev.value) else {
             continue;
         };
         let begin = clip_start + rational_ticks(ev.begin, cycle);
@@ -156,7 +170,77 @@ fn pattern_notes(tempo: &TempoMap, sr: u32, clip: &Clip, out: &mut Vec<NoteEvent
             end: ticks_to_samples(tempo, end, sr),
             pitch,
             velocity: 100,
+            sound,
         });
+    }
+}
+
+/// A sample bank ready to play: the instrument's map, and where each of the
+/// bank's sounds sits in the map's sample list.
+pub struct CompiledBank<'a> {
+    pub map: BankMap,
+    bank: &'a SampleBank,
+    /// Each sound's loaded variations: the sample index and recorded note.
+    sounds: HashMap<&'a str, Vec<(u32, Option<u8>)>>,
+}
+
+impl<'a> CompiledBank<'a> {
+    /// Collects the bank's decoded samples and lays out its keys. Samples
+    /// whose audio is not loaded are left out.
+    pub fn new(bank: &'a SampleBank, audio: &AudioCache) -> Self {
+        let mut map = BankMap::default();
+        let mut sounds = HashMap::new();
+        for (name, samples) in &bank.sounds {
+            let mut loaded = Vec::new();
+            for s in samples {
+                if let Some(data) = audio.get(&s.audio) {
+                    loaded.push((map.samples.len() as u32, s.root));
+                    map.samples.push(data.clone());
+                }
+            }
+            if !loaded.is_empty() {
+                sounds.insert(name.as_str(), loaded);
+            }
+        }
+        let mut compiled = Self { map, bank, sounds };
+        compiled.map.keys = (0..128u8).map(|key| compiled.key_zone(key)).collect();
+        compiled
+    }
+
+    fn loaded(&self, name: &str) -> Option<&[(u32, Option<u8>)]> {
+        let (key, _) = self.bank.resolve(name)?;
+        self.sounds.get(key).map(Vec::as_slice)
+    }
+
+    /// The sample for a pattern sound: `bd:3` is the fourth `bd`, wrapping
+    /// around when the sound has fewer variations.
+    pub fn sound(&self, name: &str, index: u32) -> Option<u32> {
+        let list = self.loaded(name)?;
+        list.get(index as usize % list.len())
+            .map(|&(sample, _)| sample)
+    }
+
+    fn key_zone(&self, key: u8) -> Option<KeyZone> {
+        if let Some(pitched) = &self.bank.pitched {
+            // The pitched sound across the keyboard, each key played by the
+            // nearest recorded note. Samples without one count as C4.
+            let (sample, root) = self
+                .loaded(pitched)?
+                .iter()
+                .map(|&(sample, root)| (sample, root.unwrap_or(60)))
+                .min_by_key(|&(_, root)| (i32::from(root) - i32::from(key)).abs())?;
+            return Some(KeyZone {
+                sample,
+                semitones: f32::from(key) - f32::from(root),
+            });
+        }
+        // Drum sounds on their General MIDI notes.
+        sky_pattern::drum_names(key).find_map(|drum| {
+            self.sound(drum, 0).map(|sample| KeyZone {
+                sample,
+                semitones: 0.0,
+            })
+        })
     }
 }
 
@@ -215,6 +299,18 @@ fn track_node(
             SourceNode::Audio(clips)
         }
         TrackKind::Instrument => {
+            let slot = track.instrument.as_ref();
+            let bank = slot
+                .filter(|s| s.kind == InstrumentType::Bank)
+                .and_then(|s| s.bank.as_ref())
+                .map(|b| CompiledBank::new(b, audio));
+            let resolve: Box<Resolve> = match &bank {
+                Some(bank) => Box::new(|v: &Value| match v {
+                    Value::Note(n) => Some((*n, None)),
+                    Value::Sound { name, index } => bank.sound(name, *index).map(|s| (0, Some(s))),
+                }),
+                None => Box::new(|v: &Value| v.midi_note().map(|n| (n, None))),
+            };
             let mut notes = Vec::new();
             for clip in &track.clips {
                 match &clip.content {
@@ -227,19 +323,29 @@ fn track_node(
                                 end: ticks_to_samples(tempo, end, sr),
                                 pitch: n.pitch,
                                 velocity: n.velocity,
+                                sound: None,
                             });
                         }
                     }
-                    ClipContent::Pattern { .. } => pattern_notes(tempo, sr, clip, &mut notes),
+                    ClipContent::Pattern { .. } => {
+                        pattern_notes(tempo, sr, clip, &resolve, &mut notes);
+                    }
                     ClipContent::Audio { .. } => {}
                 }
             }
-            notes.sort_by_key(|n| (n.time, n.pitch));
-            let instrument = track.instrument.as_ref().map(|slot| {
-                let sample = slot.sample.and_then(|id| audio.get(&id).cloned());
+            notes.sort_by_key(|n| (n.time, n.pitch, n.sound));
+            drop(resolve);
+            let instrument = slot.map(|slot| {
+                let input = match (slot.kind, bank) {
+                    (InstrumentType::Bank, Some(bank)) => InstrumentAudio::Bank(Arc::new(bank.map)),
+                    _ => slot
+                        .sample
+                        .and_then(|id| audio.get(&id).cloned())
+                        .map_or(InstrumentAudio::None, InstrumentAudio::Sample),
+                };
                 slot.kind.create_with(
                     srf,
-                    sample,
+                    input,
                     slot.params.iter().map(|(k, v)| (k.as_str(), *v)),
                 )
             });

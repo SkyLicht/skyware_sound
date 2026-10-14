@@ -36,10 +36,11 @@ pub enum NewTrack {
 }
 
 impl NewTrack {
-    pub const ALL: [NewTrack; 4] = [
+    pub const ALL: [NewTrack; 5] = [
         NewTrack::Instrument(InstrumentType::Synth),
         NewTrack::Instrument(InstrumentType::Drums),
         NewTrack::Instrument(InstrumentType::Sampler),
+        NewTrack::Instrument(InstrumentType::Bank),
         NewTrack::Audio,
     ];
 
@@ -48,6 +49,7 @@ impl NewTrack {
             NewTrack::Instrument(InstrumentType::Synth) => "Synth",
             NewTrack::Instrument(InstrumentType::Drums) => "Drums",
             NewTrack::Instrument(InstrumentType::Sampler) => "Sampler",
+            NewTrack::Instrument(InstrumentType::Bank) => "Sample bank",
             NewTrack::Audio => "Audio",
         }
     }

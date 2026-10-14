@@ -62,6 +62,24 @@ pub fn drum_note(name: &str) -> Option<u8> {
         .map(|&(_, note)| note)
 }
 
+/// Every drum name for General MIDI note `note`, such as `sd`, `sn` and
+/// `snare` for 38. Empty for notes that have no drum name.
+pub fn drum_names(note: u8) -> impl Iterator<Item = &'static str> {
+    DRUMS
+        .iter()
+        .filter(move |&&(_, n)| n == note)
+        .map(|&(name, _)| name)
+}
+
+/// Reads a note name such as `c4`, `F#3`, `Ds1` or `eb5` as a MIDI note
+/// (`c4` is 60). Without an octave the note is in octave 3.
+pub fn note_number(name: &str) -> Option<u8> {
+    match note_name(name) {
+        NoteName::Note(n) => Some(n),
+        _ => None,
+    }
+}
+
 /// Result of reading a word as a note name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NoteName {
@@ -161,6 +179,19 @@ mod tests {
         assert_eq!(drum_note("BD"), Some(36));
         assert_eq!(drum_note("piano"), None);
         assert_eq!(drum_note(""), None);
+    }
+
+    #[test]
+    fn drum_aliases_and_note_numbers() {
+        assert_eq!(drum_names(38).collect::<Vec<_>>(), ["sd", "sn", "snare"]);
+        assert_eq!(drum_names(36).collect::<Vec<_>>(), ["bd", "kick"]);
+        assert_eq!(drum_names(61).count(), 0);
+        assert_eq!(note_number("A0"), Some(21));
+        assert_eq!(note_number("Ds1"), Some(27));
+        assert_eq!(note_number("A#3"), Some(58));
+        assert_eq!(note_number("C4"), Some(60));
+        assert_eq!(note_number("bd"), None);
+        assert_eq!(note_number("g#9"), None);
     }
 
     #[test]

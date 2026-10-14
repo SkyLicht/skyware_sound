@@ -17,6 +17,7 @@ sky-model.workspace = true
 sky-engine.workspace = true
 sky-io.workspace = true
 sky-game.workspace = true
+sky-library.workspace = true
 arc-swap.workspace = true
 serde.workspace = true
 thiserror.workspace = true

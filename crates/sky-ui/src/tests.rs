@@ -12,7 +12,10 @@ use egui::{
 use sky_core::{AudioId, ClipId, PPQ};
 use sky_dsp::{AudioData, InstrumentType};
 use sky_model::templates::{demo_project, empty_project};
-use sky_model::{Clip, ClipContent, Command, Note, Origin, Project, Track, Transaction};
+use sky_model::{
+    BankSample, Clip, ClipContent, Command, License, Note, Origin, Project, SampleBank, Track,
+    Transaction,
+};
 use sky_session::Session;
 
 use crate::actions::{self, NewTrack};
@@ -20,7 +23,7 @@ use crate::app::{Action, App, Tab};
 use crate::dialogs::PathPurpose;
 use crate::waveform::Peaks;
 use crate::widgets::Gestures;
-use crate::{UiConfig, arrange, palette, pattern_editor, theme};
+use crate::{UiConfig, arrange, palette, pattern_editor, sounds, theme};
 
 const TABS: [Tab; 4] = [Tab::Editor, Tab::Mixer, Tab::Instrument, Tab::Ai];
 
@@ -1011,6 +1014,223 @@ fn exports_run_on_threads() {
     h.frames(2);
 }
 
+/// A pack folder with a bank `Kit` of three drums and a pitched `keys`.
+fn write_pack(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("pack folder");
+    for (i, name) in ["bd0", "bd1", "sd", "hh", "c4"].into_iter().enumerate() {
+        let audio = AudioData {
+            sample_rate: 48_000,
+            channels: vec![vec![0.1 * (i + 1) as f32; 2_400]],
+        };
+        sky_io::write_wav(
+            &dir.join(format!("{name}.wav")),
+            &audio,
+            sky_io::WavFormat::Pcm16,
+            false,
+        )
+        .expect("write wav");
+    }
+    std::fs::write(
+        dir.join("strudel.json"),
+        r#"{"Kit_bd": ["bd0.wav", "bd1.wav"], "Kit_sd": "sd.wav", "Kit_hh": "hh.wav",
+            "keys": {"c4": "c4.wav"}}"#,
+    )
+    .expect("write map");
+}
+
+#[test]
+fn sample_banks_load_from_a_pack_and_exports_credit_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let folder = dir.path().join("my kit");
+    write_pack(&folder);
+    let mut h = Harness::with_project(empty_project("Banks"));
+    let ctx = h.ctx();
+
+    // Load sounds with nothing selected loads into a new track.
+    h.app.run_action(&ctx, Action::LoadSounds);
+    let d = h
+        .app
+        .dialogs
+        .load_sounds
+        .as_mut()
+        .expect("the dialog opens");
+    assert_eq!(d.track, None);
+    assert!(d.pack.is_some(), "a known pack is chosen");
+    // Another pack: first an address that does not work.
+    d.pack = None;
+    d.address = dir.path().join("nowhere").display().to_string();
+    h.app.read_pack(&ctx);
+    h.wait_jobs();
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    let listing = d.listing.as_ref().expect("read");
+    assert!(listing.pack.is_err());
+    assert!(d.offered().is_empty());
+
+    // Then the folder, said to be CC BY 4.0.
+    d.license = License::CcBy4;
+    assert_eq!(
+        h.app
+            .path_chosen(&ctx, PathPurpose::SoundPack, folder.clone()),
+        None
+    );
+    h.wait_jobs();
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    assert_eq!(d.bank, None, "the pack has a sound in no bank");
+    let offered: Vec<String> = d.offered().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(offered, ["keys"]);
+    d.bank = Some("Kit".into());
+    assert_eq!(
+        d.offered(),
+        [("bd".to_string(), 2), ("hh".into(), 1), ("sd".into(), 1)]
+    );
+    d.chosen.extend(["bd".to_string(), "sd".to_string()]);
+    h.frames(3);
+    assert!(h.app.dialogs.blocks_input());
+
+    h.app.start_bank_load(&ctx);
+    assert!(
+        h.app
+            .dialogs
+            .load_sounds
+            .as_ref()
+            .is_some_and(|d| d.running)
+    );
+    h.wait_jobs();
+    let kit = h.track_named("Kit");
+    assert_eq!(h.app.sel.track, Some(kit.id));
+    assert_eq!(h.app.tab, Tab::Instrument);
+    let slot = kit.instrument.clone().expect("instrument");
+    assert_eq!(slot.kind, InstrumentType::Bank);
+    let bank = slot.bank.clone().expect("bank");
+    assert_eq!(bank.sounds.keys().collect::<Vec<_>>(), ["bd", "sd"]);
+    assert_eq!(bank.sounds["bd"].len(), 2);
+    let p = h.project();
+    let source = p
+        .pool_entry(bank.sounds["sd"][0].audio)
+        .ok()
+        .and_then(|e| e.source.clone())
+        .expect("pack audio keeps its source");
+    assert_eq!(
+        (source.pack.as_str(), source.license),
+        ("my kit", License::CcBy4)
+    );
+    let d = h
+        .app
+        .dialogs
+        .load_sounds
+        .as_mut()
+        .expect("dialog stays open");
+    assert_eq!(
+        d.track,
+        Some(kit.id),
+        "the next load goes to the same track"
+    );
+    match &d.result {
+        Some(Ok(b)) => assert_eq!(b.new_files, 3),
+        other => panic!(
+            "load failed: {:?}",
+            other.as_ref().map(|r| r.as_ref().err())
+        ),
+    }
+    h.frames(3);
+
+    // Adding hh keeps bd and sd.
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    d.chosen = ["hh".to_string()].into();
+    d.add = true;
+    h.app.start_bank_load(&ctx);
+    h.wait_jobs();
+    let bank = h
+        .track_named("Kit")
+        .instrument
+        .and_then(|i| i.bank)
+        .expect("bank");
+    assert_eq!(bank.sounds.keys().collect::<Vec<_>>(), ["bd", "hh", "sd"]);
+    assert_eq!(bank.name, "Kit");
+
+    // The one plain sound, pitched, into another new track.
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    d.track = None;
+    d.bank = None;
+    d.chosen.clear();
+    d.add = false;
+    h.app.start_bank_load(&ctx);
+    h.wait_jobs();
+    let keys = h.track_named("keys");
+    let bank = keys.instrument.and_then(|i| i.bank).expect("bank");
+    assert_eq!(bank.pitched.as_deref(), Some("keys"));
+    h.app.dialogs.load_sounds = None;
+
+    // The bank panel draws, and its pattern clip plays the drums.
+    h.app.sel.select_track(kit.id);
+    h.app.tab = Tab::Instrument;
+    h.frames(3);
+    h.app.add_bank_pattern(kit.id);
+    let clip = h.app.sel.clip.expect("the pattern clip is selected");
+    match &h.clip(clip).content {
+        ClipContent::Pattern { source, .. } => assert_eq!(source, "bd*4, ~ sd ~ sd, hh*8"),
+        other => panic!("not a pattern: {other:?}"),
+    }
+    h.every_tab();
+
+    // Exports credit the pack.
+    h.app.open_export_loop();
+    let d = h.app.dialogs.export_loop.as_mut().expect("export dialog");
+    assert_eq!(d.licenses.credits, ["my kit (CC BY 4.0)"]);
+    d.folder = dir.path().join("game").display().to_string();
+    h.frames(2);
+    h.app.start_loop_export(&ctx);
+    h.wait_jobs();
+    match &h
+        .app
+        .dialogs
+        .export_loop
+        .as_ref()
+        .and_then(|d| d.result.as_ref())
+    {
+        Some(Ok(s)) => {
+            assert_eq!(s.licenses.credits, ["my kit (CC BY 4.0)"]);
+            wait_for_file(&s.manifest);
+            let manifest = std::fs::read_to_string(&s.manifest).expect("manifest");
+            assert!(manifest.contains("my kit (CC BY 4.0)"), "{manifest}");
+        }
+        other => panic!("export failed: {:?}", other.map(|r| r.as_ref().err())),
+    }
+    h.frames(2);
+}
+
+#[test]
+fn starter_patterns_use_what_the_bank_has() {
+    let bank = |names: &[&str], pitched: Option<&str>| SampleBank {
+        name: "b".into(),
+        sounds: names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    vec![BankSample {
+                        audio: AudioId::new(),
+                        root: None,
+                    }],
+                )
+            })
+            .collect(),
+        pitched: pitched.map(str::to_string),
+    };
+    assert_eq!(
+        sounds::starter_pattern(&bank(&["bd", "sn", "hh"], None)),
+        "bd*4, ~ sd ~ sd, hh*8"
+    );
+    assert_eq!(
+        sounds::starter_pattern(&bank(&["casio", "e", "crow", "my.sound"], None)),
+        "casio crow"
+    );
+    assert_eq!(
+        sounds::starter_pattern(&bank(&["piano"], Some("piano"))),
+        "c3 e3 g3 e3"
+    );
+}
+
 #[test]
 fn waveform_peaks_cover_the_audio() {
     let mut audio = AudioData::silent(2, 1000, 48_000);
@@ -1043,6 +1263,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("params.rs"),
         include_str!("pattern_editor.rs"),
         include_str!("piano_roll.rs"),
+        include_str!("sounds.rs"),
         include_str!("theme.rs"),
         include_str!("tracks.rs"),
         include_str!("transport.rs"),

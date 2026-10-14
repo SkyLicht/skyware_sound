@@ -8,12 +8,13 @@ Status: **alpha** (0.1.0-alpha.1). The core works end to end: you can build a lo
 
 - **Project model with undo.** Every change, from the UI or an AI client, is one serializable command with an exact inverse. Projects are `.skyproj` folders (`project.json`, an `audio/` pool, renders), saved atomically, with a crash journal that recovers unsaved changes on the next open, and an autosave copy every two minutes in the app's data folder (`autosave/`), so projects that were never saved survive a crash too.
 - **Real-time engine.** Instrument and audio tracks, a mixer with volume, pan, mute, solo and insert effects, and a master bus. The audio thread never allocates, locks or panics; it plays immutable snapshots that the control side swaps in at block boundaries, keeping voices and effect tails across edits. Output uses WASAPI (shared mode) through `cpal`; ASIO is behind the `asio` feature.
-- **Instruments:** a polyphonic subtractive synth, a synthesized drum kit (808/909 styles on General MIDI notes) and a sampler.
+- **Instruments:** a polyphonic subtractive synth, a synthesized drum kit (808/909 styles on General MIDI notes), a sampler, and a sample bank that plays sounds by name as Strudel does (`bd sd:1 hh`).
+- **Strudel sound packs:** Load sounds (in the app, or the `bank_load` tool) reads Strudel's `strudel.json` sample maps, such as its drum machines (`RolandTR808`), VCSL and the Salamander piano, or any map on the web or in a folder. Files are downloaded once into a cache and keep their pack's license in the project. Only VCSL is CC0, so nothing is bundled: loop exports write the credits that licenses ask for into the manifest and warn about packs that state no license or are share-alike.
 - **Effects:** gain, filter, 3-band EQ, compressor, limiter, delay, reverb and distortion.
 - **Clips:** MIDI clips, audio clips and pattern clips written in a Tidal-style mini-notation (`bd*4, ~ sd ~ sd, hh*8`) with exact rational timing.
 - **Rendering and analysis:** offline render with the same engine, WAV export (16/24-bit with dither, or 32-bit float), loudness (LUFS), true peak, clipping and a loop seam check.
 - **Game loop export:** renders the loop region twice and keeps the second pass, so reverb and release tails wrap into the start, then writes the WAV and records it in `skyware-manifest.json`.
-- **MCP server:** 33 tools over Streamable HTTP on localhost (while the app runs) or stdio. See [Connecting an AI assistant](#connecting-an-ai-assistant).
+- **MCP server:** 35 tools over Streamable HTTP on localhost (while the app runs) or stdio. See [Connecting an AI assistant](#connecting-an-ai-assistant).
 - **UI** in egui: transport, arrangement, track headers, piano roll, pattern editor, mixer with meters, instrument and effect editors, an AI activity panel where you can undo what an assistant did, and a command palette (Ctrl+K).
 - **`sky-runtime`:** the MIT/Apache-2.0 library a game links to play exported loops and randomized SFX containers. See [crates/sky-runtime/README.md](crates/sky-runtime/README.md).
 
@@ -102,6 +103,7 @@ Every tool call is one undo step and is listed in the app's AI activity panel. `
 | `sky-engine` | GPL-3.0-or-later | Real-time graph, snapshot swap, offline render |
 | `sky-io` | GPL-3.0-or-later | Audio file decoding and encoding, device output |
 | `sky-game` | GPL-3.0-or-later | Game exports and manifests |
+| `sky-library` | GPL-3.0-or-later | Strudel sample maps, sound packs and their download cache |
 | `sky-session` | GPL-3.0-or-later | The live session shared by the UI and MCP |
 | `sky-check` | GPL-3.0-or-later | The system check behind `skyware check` and the `system_check` tool |
 | `sky-mcp` | GPL-3.0-or-later | MCP tools and transports |

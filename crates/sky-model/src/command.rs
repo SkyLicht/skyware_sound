@@ -283,6 +283,55 @@ fn validate_instrument(project: &Project, slot: &InstrumentSlot) -> Result<(), M
     if let Some(sample) = slot.sample {
         project.pool_entry(sample)?;
     }
+    if let Some(bank) = &slot.bank {
+        if slot.kind != sky_dsp::InstrumentType::Bank {
+            return Err(ModelError::InvalidValue(format!(
+                "only a sample-bank instrument can hold sounds, not a {}",
+                slot.kind.name()
+            )));
+        }
+        validate_bank(project, bank)?;
+    }
+    Ok(())
+}
+
+/// The longest sound name a bank accepts.
+const MAX_SOUND_NAME: usize = 64;
+
+fn validate_bank(project: &Project, bank: &SampleBank) -> Result<(), ModelError> {
+    for (name, samples) in &bank.sounds {
+        let ok = !name.is_empty()
+            && name.len() <= MAX_SOUND_NAME
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '#'));
+        if !ok {
+            return Err(ModelError::InvalidValue(format!(
+                "bank sound names use letters, digits, _ - . or # and are at most \
+                 {MAX_SOUND_NAME} long, got {name:?}"
+            )));
+        }
+        if samples.is_empty() {
+            return Err(ModelError::InvalidValue(format!(
+                "bank sound {name:?} has no samples"
+            )));
+        }
+        for s in samples {
+            project.pool_entry(s.audio)?;
+            if s.root.is_some_and(|r| r > 127) {
+                return Err(ModelError::InvalidValue(format!(
+                    "bank sound {name:?} has a root note above 127"
+                )));
+            }
+        }
+    }
+    if let Some(p) = &bank.pitched
+        && !bank.sounds.contains_key(p)
+    {
+        return Err(ModelError::InvalidValue(format!(
+            "the bank has no sound {p:?} to play notes with"
+        )));
+    }
     Ok(())
 }
 
@@ -866,14 +915,18 @@ impl Command {
             }
             Command::RemovePoolAudio { id } => {
                 let used = project.tracks.iter().any(|t| {
-                    t.instrument.as_ref().is_some_and(|i| i.sample == Some(id))
-                        || t.clips.iter().any(
-                            |c| matches!(c.content, ClipContent::Audio { source, .. } if source == id),
-                        )
+                    t.instrument.as_ref().is_some_and(|i| {
+                        i.sample == Some(id)
+                            || i.bank
+                                .as_ref()
+                                .is_some_and(|b| b.audio_ids().any(|a| a == id))
+                    }) || t.clips.iter().any(
+                        |c| matches!(c.content, ClipContent::Audio { source, .. } if source == id),
+                    )
                 });
                 if used {
                     return Err(ModelError::InvalidValue(format!(
-                        "audio {id} is still used by a clip or sampler; delete those first"
+                        "audio {id} is still used by a clip, sampler or sample bank; delete those first"
                     )));
                 }
                 let i = project
