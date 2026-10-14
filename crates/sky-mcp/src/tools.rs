@@ -828,8 +828,8 @@ pub struct GameExportSettingsArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GameExportArgs {
-    /// Export only these assets. Default: all of them, and assets the
-    /// project no longer has are removed from the folder.
+    /// Export only these assets. Default: all of them, and (once the
+    /// project is saved) assets it no longer has are removed from the folder.
     pub only: Option<Vec<String>>,
     /// Export folder for this export only. Default: the project's game
     /// export folder.
@@ -2315,7 +2315,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Renders the project's game assets and writes them for the game: one WAV per loop and per SFX variation, and skyware-manifest.json, which sky-runtime loads. Exporting everything also removes assets the project no longer has and their old files. Then loads the export into the game runtime and checks every asset."
+        description = "Renders the project's game assets and writes them for the game: one WAV per loop and per SFX variation, and skyware-manifest.json, which sky-runtime loads. Exporting everything from a saved project also removes assets it no longer has and their old files. Then loads the export into the game runtime and checks every asset."
     )]
     async fn game_export(&self, Parameters(a): Parameters<GameExportArgs>) -> ToolResult {
         let dir = match &a.dir {

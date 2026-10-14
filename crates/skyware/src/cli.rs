@@ -151,7 +151,7 @@ pub enum Cmd {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Export only this asset. Repeatable. Without it, every asset is
-        /// exported and assets the project dropped are removed.
+        /// exported and, for a saved project, assets it dropped are removed.
         #[arg(long, value_name = "NAME")]
         only: Vec<String>,
     },

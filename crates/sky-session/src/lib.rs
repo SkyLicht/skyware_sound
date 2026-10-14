@@ -42,13 +42,13 @@ const VIEW_HISTORY: usize = 100;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error("{0}")]
+    #[error(transparent)]
     Model(#[from] ModelError),
-    #[error("{0}")]
+    #[error(transparent)]
     Io(#[from] sky_io::IoError),
-    #[error("{0}")]
+    #[error(transparent)]
     Export(#[from] sky_game::GameError),
-    #[error("{0}")]
+    #[error(transparent)]
     Library(#[from] LibraryError),
     #[error("the project has not been saved yet; give a folder to save it in")]
     NoProjectPath,
@@ -1071,6 +1071,12 @@ impl Session {
     /// Renders the project's game assets and exports them for `sky-runtime`:
     /// loops (with their intros) and SFX sets with one file per variation,
     /// all recorded in the folder's manifest.
+    ///
+    /// A saved project marks its entries with its ID and, when exporting
+    /// everything, removes the ones it no longer has. An unsaved project has
+    /// no lasting ID (the demo gets a new one each run), so it exports like
+    /// a one-off export: unmarked entries, which it or the project once
+    /// saved can replace later, and nothing removed.
     pub fn export_game(&self, opts: &GameExportOptions) -> Result<GameExported, SessionError> {
         let (project, audio) = self.render_inputs();
         let game = &project.game;
@@ -1190,10 +1196,11 @@ impl Session {
                 },
             })
             .collect();
+        let project_id = self.view().path.is_some().then(|| project.id.to_string());
         let set = ExportSet {
             project: project.name.clone(),
-            project_id: Some(project.id.to_string()),
-            prune: opts.only.is_empty(),
+            prune: project_id.is_some() && opts.only.is_empty(),
+            project_id,
             format,
         };
         let out = sky_game::export_assets(&dir, &set, &exports)?;

@@ -420,6 +420,43 @@ fn export_game_writes_loops_with_intros_and_sfx_sets() {
 }
 
 #[test]
+fn unsaved_projects_export_like_one_off_exports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = GameExportOptions {
+        dir: Some(tmp.path().join("audio")),
+        ..Default::default()
+    };
+    // Each run of the demo is a new project ID; exporting again into the
+    // same folder still works.
+    for _ in 0..2 {
+        let out = headless(demo_project()).export_game(&opts).unwrap();
+        assert!(out.removed.is_empty());
+    }
+    let manifest = sky_game::read_manifest(&tmp.path().join("audio"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.assets.len(), 2);
+    assert!(manifest.assets.iter().all(|a| a.project_id().is_none()));
+
+    // Once saved, the project takes its entries over.
+    let session = headless(demo_project());
+    session
+        .save(Some(&tmp.path().join("Demo.skyproj")))
+        .unwrap();
+    session.export_game(&opts).unwrap();
+    let manifest = sky_game::read_manifest(&tmp.path().join("audio"))
+        .unwrap()
+        .unwrap();
+    let id = session.project().id.to_string();
+    assert!(
+        manifest
+            .assets
+            .iter()
+            .all(|a| a.project_id() == Some(id.as_str()))
+    );
+}
+
+#[test]
 fn export_game_needs_assets() {
     let tmp = tempfile::tempdir().unwrap();
     let mut project = demo_project();

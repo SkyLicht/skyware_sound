@@ -27,7 +27,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum GameError {
-    #[error("{0}")]
+    #[error(transparent)]
     Io(#[from] sky_io::IoError),
     #[error("manifest: {0}")]
     Manifest(String),
