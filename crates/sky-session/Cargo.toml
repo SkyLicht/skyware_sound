@@ -1,5 +1,6 @@
 [package]
 name = "sky-session"
+description = "The live session: one project, its undo history, the audio engine and saving"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,20 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+sky-core.workspace = true
+sky-dsp.workspace = true
+sky-model.workspace = true
+sky-engine.workspace = true
+sky-io.workspace = true
+sky-game.workspace = true
+arc-swap.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sky-runtime.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
