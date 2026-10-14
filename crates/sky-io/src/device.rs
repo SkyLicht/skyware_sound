@@ -741,24 +741,24 @@ impl Pcm {
         let full = |s: f32, max: f64| (f64::from(s.clamp(-1.0, 1.0)) * max).round();
         match self {
             Pcm::F32 => {
-                for (s, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
-                    d.copy_from_slice(&s.to_le_bytes());
+                for (s, d) in src.iter().zip(dst.as_chunks_mut::<4>().0) {
+                    *d = s.to_le_bytes();
                 }
             }
             Pcm::I32 => {
-                for (s, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
-                    d.copy_from_slice(&(full(*s, 2_147_483_647.0) as i32).to_le_bytes());
+                for (s, d) in src.iter().zip(dst.as_chunks_mut::<4>().0) {
+                    *d = (full(*s, 2_147_483_647.0) as i32).to_le_bytes();
                 }
             }
             Pcm::I24 => {
-                for (s, d) in src.iter().zip(dst.chunks_exact_mut(3)) {
+                for (s, d) in src.iter().zip(dst.as_chunks_mut::<3>().0) {
                     let v = (full(*s, 8_388_607.0) as i32).to_le_bytes();
                     d.copy_from_slice(&v[..3]);
                 }
             }
             Pcm::I16 => {
-                for (s, d) in src.iter().zip(dst.chunks_exact_mut(2)) {
-                    d.copy_from_slice(&(full(*s, 32_767.0) as i16).to_le_bytes());
+                for (s, d) in src.iter().zip(dst.as_chunks_mut::<2>().0) {
+                    *d = (full(*s, 32_767.0) as i16).to_le_bytes();
                 }
             }
         }
@@ -909,28 +909,36 @@ mod tests {
 
         Pcm::I16.write(&src, &mut out[..src.len() * 2]);
         let i16s: Vec<i16> = out[..src.len() * 2]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(i16s, [0, 32_767, -32_767, 16_384, 32_767, 0]);
 
         Pcm::I24.write(&src, &mut out[..src.len() * 3]);
         let i24s: Vec<i32> = out[..src.len() * 3]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8)
             .collect();
         assert_eq!(i24s, [0, 8_388_607, -8_388_607, 4_194_304, 8_388_607, 0]);
 
         Pcm::I32.write(&src, &mut out);
         let i32s: Vec<i32> = out
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         assert_eq!(i32s, [0, i32::MAX, -i32::MAX, 1_073_741_824, i32::MAX, 0]);
 
         Pcm::F32.write(&src[..5], &mut out[..20]);
         let f32s: Vec<f32> = out[..20]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         assert_eq!(f32s, src[..5]);
