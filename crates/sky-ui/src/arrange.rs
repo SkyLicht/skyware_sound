@@ -1129,6 +1129,7 @@ fn draw_clip(
                 source,
                 seed,
                 cycle,
+                ..
             } => draw_pattern(app, &p, r, body, vis, clip, source, *seed, *cycle, color),
             ClipContent::Audio {
                 source,

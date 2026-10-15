@@ -515,11 +515,7 @@ fn banks_load_from_packs_play_undo_and_credit_exports() {
         name: "Beat".into(),
         start: 0,
         length: PPQ * 4,
-        content: ClipContent::Pattern {
-            source: "bd sd bd:1 sd".into(),
-            seed: 0,
-            cycle: PPQ * 4,
-        },
+        content: ClipContent::pattern("bd sd bd:1 sd", 0, PPQ * 4),
     });
     let track_id = track.id;
     project.tracks.push(track);
@@ -630,11 +626,7 @@ fn unknown_licenses_warn_and_bad_requests_change_nothing() {
                 name: "p".into(),
                 start: 0,
                 length: PPQ * 4,
-                content: ClipContent::Pattern {
-                    source: "bd".into(),
-                    seed: 0,
-                    cycle: PPQ * 4,
-                },
+                content: ClipContent::pattern("bd", 0, PPQ * 4),
             }),
         }))
         .unwrap();

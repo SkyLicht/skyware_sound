@@ -36,6 +36,18 @@ fn a_sixteen_bar_loop_passes_every_check() {
     );
 }
 
+/// The phase 1 gate: a techno loop with a ducked bass, accented and swung
+/// hats and a synced delay, made without samples, exports and loops.
+#[test]
+fn the_techno_loop_passes_every_check() {
+    let (session, _) = Session::new(sky_model::templates::techno_project(), None);
+    let check = check_loop(&session, &LoopOptions::default()).unwrap();
+    let failed: Vec<_> = check.checks.iter().filter(|c| !c.passed).collect();
+    assert!(check.passed, "{failed:#?}");
+    // Four bars of 4/4 at 128 BPM.
+    assert_eq!(check.frames, 360_000);
+}
+
 #[test]
 fn without_a_folder_the_export_is_cleaned_up() {
     let (session, _) = Session::new(check_project(4), None);

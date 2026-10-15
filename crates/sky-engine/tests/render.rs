@@ -303,11 +303,7 @@ fn pattern_clips_play_on_the_grid() {
             name: "p".into(),
             start: 0,
             length: PPQ * 4 * bars,
-            content: ClipContent::Pattern {
-                source: "~ bd".into(),
-                seed: 0,
-                cycle: PPQ * 4,
-            },
+            content: ClipContent::pattern("~ bd", 0, PPQ * 4),
         });
         p.tracks.push(t);
         p
@@ -408,14 +404,7 @@ fn level_at(buf: &[f32], onset: usize) -> f32 {
 #[test]
 fn bank_patterns_play_named_sounds_and_variations() {
     // One bar of four steps, a quarter note (24 000 samples) each.
-    let (p, audio) = bank_project(
-        ClipContent::Pattern {
-            source: "bd sd:1 zz sn:2".into(),
-            seed: 0,
-            cycle: PPQ * 4,
-        },
-        None,
-    );
+    let (p, audio) = bank_project(ClipContent::pattern("bd sd:1 zz sn:2", 0, PPQ * 4), None);
     let out = render(compile(&p, &audio, SR, 1), 0, SR as usize * 2, false);
     let l = out.left();
     let base = level_at(l, 0);
@@ -441,14 +430,7 @@ fn bank_notes_play_drums_by_number_or_the_pitched_sound() {
         None,
     );
     let drums = render(compile(&p, &audio, SR, 1), 0, SR as usize / 2, false);
-    let (p2, audio2) = bank_project(
-        ClipContent::Pattern {
-            source: "bd".into(),
-            seed: 0,
-            cycle: PPQ * 4,
-        },
-        None,
-    );
+    let (p2, audio2) = bank_project(ClipContent::pattern("bd", 0, PPQ * 4), None);
     let bd = render(compile(&p2, &audio2, SR, 1), 0, SR as usize / 2, false);
     // Note 38 is the snare: the first `sn`, twice the level of `bd`.
     assert!((level_at(drums.left(), 0) / level_at(bd.left(), 0) - 2.0).abs() < 0.01);

@@ -273,6 +273,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
             let items = [
                 ("New empty project", Action::NewEmpty),
                 ("New demo project", Action::NewDemo),
+                ("New techno loop", Action::NewTechno),
                 ("Open project…", Action::Open),
                 ("Save as…", Action::SaveAs),
                 ("Import audio…", Action::ImportAudio),

@@ -10,7 +10,7 @@ use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use sky_dsp::MAX_BLOCK;
 
 use crate::compile::{
-    AudioClipNode, ChannelNode, EngineSnapshot, NoteEvent, SourceNode, TrackNode,
+    AudioClipNode, ChannelNode, EngineSnapshot, NoteEvent, SourceNode, TrackNode, Triggers,
 };
 use crate::shared::EngineShared;
 
@@ -208,8 +208,16 @@ fn mix_clip(clip: &AudioClipNode, pos: i64, left: &mut [f32], right: &mut [f32])
     }
 }
 
-/// Renders a track's source for `[pos, pos + len)` into its buffer at `offset`.
-fn render_source(track: &mut TrackNode, playing: bool, pos: i64, offset: usize, len: usize) {
+/// Renders a track's source for `[pos, pos + len)` into its buffer at
+/// `offset`, noting each note it starts in `triggers`.
+fn render_source(
+    track: &mut TrackNode,
+    triggers: &mut Triggers,
+    playing: bool,
+    pos: i64,
+    offset: usize,
+    len: usize,
+) {
     let [bl, br] = &mut track.buf;
     let (Some(bl), Some(br)) = (
         bl.get_mut(offset..offset + len),
@@ -227,7 +235,11 @@ fn render_source(track: &mut TrackNode, playing: bool, pos: i64, offset: usize, 
                 }
             }
         }
-        SourceNode::Instrument { instrument, notes } => {
+        SourceNode::Instrument {
+            instrument,
+            notes,
+            locks,
+        } => {
             let Some(inst) = instrument else {
                 return;
             };
@@ -276,6 +288,11 @@ fn render_source(track: &mut TrackNode, playing: bool, pos: i64, offset: usize, 
                         break;
                     }
                     if n.end > t {
+                        let range = n.lock_start as usize..n.lock_end as usize;
+                        for lock in locks.get(range).unwrap_or_default() {
+                            inst.set_param(lock.param, lock.value);
+                        }
+                        triggers.push(offset + (t - pos) as usize, n.pitch);
                         if let Some(sound) = n.sound {
                             // Bank sounds are one-shots: nothing to end.
                             inst.sound_on(sound, n.velocity);
@@ -289,6 +306,17 @@ fn render_source(track: &mut TrackNode, playing: bool, pos: i64, offset: usize, 
                     }
                     state.cursor += 1;
                 }
+            }
+        }
+    }
+}
+
+/// Passes the note starts of each effect's sidechain track to it.
+fn feed_sidechains(channel: &mut ChannelNode, triggers: &[Triggers]) {
+    for fx in channel.effects.iter_mut().filter(|f| f.enabled) {
+        if let Some(source) = fx.sidechain.and_then(|i| triggers.get(i)) {
+            for (offset, pitch) in source.iter() {
+                fx.effect.sidechain_note(offset, pitch);
             }
         }
     }
@@ -421,6 +449,9 @@ impl Engine {
     fn render_block(&mut self, frames: usize) {
         let frames = frames.min(MAX_BLOCK);
         let snap = &mut *self.snapshot;
+        for t in snap.triggers.iter_mut() {
+            t.clear();
+        }
         let mut done = 0;
         while done < frames {
             let mut len = frames - done;
@@ -432,8 +463,8 @@ impl Engine {
             {
                 len = (le - self.position) as usize;
             }
-            for track in snap.tracks.iter_mut() {
-                render_source(track, self.playing, self.position, done, len);
+            for (track, triggers) in snap.tracks.iter_mut().zip(snap.triggers.iter_mut()) {
+                render_source(track, triggers, self.playing, self.position, done, len);
             }
             done += len;
             if self.playing {
@@ -467,6 +498,7 @@ impl Engine {
             let (Some(bl), Some(br)) = (bl.get_mut(..frames), br.get_mut(..frames)) else {
                 continue;
             };
+            feed_sidechains(&mut track.channel, &snap.triggers);
             let (pl, pr) = apply_channel(&mut track.channel, k, bl, br);
             if let Some(m) = self.shared.track_meter(track.meter) {
                 m.record(pl, pr);
@@ -480,6 +512,7 @@ impl Engine {
                 *n += *t;
             }
         }
+        feed_sidechains(&mut snap.master, &snap.triggers);
         let (pl, pr) = apply_channel(&mut snap.master, k, ml, mr);
         self.shared.master.record(pl, pr);
     }

@@ -2,12 +2,15 @@
 //! The Editor tab: a header for the selected clip, then the piano roll, the
 //! pattern editor or the audio clip settings, depending on the clip.
 
+use std::collections::{BTreeMap, HashMap};
+
 use egui::{
-    Align2, Color32, CornerRadius, DragValue, Id, RichText, Sense, Slider, Stroke, TextEdit, Ui,
-    vec2,
+    Align2, Color32, ComboBox, CornerRadius, DragValue, Id, RichText, Sense, Slider, Stroke,
+    TextEdit, Ui, vec2,
 };
 use sky_core::{ClipId, PPQ, Ticks};
-use sky_model::{Clip, ClipContent, Project, Track};
+use sky_model::command::VELOCITY;
+use sky_model::{Clip, ClipContent, Project, Swing, Track};
 use sky_pattern::Time;
 
 use crate::actions::{self, AudioClipChange};
@@ -22,6 +25,10 @@ pub struct PatternState {
     synced: Option<(String, u64, Ticks)>,
     /// The clip name being edited.
     pub name: Option<(ClipId, String)>,
+    /// The text of each control pattern being edited.
+    pub controls: HashMap<String, String>,
+    /// The clip and controls the control texts were loaded from.
+    controls_synced: Option<(ClipId, BTreeMap<String, String>)>,
 }
 
 pub fn clip_editor(app: &mut App, ui: &mut Ui) {
@@ -49,7 +56,12 @@ pub fn clip_editor(app: &mut App, ui: &mut Ui) {
             source,
             seed,
             cycle,
-        } => pattern_ui(app, ui, project, clip, source, *seed, *cycle),
+            controls,
+            swing,
+        } => {
+            pattern_ui(app, ui, project, clip, source, *seed, *cycle);
+            groove_ui(app, ui, track, clip, controls, *swing);
+        }
         ClipContent::Audio {
             source,
             gain_db,
@@ -299,6 +311,219 @@ fn pattern_ui(
     });
 }
 
+/// A number as a pattern writes it: at most three decimals, no trailing
+/// zeros.
+pub fn format_number(value: f64) -> String {
+    let text = format!("{value:.3}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" {
+        "0".into()
+    } else {
+        text.into()
+    }
+}
+
+/// What a control sets, for its row: a label and a tooltip.
+fn control_label(track: &Track, name: &str) -> (String, String, bool) {
+    if name == VELOCITY {
+        return (
+            "Velocity".into(),
+            "How hard each note plays, 1 to 127; 0 skips the note".into(),
+            true,
+        );
+    }
+    let spec = track
+        .instrument
+        .as_ref()
+        .and_then(|i| sky_dsp::params::find(i.kind.params(), name));
+    match spec {
+        Some(s) => (
+            s.label.into(),
+            format!(
+                "{}: {} to {}{}",
+                s.name,
+                s.min,
+                s.max,
+                if s.unit.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", s.unit)
+                }
+            ),
+            true,
+        ),
+        None => (
+            name.into(),
+            "This instrument has no such parameter, so the pattern does nothing".into(),
+            false,
+        ),
+    }
+}
+
+/// The pattern's control rows and swing.
+fn groove_ui(
+    app: &mut App,
+    ui: &mut Ui,
+    track: &Track,
+    clip: &Clip,
+    controls: &BTreeMap<String, String>,
+    swing: Swing,
+) {
+    let focused = controls.keys().any(|name| {
+        ui.ctx()
+            .memory(|m| m.has_focus(Id::new(("control_text", clip.id, name.as_str()))))
+    });
+    let st = &mut app.pattern;
+    let stale = st
+        .controls_synced
+        .as_ref()
+        .is_none_or(|(id, synced)| *id != clip.id || (!focused && synced != controls));
+    if stale {
+        st.controls = controls.clone().into_iter().collect();
+        st.controls_synced = Some((clip.id, controls.clone()));
+    }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Controls").color(theme::TEXT_WEAK));
+        ui.label(
+            RichText::new("number patterns read at the start of each note")
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+    });
+    let mut commits: Vec<(String, Option<String>)> = Vec::new();
+    egui::Grid::new(("pattern_controls", clip.id))
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for (name, current) in controls {
+                let (label, tip, known) = control_label(track, name);
+                let color = if known { theme::TEXT } else { theme::TEXT_DIM };
+                ui.label(RichText::new(label).color(color))
+                    .on_hover_text(tip);
+                let text = app
+                    .pattern
+                    .controls
+                    .entry(name.clone())
+                    .or_insert_with(|| current.clone());
+                let resp = ui.add(
+                    TextEdit::singleline(text)
+                        .id(Id::new(("control_text", clip.id, name.as_str())))
+                        .font(theme::mono(14.0))
+                        .desired_width(280.0)
+                        .hint_text("100 60 80 60"),
+                );
+                let parsed = sky_pattern::parse_numbers(text);
+                if resp.lost_focus() && text != current {
+                    match &parsed {
+                        Ok(_) => commits.push((name.clone(), Some(text.clone()))),
+                        Err(e) => app.error(format!(
+                            "{name} not applied: {} at column {}",
+                            e.message, e.column
+                        )),
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Remove this control")
+                        .clicked()
+                    {
+                        commits.push((name.clone(), None));
+                    }
+                    if let Err(e) = &parsed {
+                        ui.label(
+                            RichText::new(format!("Column {}: {}", e.column, e.message))
+                                .small()
+                                .color(theme::ERROR),
+                        );
+                    }
+                });
+                ui.end_row();
+            }
+        });
+    // Velocity, then the instrument's parameters, that are not used yet.
+    let mut options: Vec<(String, String)> = Vec::new();
+    if !controls.contains_key(VELOCITY) {
+        options.push((VELOCITY.into(), "Velocity".into()));
+    }
+    if let Some(slot) = &track.instrument {
+        for spec in slot.kind.params() {
+            if !controls.contains_key(spec.name) {
+                options.push((spec.name.into(), spec.label.into()));
+            }
+        }
+    }
+    ui.horizontal(|ui| {
+        if controls.len() < sky_model::command::MAX_CONTROLS && !options.is_empty() {
+            let mut picked: Option<String> = None;
+            ComboBox::from_id_salt(("add_control", clip.id))
+                .selected_text("Add control…")
+                .width(150.0)
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    for (name, label) in &options {
+                        if ui.selectable_label(false, label).clicked() {
+                            picked = Some(name.clone());
+                        }
+                    }
+                });
+            if let Some(name) = picked {
+                // Start from the track's own value, so nothing changes yet.
+                let start = match track.instrument.as_ref().and_then(|i| i.param(&name)) {
+                    Some(v) => format_number(v as f64),
+                    None => "100".into(),
+                };
+                commits.push((name, Some(start)));
+            }
+        }
+
+        ui.separator();
+        ui.label(RichText::new("Swing").color(theme::TEXT_WEAK));
+        let mut amount = swing.amount;
+        let r1 = ui
+            .add(
+                DragValue::new(&mut amount)
+                    .range(Swing::STRAIGHT..=Swing::MAX)
+                    .speed(0.2)
+                    .suffix(" %"),
+            )
+            .on_hover_text(
+                "Where every second step lands within its pair: 50 is straight, \
+                 about 66 a triplet feel",
+            );
+        let mut grid = swing.grid;
+        ComboBox::from_id_salt(("swing_grid", clip.id))
+            .selected_text(format!("1/{grid}"))
+            .width(60.0)
+            .show_ui(ui, |ui| {
+                for g in Swing::GRIDS {
+                    ui.selectable_value(&mut grid, g, format!("1/{g}"));
+                }
+            });
+        let next = Swing::new(amount, grid);
+        if next != swing {
+            let key = r1.changed().then(|| app.gestures.key(r1.id));
+            let r = actions::set_swing(&app.session, clip.id, next, key);
+            app.report(r);
+        }
+    });
+    for (name, source) in commits {
+        let r = actions::set_pattern_control(&app.session, clip.id, &name, source.as_deref());
+        if app.report(r).is_some() {
+            match source {
+                Some(s) => {
+                    app.pattern.controls.insert(name, s);
+                }
+                None => {
+                    app.pattern.controls.remove(&name);
+                }
+            }
+        }
+    }
+}
+
 /// A strip showing the events of the first few cycles.
 fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64) {
     let Ok(pattern) = sky_pattern::parse(text) else {
@@ -333,6 +558,7 @@ fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64) {
             let label = match &e.value {
                 sky_pattern::Value::Sound { name, .. } => name.clone(),
                 sky_pattern::Value::Note(n) => sky_core::music::note_name(*n),
+                sky_pattern::Value::Number(_) => format_number(e.value.number().unwrap_or(0.0)),
             };
             notes.push((
                 x0 + b * cw,

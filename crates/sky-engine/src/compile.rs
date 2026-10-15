@@ -9,9 +9,14 @@ use num_rational::Rational64;
 use sky_core::{AudioId, EffectId, TempoMap, Ticks, TrackId};
 use sky_dsp::instruments::{BankMap, KeyZone};
 use sky_dsp::util::db_to_gain;
-use sky_dsp::{AudioData, Effect, Instrument, InstrumentAudio, InstrumentType, MAX_BLOCK};
-use sky_model::{Channel, Clip, ClipContent, Project, SampleBank, Track, TrackKind};
-use sky_pattern::Value;
+use sky_dsp::{
+    AudioData, Effect, Instrument, InstrumentAudio, InstrumentType, MAX_BLOCK, ParamSpec,
+};
+use sky_model::command::VELOCITY;
+use sky_model::{
+    Channel, Clip, ClipContent, InstrumentSlot, Project, SampleBank, Track, TrackKind,
+};
+use sky_pattern::{Time, Value};
 
 /// Decoded audio-pool files, shared between snapshots.
 pub type AudioCache = HashMap<AudioId, Arc<AudioData>>;
@@ -21,11 +26,24 @@ pub type AudioCache = HashMap<AudioId, Arc<AudioData>>;
 pub struct NoteEvent {
     pub time: i64,
     pub end: i64,
+    /// The key, or for a bank sound the General MIDI drum note of its name
+    /// (0 when it has none), so a duck can tell kicks apart.
     pub pitch: u8,
     pub velocity: u8,
     /// For a sample bank: the sound to start as a one-shot instead of the
     /// key `pitch`.
     pub sound: Option<u32>,
+    /// The note's parameter values: `locks[lock_start..lock_end]` of its
+    /// source, set on the instrument right before the note starts.
+    pub lock_start: u32,
+    pub lock_end: u32,
+}
+
+/// An instrument parameter set for one note.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamLock {
+    pub param: &'static str,
+    pub value: f32,
 }
 
 pub struct AudioClipNode {
@@ -46,6 +64,7 @@ pub enum SourceNode {
     Instrument {
         instrument: Option<Box<dyn Instrument>>,
         notes: Vec<NoteEvent>,
+        locks: Vec<ParamLock>,
     },
 }
 
@@ -53,6 +72,48 @@ pub struct EffectNode {
     pub id: EffectId,
     pub enabled: bool,
     pub effect: Box<dyn Effect>,
+    /// The index of the track whose note starts drive the effect.
+    pub sidechain: Option<usize>,
+}
+
+/// Most note starts a track reports to sidechains in one block.
+pub(crate) const MAX_TRIGGERS: usize = 128;
+
+/// The note starts of one track in the block being rendered: the frame
+/// offset in the block and the pitch.
+pub(crate) struct Triggers {
+    notes: [(u32, u8); MAX_TRIGGERS],
+    len: usize,
+}
+
+impl Default for Triggers {
+    fn default() -> Self {
+        Self {
+            notes: [(0, 0); MAX_TRIGGERS],
+            len: 0,
+        }
+    }
+}
+
+impl Triggers {
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub(crate) fn push(&mut self, offset: usize, pitch: u8) {
+        if let Some(slot) = self.notes.get_mut(self.len) {
+            *slot = (offset.min(u32::MAX as usize) as u32, pitch);
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, u8)> + '_ {
+        self.notes
+            .get(..self.len)
+            .unwrap_or_default()
+            .iter()
+            .map(|&(offset, pitch)| (offset as usize, pitch))
+    }
 }
 
 pub struct ChannelNode {
@@ -97,9 +158,19 @@ pub struct EngineSnapshot {
     pub master: ChannelNode,
     /// Loop region in samples, when looping is on.
     pub loop_range: Option<(i64, i64)>,
+    /// Each track's note starts in the current block, by track index.
+    pub(crate) triggers: Vec<Triggers>,
 }
 
-fn channel_node(channel: &Channel, audible: bool, sample_rate: f32) -> ChannelNode {
+/// What effects need from the project beyond their own settings.
+struct EffectContext<'a> {
+    sample_rate: f32,
+    /// Tempo-synced effects follow the tempo at the start of the song.
+    bpm: f64,
+    tracks: &'a HashMap<TrackId, usize>,
+}
+
+fn channel_node(channel: &Channel, audible: bool, cx: &EffectContext) -> ChannelNode {
     let gain = if audible && !channel.mute {
         db_to_gain(channel.volume_db)
     } else {
@@ -112,10 +183,12 @@ fn channel_node(channel: &Channel, audible: bool, sample_rate: f32) -> ChannelNo
         .map(|slot| EffectNode {
             id: slot.id,
             enabled: slot.enabled,
-            effect: slot.kind.create_with(
-                sample_rate,
+            effect: slot.kind.create_at(
+                cx.sample_rate,
+                cx.bpm,
                 slot.params.iter().map(|(k, v)| (k.as_str(), *v)),
             ),
+            sidechain: slot.sidechain.and_then(|t| cx.tracks.get(&t).copied()),
         })
         .collect();
     ChannelNode {
@@ -133,17 +206,141 @@ fn ticks_to_samples(tempo: &TempoMap, tick: Ticks, sr: u32) -> i64 {
 /// What a pattern value plays on a track: a key, or a bank sound.
 type Resolve<'a> = dyn Fn(&Value) -> Option<(u8, Option<u32>)> + 'a;
 
+/// The velocity of a note with none given.
+const DEFAULT_VELOCITY: u8 = 100;
+
+/// The instrument parameters a track's patterns set per note. Once any
+/// clip sets one, every note on the track carries a value for it, the
+/// usual one where nothing else says, so a note always sounds the same
+/// whatever played before it.
+struct Locks {
+    params: Vec<&'static ParamSpec>,
+    /// The track's own value of each parameter.
+    base: Vec<f32>,
+    out: Vec<ParamLock>,
+}
+
+impl Locks {
+    fn new(track: &Track) -> Self {
+        let mut locks = Self {
+            params: Vec::new(),
+            base: Vec::new(),
+            out: Vec::new(),
+        };
+        let Some(slot) = &track.instrument else {
+            return locks;
+        };
+        let specs = slot.kind.params();
+        let mut names: Vec<&str> = track
+            .clips
+            .iter()
+            .filter_map(|c| match &c.content {
+                ClipContent::Pattern { controls, .. } => Some(controls.keys()),
+                _ => None,
+            })
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        for spec in names
+            .into_iter()
+            .filter_map(|n| sky_dsp::params::find(specs, n))
+        {
+            locks.params.push(spec);
+            locks.base.push(base_value(slot, spec));
+        }
+        locks
+    }
+
+    /// Records a note's values, `value(i)` overriding parameter `i`'s
+    /// usual one, and returns where they sit.
+    fn push(&mut self, value: impl Fn(usize) -> Option<f64>) -> (u32, u32) {
+        let start = self.out.len() as u32;
+        for (i, (spec, base)) in self.params.iter().zip(&self.base).enumerate() {
+            let v = value(i).map_or(*base, |v| spec.clamp(v as f32));
+            self.out.push(ParamLock {
+                param: spec.name,
+                value: v,
+            });
+        }
+        (start, self.out.len() as u32)
+    }
+}
+
+fn base_value(slot: &InstrumentSlot, spec: &ParamSpec) -> f32 {
+    slot.params.get(spec.name).copied().unwrap_or(spec.default)
+}
+
+/// What a control pattern sets.
+#[derive(Clone, Copy)]
+enum Target {
+    Velocity,
+    /// An index into [`Locks::params`].
+    Param(usize),
+}
+
+/// A control pattern's events over a clip, ready to be read at any time.
+struct Control {
+    target: Target,
+    /// Begin, end and value, sorted by begin.
+    events: Vec<(Time, Time, f64)>,
+    longest: Time,
+}
+
+impl Control {
+    fn new(target: Target, source: &str, to: Time, seed: u64) -> Option<Self> {
+        let pattern = sky_pattern::parse_numbers(source).ok()?;
+        let mut events: Vec<(Time, Time, f64)> = pattern
+            .query(Time::from_integer(0), to, seed)
+            .into_iter()
+            .filter_map(|e| Some((e.begin, e.end, e.value.number()?)))
+            .collect();
+        events.sort_by_key(|e| e.0);
+        let longest = events.iter().map(|e| e.1 - e.0).max().unwrap_or_default();
+        Some(Self {
+            target,
+            events,
+            longest,
+        })
+    }
+
+    /// The value of the step playing at `t`, or `None` on a rest.
+    fn at(&self, t: Time) -> Option<f64> {
+        let upto = self.events.partition_point(|e| e.0 <= t);
+        self.events
+            .get(..upto)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .take_while(|e| e.0 > t - self.longest)
+            .find(|e| e.1 > t)
+            .map(|e| e.2)
+    }
+}
+
+/// A seed of its own for each control, so a `?` in one does not follow the
+/// notes' or another control's.
+fn control_seed(seed: u64, name: &str) -> u64 {
+    name.bytes().fold(seed ^ 0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 fn pattern_notes(
     tempo: &TempoMap,
     sr: u32,
     clip: &Clip,
     resolve: &Resolve,
+    locks: &mut Locks,
     out: &mut Vec<NoteEvent>,
 ) {
     let ClipContent::Pattern {
         source,
         seed,
         cycle,
+        controls,
+        swing,
     } = &clip.content
     else {
         return;
@@ -156,21 +353,53 @@ fn pattern_notes(
         return;
     }
     let to = Rational64::new(clip_len, cycle);
+    let controls: Vec<Control> = controls
+        .iter()
+        .filter_map(|(name, src)| {
+            let target = if name == VELOCITY {
+                Target::Velocity
+            } else {
+                Target::Param(locks.params.iter().position(|s| s.name == name)?)
+            };
+            Control::new(target, src, to, control_seed(seed, name))
+        })
+        .collect();
+    let clip_end = clip_start + clip_len;
     for ev in pattern.query(Rational64::from_integer(0), to, seed) {
         let Some((pitch, sound)) = resolve(&ev.value) else {
             continue;
         };
-        let begin = clip_start + rational_ticks(ev.begin, cycle);
-        let end = (clip_start + rational_ticks(ev.end, cycle)).min(clip_start + clip_len);
+        let mut velocity = DEFAULT_VELOCITY;
+        for c in &controls {
+            if let (Target::Velocity, Some(v)) = (c.target, c.at(ev.begin)) {
+                // Like MIDI, velocity 0 is no note at all.
+                velocity = v.round().clamp(0.0, 127.0) as u8;
+            }
+        }
+        if velocity == 0 {
+            continue;
+        }
+        let begin = swing.apply(clip_start + rational_ticks(ev.begin, cycle));
+        let end = swing
+            .apply(clip_start + rational_ticks(ev.end, cycle))
+            .min(clip_end);
         if end <= begin {
             continue;
         }
+        let (lock_start, lock_end) = locks.push(|i| {
+            controls.iter().find_map(|c| match c.target {
+                Target::Param(p) if p == i => c.at(ev.begin),
+                _ => None,
+            })
+        });
         out.push(NoteEvent {
             time: ticks_to_samples(tempo, begin, sr),
             end: ticks_to_samples(tempo, end, sr),
             pitch,
-            velocity: 100,
+            velocity,
             sound,
+            lock_start,
+            lock_end,
         });
     }
 }
@@ -263,6 +492,7 @@ fn track_node(
     audio: &AudioCache,
     sr: u32,
     any_solo: bool,
+    cx: &EffectContext,
 ) -> TrackNode {
     let tempo = &project.tempo;
     let srf = sr as f32;
@@ -307,28 +537,35 @@ fn track_node(
             let resolve: Box<Resolve> = match &bank {
                 Some(bank) => Box::new(|v: &Value| match v {
                     Value::Note(n) => Some((*n, None)),
-                    Value::Sound { name, index } => bank.sound(name, *index).map(|s| (0, Some(s))),
+                    Value::Sound { name, index } => bank
+                        .sound(name, *index)
+                        .map(|s| (sky_pattern::drum_note(name).unwrap_or(0), Some(s))),
+                    Value::Number(_) => None,
                 }),
                 None => Box::new(|v: &Value| v.midi_note().map(|n| (n, None))),
             };
             let mut notes = Vec::new();
+            let mut locks = Locks::new(track);
             for clip in &track.clips {
                 match &clip.content {
                     ClipContent::Midi { notes: clip_notes } => {
                         for n in clip_notes.iter().filter(|n| n.start < clip.length) {
                             let begin = clip.start + n.start;
                             let end = clip.start + (n.start + n.length).min(clip.length);
+                            let (lock_start, lock_end) = locks.push(|_| None);
                             notes.push(NoteEvent {
                                 time: ticks_to_samples(tempo, begin, sr),
                                 end: ticks_to_samples(tempo, end, sr),
                                 pitch: n.pitch,
                                 velocity: n.velocity,
                                 sound: None,
+                                lock_start,
+                                lock_end,
                             });
                         }
                     }
                     ClipContent::Pattern { .. } => {
-                        pattern_notes(tempo, sr, clip, &resolve, &mut notes);
+                        pattern_notes(tempo, sr, clip, &resolve, &mut locks, &mut notes);
                     }
                     ClipContent::Audio { .. } => {}
                 }
@@ -349,7 +586,11 @@ fn track_node(
                     slot.params.iter().map(|(k, v)| (k.as_str(), *v)),
                 )
             });
-            SourceNode::Instrument { instrument, notes }
+            SourceNode::Instrument {
+                instrument,
+                notes,
+                locks: locks.out,
+            }
         }
     };
     let audible = !any_solo || track.channel.solo;
@@ -357,7 +598,7 @@ fn track_node(
         id: track.id,
         meter: index,
         source,
-        channel: channel_node(&track.channel, audible, srf),
+        channel: channel_node(&track.channel, audible, cx),
         state: TrackState::default(),
         buf: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
     }
@@ -371,12 +612,24 @@ pub fn compile(
     version: u64,
 ) -> EngineSnapshot {
     let any_solo = project.any_solo();
-    let tracks = project
+    let indices: HashMap<TrackId, usize> = project
         .tracks
         .iter()
         .enumerate()
-        .map(|(i, t)| track_node(project, t, i, audio, sample_rate, any_solo))
+        .map(|(i, t)| (t.id, i))
         .collect();
+    let cx = EffectContext {
+        sample_rate: sample_rate as f32,
+        bpm: project.tempo.initial_bpm(),
+        tracks: &indices,
+    };
+    let tracks: Vec<TrackNode> = project
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| track_node(project, t, i, audio, sample_rate, any_solo, &cx))
+        .collect();
+    let triggers = tracks.iter().map(|_| Triggers::default()).collect();
     let loop_range = project.loop_enabled.then(|| {
         (
             ticks_to_samples(&project.tempo, project.loop_region.start, sample_rate),
@@ -387,8 +640,9 @@ pub fn compile(
         version,
         sample_rate,
         tracks,
-        master: channel_node(&project.master, true, sample_rate as f32),
+        master: channel_node(&project.master, true, &cx),
         loop_range,
+        triggers,
     }
 }
 

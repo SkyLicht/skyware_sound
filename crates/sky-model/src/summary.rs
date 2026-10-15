@@ -17,12 +17,16 @@ fn channel_json(ch: &Channel) -> Value {
         .effects
         .iter()
         .map(|e| {
-            json!({
+            let mut v = json!({
                 "id": e.id.to_string(),
                 "type": e.kind.name(),
                 "enabled": e.enabled,
                 "params": e.params,
-            })
+            });
+            if let Some(source) = e.sidechain {
+                v["sidechain"] = json!(source.to_string());
+            }
+            v
         })
         .collect();
     json!({
@@ -70,10 +74,18 @@ pub fn clip_json(project: &Project, clip: &Clip, detail: bool) -> Value {
             source,
             seed,
             cycle,
+            controls,
+            swing,
         } => {
             v["pattern"] = json!(source);
             v["seed"] = json!(seed);
             v["cycleBars"] = json!(round(*cycle as f64 / bar, 4));
+            if !controls.is_empty() {
+                v["controls"] = json!(controls);
+            }
+            if !swing.is_straight() {
+                v["swing"] = json!({ "amount": swing.amount, "grid": swing.grid });
+            }
         }
     }
     v

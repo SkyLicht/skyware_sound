@@ -147,11 +147,7 @@ mod tests {
             name: "p".into(),
             start: 0,
             length: 960,
-            content: ClipContent::Pattern {
-                source: "s0".into(),
-                seed: 0,
-                cycle: 960,
-            },
+            content: ClipContent::pattern("s0", 0, 960),
         });
         t
     }

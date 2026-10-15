@@ -424,6 +424,10 @@ pub struct EffectSlot {
     /// Values that differ from the defaults.
     #[serde(default)]
     pub params: BTreeMap<String, f32>,
+    /// The track whose notes drive the effect, for one that
+    /// [takes a sidechain](EffectType::takes_sidechain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain: Option<TrackId>,
 }
 
 impl EffectSlot {
@@ -433,7 +437,13 @@ impl EffectSlot {
             kind,
             enabled: true,
             params: BTreeMap::new(),
+            sidechain: None,
         }
+    }
+
+    pub fn with_sidechain(mut self, track: TrackId) -> Self {
+        self.sidechain = Some(track);
+        self
     }
 
     pub fn with_params(mut self, params: &[(&str, f32)]) -> Self {
@@ -498,10 +508,83 @@ pub enum ClipContent {
         seed: u64,
         /// The length of one pattern cycle, normally one bar.
         cycle: Ticks,
+        /// Number patterns by parameter name, read at the start of each
+        /// note: `velocity` sets how hard the note plays (0 skips it), and
+        /// an instrument parameter's name sets it for that note. A note
+        /// that falls on a rest gets the usual value.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        controls: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Swing::is_straight")]
+        swing: Swing,
     },
 }
 
+/// Swing for a pattern: every second step of `grid` comes late.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Swing {
+    /// Where the second step of each pair starts, as a percentage of the
+    /// pair: 50 is straight, about 66 a triplet feel, 75 the most.
+    pub amount: u8,
+    /// The step that swings as a note value: 8 swings eighths, 16
+    /// sixteenths.
+    pub grid: u8,
+}
+
+impl Swing {
+    pub const STRAIGHT: u8 = 50;
+    pub const MAX: u8 = 75;
+    pub const GRIDS: [u8; 4] = [4, 8, 16, 32];
+
+    pub fn new(amount: u8, grid: u8) -> Self {
+        Self { amount, grid }
+    }
+
+    pub fn is_straight(&self) -> bool {
+        self.amount <= Self::STRAIGHT
+    }
+
+    /// Moves a time on the timeline to where swing plays it. Times on the
+    /// grid's pairs stay put and everything between stretches, so notes
+    /// keep their order and never overlap.
+    pub fn apply(&self, tick: Ticks) -> Ticks {
+        if self.is_straight() || self.grid == 0 {
+            return tick;
+        }
+        let step = sky_core::PPQ * 4 / Ticks::from(self.grid);
+        let pair = 2 * step;
+        let base = tick.div_euclid(pair) * pair;
+        let x = tick - base;
+        let late = pair * Ticks::from(self.amount.min(Self::MAX)) / 100;
+        let y = if x < step {
+            x * late / step
+        } else {
+            late + (x - step) * (pair - late) / step
+        };
+        base + y
+    }
+}
+
+impl Default for Swing {
+    fn default() -> Self {
+        Self {
+            amount: Self::STRAIGHT,
+            grid: 16,
+        }
+    }
+}
+
 impl ClipContent {
+    /// A pattern with no controls or swing.
+    pub fn pattern(source: impl Into<String>, seed: u64, cycle: Ticks) -> Self {
+        ClipContent::Pattern {
+            source: source.into(),
+            seed,
+            cycle,
+            controls: BTreeMap::new(),
+            swing: Swing::default(),
+        }
+    }
     pub fn kind_name(&self) -> &'static str {
         match self {
             ClipContent::Audio { .. } => "audio",
@@ -747,6 +830,25 @@ impl Project {
             .max()
             .unwrap_or(0)
             .max(self.loop_region.end)
+    }
+
+    /// The track a new duck on `channel`'s track (or the master, for
+    /// `None`) should follow: the first other drum track, else the first
+    /// other instrument track.
+    pub fn default_sidechain(&self, channel: Option<TrackId>) -> Option<TrackId> {
+        let others = || {
+            self.tracks
+                .iter()
+                .filter(move |t| t.kind == TrackKind::Instrument && Some(t.id) != channel)
+        };
+        others()
+            .find(|t| {
+                t.instrument
+                    .as_ref()
+                    .is_some_and(|i| i.kind == InstrumentType::Drums)
+            })
+            .or_else(|| others().next())
+            .map(|t| t.id)
     }
 
     pub fn ticks_per_bar(&self) -> Ticks {
