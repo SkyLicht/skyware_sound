@@ -9,10 +9,10 @@ use sky_core::music::note_name;
 use sky_core::{NoteId, PPQ, Ticks};
 use sky_model::{Clip, Note, Project, Track};
 
-use crate::actions;
 use crate::app::{App, Focus};
 use crate::arrange::{snap_floor, snap_round};
 use crate::theme;
+use crate::{actions, audition};
 
 const KEYS_W: f32 = 46.0;
 const RULER_H: f32 = 16.0;
@@ -79,6 +79,8 @@ pub struct NoteDrag {
     pub preview: Vec<Note>,
     pub grab_tick: f64,
     pub grab_pitch: f32,
+    /// The pitch offset last heard while moving.
+    pub heard: i32,
 }
 
 pub struct PianoState {
@@ -218,6 +220,8 @@ pub fn show(
         {
             refit = true;
         }
+        ui.checkbox(&mut app.audition.hear_notes, "Hear notes")
+            .on_hover_text("Play notes as you add, press or move them");
         ui.label(
             RichText::new(format!(
                 "{} note{} · {} selected",
@@ -230,7 +234,8 @@ pub fn show(
         );
         ui.label(
             RichText::new(
-                "Click to add · drag to move · drag the end to resize · right-click deletes",
+                "Click to add · drag to move · drag the end to resize · right-click deletes \
+                 · press the keys to hear them",
             )
             .small()
             .color(theme::TEXT_DIM),
@@ -264,7 +269,32 @@ pub fn show(
         top_pitch: app.piano.top_pitch,
         row_h: app.piano.row_h,
     };
-    update_drag(app, ui.ctx(), &view, clip);
+    update_drag(app, ui.ctx(), &view, project, track, clip);
+
+    // The keys play the track's instrument while pressed; dragging along
+    // them plays each key passed.
+    let keys_rect = Rect::from_min_max(
+        pos2(full.left(), grid_rect.top()),
+        pos2(grid_rect.left(), full.bottom()),
+    );
+    let keys = ui
+        .interact(
+            keys_rect,
+            Id::new(("piano_keys", clip.id)),
+            Sense::click_and_drag(),
+        )
+        .on_hover_text("Press to hear the track's instrument");
+    if keys.is_pointer_button_down_on()
+        && let Some(p) = ui.input(|i| i.pointer.latest_pos())
+    {
+        let pitch = view.pitch_at(p.y).floor().clamp(0.0, 127.0) as u8;
+        app.hold_key(track.id, Some(pitch), app.piano.velocity);
+    }
+    let held = app
+        .audition
+        .held
+        .filter(|(t, _)| *t == track.id)
+        .map(|(_, p)| p);
 
     let painter = ui.painter_at(full);
     draw_background(&painter, &view, project, clip);
@@ -276,7 +306,7 @@ pub fn show(
     {
         app.sel.focus = Focus::Editor;
         let free = ui.input(|i| i.modifiers.alt);
-        add_note_at(app, clip, &view, p, free);
+        add_note_at(app, project, track, clip, &view, p, free);
     }
 
     let color = theme::track_color(track.color);
@@ -325,6 +355,11 @@ pub fn show(
             n.velocity,
             n.length
         ));
+        // Heard as the button goes down, so a click and a drag both sound.
+        if body.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
+            let seconds = audition::note_seconds(project, clip.start + n.start, n.length);
+            app.hear_notes(track.id, &[(n.pitch, n.velocity)], seconds);
+        }
         if body.secondary_clicked() {
             app.sel.focus = Focus::Editor;
             app.sel.notes.retain(|id| *id != n.id);
@@ -370,6 +405,7 @@ pub fn show(
                 orig,
                 grab_tick: view.tick_at(origin.x),
                 grab_pitch: view.pitch_at(origin.y),
+                heard: 0,
             });
         }
     }
@@ -382,14 +418,7 @@ pub fn show(
             painter.vline(x, grid_rect.y_range(), Stroke::new(1.0, theme::ACCENT));
         }
     }
-    draw_keys(
-        &painter,
-        &view,
-        Rect::from_min_max(
-            pos2(full.left(), grid_rect.top()),
-            pos2(grid_rect.left(), full.bottom()),
-        ),
-    );
+    draw_keys(&painter, &view, keys_rect, held);
     draw_ruler(
         &painter,
         &view,
@@ -430,7 +459,15 @@ fn input(app: &mut App, ui: &mut Ui, area: Rect, grid: Rect, rows: f32) {
     }
 }
 
-fn add_note_at(app: &mut App, clip: &Clip, view: &View, p: egui::Pos2, free: bool) {
+fn add_note_at(
+    app: &mut App,
+    project: &Project,
+    track: &Track,
+    clip: &Clip,
+    view: &View,
+    p: egui::Pos2,
+    free: bool,
+) {
     let tick = view.tick_at(p.x);
     if tick < 0.0 || tick >= clip.length as f64 {
         app.sel.notes.clear();
@@ -447,10 +484,19 @@ fn add_note_at(app: &mut App, clip: &Clip, view: &View, p: egui::Pos2, free: boo
     let r = actions::add_note(&app.session, clip.id, note);
     if let Some(id) = app.report(r) {
         app.sel.notes = vec![id];
+        let seconds = audition::note_seconds(project, clip.start + start, length);
+        app.hear_notes(track.id, &[(note.pitch, note.velocity)], seconds);
     }
 }
 
-fn update_drag(app: &mut App, ctx: &Context, view: &View, clip: &Clip) {
+fn update_drag(
+    app: &mut App,
+    ctx: &Context,
+    view: &View,
+    project: &Project,
+    track: &Track,
+    clip: &Clip,
+) {
     let Some(mut drag) = app.piano.drag.clone() else {
         return;
     };
@@ -500,6 +546,17 @@ fn update_drag(app: &mut App, ctx: &Context, view: &View, clip: &Clip) {
                         ..*n
                     })
                     .collect();
+                if dp != drag.heard {
+                    drag.heard = dp;
+                    let notes: Vec<(u8, u8)> =
+                        drag.preview.iter().map(|n| (n.pitch, n.velocity)).collect();
+                    let seconds = audition::note_seconds(
+                        project,
+                        clip.start + anchor.start + dt,
+                        anchor.length,
+                    );
+                    app.hear_notes(track.id, &notes, seconds);
+                }
                 ctx.set_cursor_icon(CursorIcon::Grabbing);
             }
             NoteDragKind::Resize => {
@@ -618,7 +675,7 @@ fn draw_note(p: &Painter, r: Rect, n: &Note, color: Color32, selected: bool) {
     }
 }
 
-fn draw_keys(p: &Painter, v: &View, rect: Rect) {
+fn draw_keys(p: &Painter, v: &View, rect: Rect, held: Option<u8>) {
     let p = p.with_clip_rect(rect.intersect(p.clip_rect()));
     p.rect_filled(rect, CornerRadius::ZERO, Color32::from_gray(200));
     let first = (v.top_pitch.ceil() as i32 - 1).min(127);
@@ -628,7 +685,9 @@ fn draw_keys(p: &Painter, v: &View, rect: Rect) {
         let pu = pitch as u8;
         let y = v.y_of(pu);
         let row = Rect::from_min_max(pos2(rect.left(), y), pos2(rect.right(), y + v.row_h));
-        if is_black(pu) {
+        if held == Some(pu) {
+            p.rect_filled(row, CornerRadius::ZERO, theme::ACCENT);
+        } else if is_black(pu) {
             p.rect_filled(
                 Rect::from_min_max(
                     row.min,

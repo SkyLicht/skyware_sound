@@ -18,6 +18,7 @@ use crate::actions::{self, NewTrack};
 use crate::ai_panel::AiState;
 use crate::arrange::ArrangeState;
 use crate::audio::AudioState;
+use crate::audition::Audition;
 use crate::dialogs::{Confirm, Dialogs, PathPurpose};
 use crate::jobs::{JobOutput, Jobs};
 use crate::mixer::MixerState;
@@ -162,6 +163,7 @@ pub struct App {
     pub steps: StepState,
     pub mixer: MixerState,
     pub ai: AiState,
+    pub audition: Audition,
     pub palette: PaletteState,
     pub dialogs: Dialogs,
     pub jobs: Jobs,
@@ -198,6 +200,7 @@ impl App {
             steps: StepState::default(),
             mixer: MixerState::default(),
             ai: AiState::new(&view),
+            audition: Audition::default(),
             palette: PaletteState::default(),
             dialogs: Dialogs::default(),
             jobs: Jobs::default(),
@@ -318,6 +321,8 @@ impl App {
         if project.id != self.project_id {
             // A different project: nothing selected or cached carries over.
             self.project_id = project.id;
+            self.stop_preview();
+            self.audition.reset();
             self.sel = Selection::default();
             self.arrange.reset_for_new_project();
             self.piano = PianoState::default();
@@ -330,6 +335,7 @@ impl App {
             self.waveforms.clear();
         }
         self.sel.validate(&project);
+        self.tidy_auditions(ctx);
         self.update_meters(ctx, &project);
         self.ai.observe(&self.view, self.now);
         if self.notice.as_ref().is_some_and(|n| n.until < self.now) {
@@ -538,6 +544,7 @@ impl App {
     }
 
     pub fn stop(&mut self) {
+        self.stop_preview();
         let result = if self.transport.playing {
             self.session.stop()
         } else {
@@ -653,6 +660,7 @@ impl App {
             JobOutput::Peaks(id, peaks) => self.waveforms.insert(id, peaks),
             JobOutput::PackListed { map, result } => self.pack_listed(map, result),
             JobOutput::BankLoaded(result) => self.bank_loaded(result),
+            JobOutput::Previewed { key, result } => self.preview_ready(key, result),
         }
     }
 

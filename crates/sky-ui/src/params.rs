@@ -248,6 +248,8 @@ pub fn instrument_panel(app: &mut App, ui: &mut Ui) {
     if slot.kind == InstrumentType::Bank {
         crate::sounds::bank_panel(app, ui, track_id, &slot);
     }
+    ui.add_space(2.0);
+    crate::audition::keyboard(app, ui, track);
     ui.separator();
 
     let specs = slot.kind.params();

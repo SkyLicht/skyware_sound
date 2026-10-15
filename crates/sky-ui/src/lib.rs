@@ -15,6 +15,7 @@ mod ai_panel;
 mod app;
 mod arrange;
 mod audio;
+mod audition;
 mod dialogs;
 mod game;
 mod jobs;

@@ -6,6 +6,7 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::app::Action;
+use crate::audition::{PreviewKey, Rendered};
 use crate::dialogs::{LoopSummary, PathPurpose, WavSummary};
 use crate::game::GameSummary;
 use crate::waveform::Peaks;
@@ -45,6 +46,11 @@ pub enum JobOutput {
         result: Result<Arc<Pack>, String>,
     },
     BankLoaded(Result<BankLoaded, String>),
+    /// Audio rendered or fetched to be heard.
+    Previewed {
+        key: PreviewKey,
+        result: Result<Rendered, String>,
+    },
 }
 
 struct Running {

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The audio callback path must never allocate, including snapshot swaps,
-//! transport changes and loop wraps.
+//! transport changes, loop wraps, live notes and previews.
 
 use std::sync::Arc;
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
 use sky_core::{AudioId, ClipId};
 use sky_dsp::{AudioData, EffectType, InstrumentType};
-use sky_engine::{AudioCache, EngineMsg, compile, create_engine};
+use sky_engine::{AudioCache, EngineMsg, Preview, compile, create_engine};
 use sky_model::templates::demo_project;
 use sky_model::{BankSample, Clip, ClipContent, EffectSlot, SampleBank, Swing, Track};
 
@@ -64,7 +64,19 @@ fn processing_never_allocates() {
         length: project.ticks_per_bar(),
         content: ClipContent::pattern("bd*16", 0, project.ticks_per_bar()),
     });
+    let bank_id = bank.id;
     project.tracks.push(bank);
+    let synth = project.tracks[1].id;
+    let preview = |id: u64, loop_start: Option<f64>| {
+        EngineMsg::Preview(Box::new(Preview {
+            id,
+            audio: Arc::new(AudioData::silent(2, 9_600, 44_100)),
+            start: 100.0,
+            loop_start,
+            rate: 44_100.0 / 48_000.0,
+            gain: 0.5,
+        }))
+    };
     // Step clips with locks, ratchets and slides, on drums and the Acid.
     let bar = project.ticks_per_bar();
     let mut beat = sky_model::StepLane::parse(42, "x*4 x?50 x@1:2 x>20").unwrap();
@@ -91,6 +103,41 @@ fn processing_never_allocates() {
     let mut out = vec![0.0f32; 2 * 1_024];
     handle.send(EngineMsg::Play);
     for i in 0..200u64 {
+        match i {
+            5 => handle.send(EngineMsg::NoteOn {
+                track: synth,
+                pitch: 72,
+                velocity: 90,
+                frames: None,
+            }),
+            // More timed notes than there are slots for them.
+            6 => {
+                for pitch in 30..70 {
+                    handle.send(EngineMsg::NoteOn {
+                        track: synth,
+                        pitch,
+                        velocity: 90,
+                        frames: Some(3_000),
+                    });
+                }
+            }
+            25 => handle.send(EngineMsg::NoteOff {
+                track: synth,
+                pitch: 72,
+            }),
+            30 => handle.send(EngineMsg::SoundOn {
+                track: bank_id,
+                sound: 0,
+                velocity: 127,
+            }),
+            40 => handle.send(preview(1, None)),
+            45 => handle.send(preview(2, Some(0.0))),
+            60 => handle.send(preview(3, Some(4_000.0))),
+            100 => handle.send(EngineMsg::StopPreview),
+            120 => handle.send(preview(4, None)),
+            130 => handle.send(EngineMsg::AllSoundOff),
+            _ => {}
+        }
         if i % 20 == 10 {
             project.tracks[1].channel.volume_db = -(i as f32 % 12.0);
             handle.send(EngineMsg::Swap(Box::new(compile(
