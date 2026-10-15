@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::notes::format_note_list;
 use crate::project::*;
+use crate::steps::{DEFAULT_GATE, StepClip, format_locks};
 
 fn round(x: f64, places: i32) -> f64 {
     let f = 10f64.powi(places);
@@ -87,8 +88,44 @@ pub fn clip_json(project: &Project, clip: &Clip, detail: bool) -> Value {
                 v["swing"] = json!({ "amount": swing.amount, "grid": swing.grid });
             }
         }
+        ClipContent::Steps(steps) => {
+            v["rate"] = json!(steps.rate);
+            v["laneCount"] = json!(steps.lanes.len());
+            if detail {
+                v["lanes"] = steps_json(steps);
+                v["seed"] = json!(steps.seed);
+            }
+            if !steps.swing.is_straight() {
+                v["swing"] = json!({ "amount": steps.swing.amount, "grid": steps.swing.grid });
+            }
+        }
     }
     v
+}
+
+/// A step clip's lanes in the text form.
+pub fn steps_json(steps: &StepClip) -> Value {
+    steps
+        .lanes
+        .iter()
+        .map(|lane| {
+            let mut v = json!({
+                "note": sky_core::music::note_name(lane.note),
+                "steps": lane.text(),
+            });
+            if lane.gate != DEFAULT_GATE {
+                v["gate"] = json!(lane.gate);
+            }
+            if lane.mute {
+                v["mute"] = json!(true);
+            }
+            let locks = format_locks(&lane.steps);
+            if !locks.is_empty() {
+                v["locks"] = json!(locks);
+            }
+            v
+        })
+        .collect()
 }
 
 pub fn track_json(project: &Project, track: &Track, detail: bool) -> Value {

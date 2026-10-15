@@ -12,6 +12,7 @@ use sky_core::{
 use sky_dsp::{EffectType, InstrumentType};
 
 use crate::error::ModelError;
+use crate::steps::StepClip;
 
 /// The project file format version this build writes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -281,6 +282,7 @@ impl Track {
                 InstrumentType::Synth => [140, 110, 214],
                 InstrumentType::Sampler => [86, 190, 140],
                 InstrumentType::Bank => [214, 176, 86],
+                InstrumentType::Acid => [196, 214, 70],
             },
             instrument: Some(InstrumentSlot::new(instrument)),
             channel: Channel::default(),
@@ -517,6 +519,8 @@ pub enum ClipContent {
         #[serde(default, skip_serializing_if = "Swing::is_straight")]
         swing: Swing,
     },
+    /// Lanes of steps on a grid, as on a drum machine or an acid bass.
+    Steps(StepClip),
 }
 
 /// Swing for a pattern: every second step of `grid` comes late.
@@ -590,6 +594,7 @@ impl ClipContent {
             ClipContent::Audio { .. } => "audio",
             ClipContent::Midi { .. } => "midi",
             ClipContent::Pattern { .. } => "pattern",
+            ClipContent::Steps(_) => "steps",
         }
     }
 }

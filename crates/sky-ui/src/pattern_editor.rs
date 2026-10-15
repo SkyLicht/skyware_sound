@@ -62,6 +62,7 @@ pub fn clip_editor(app: &mut App, ui: &mut Ui) {
             pattern_ui(app, ui, project, clip, source, *seed, *cycle);
             groove_ui(app, ui, track, clip, controls, *swing);
         }
+        ClipContent::Steps(steps) => crate::step_editor::show(app, ui, track, clip, steps),
         ClipContent::Audio {
             source,
             gain_db,

@@ -35,6 +35,7 @@ fn every_command_undoes_exactly() {
         intro_start: Some(0),
     };
     let steps_sfx = sfx_asset("hit", 3);
+    let step_clip = ClipId::new();
     let note_ids: Vec<NoteId>;
     {
         let ClipContent::Midi { notes } = &project.tracks[1].clips[0].content else {
@@ -132,6 +133,29 @@ fn every_command_undoes_exactly() {
                 length: PPQ * 4,
                 content: ClipContent::Midi { notes: vec![] },
             }),
+        },
+        Command::AddClip {
+            track: lead,
+            clip: Box::new(Clip {
+                id: step_clip,
+                name: "steps".into(),
+                start: PPQ * 4,
+                length: PPQ * 4,
+                content: ClipContent::Steps(StepClip::new(
+                    16,
+                    vec![StepLane::parse(36, "x . x/ c3!").unwrap()],
+                )),
+            }),
+        },
+        Command::SetSteps {
+            clip: step_clip,
+            steps: Box::new(StepClip::new(
+                8,
+                vec![
+                    StepLane::parse(36, "x x . -").unwrap(),
+                    StepLane::parse(42, "x?50 x*3").unwrap(),
+                ],
+            )),
         },
         Command::MoveClip {
             id: bass_clip,
@@ -578,6 +602,65 @@ fn old_files_load_without_controls_swing_or_sidechain() {
     let slot = EffectSlot::new(EffectType::Duck);
     let json = serde_json::to_string(&slot).unwrap();
     assert!(!json.contains("sidechain"), "{json}");
+}
+
+#[test]
+fn step_clips_are_checked() {
+    let mut project = demo_project();
+    let mut history = History::new();
+    let drums = project.tracks[0].id;
+    let pattern = project.tracks[0].clips[0].id;
+    let audio = Track::new_audio("Audio");
+    let audio_id = audio.id;
+    history
+        .apply(
+            &mut project,
+            tx(vec![Command::AddTrack {
+                track: Box::new(audio),
+                index: None,
+            }]),
+        )
+        .unwrap();
+    let clip = |steps: StepClip| Clip {
+        id: ClipId::new(),
+        name: "s".into(),
+        start: 0,
+        length: PPQ * 4,
+        content: ClipContent::Steps(steps),
+    };
+    let good = StepClip::new(16, vec![StepLane::parse(36, "x . . .").unwrap()]);
+    let add = |track, steps| Command::AddClip {
+        track,
+        clip: Box::new(clip(steps)),
+    };
+    let err = |project: &mut Project, history: &mut History, c: Command| {
+        history.apply(project, tx(vec![c])).unwrap_err().to_string()
+    };
+    assert!(err(&mut project, &mut history, add(audio_id, good.clone())).contains("instrument"));
+    let mut bad = good.clone();
+    bad.lanes[0].steps[1].locks.insert("nonsense".into(), 1.0);
+    assert!(err(&mut project, &mut history, add(drums, bad)).contains("nonsense"));
+    let mut bad = good.clone();
+    bad.lanes[0].steps[0].ratchet = 9;
+    let text = err(&mut project, &mut history, add(drums, bad));
+    assert!(text.contains("lane 1") && text.contains("step 1"), "{text}");
+    // SetSteps only changes step clips.
+    let text = err(
+        &mut project,
+        &mut history,
+        Command::SetSteps {
+            clip: pattern,
+            steps: Box::new(good.clone()),
+        },
+    );
+    assert!(text.contains("pattern") && text.contains("steps"), "{text}");
+    history
+        .apply(&mut project, tx(vec![add(drums, good)]))
+        .unwrap();
+    // A saved step clip loads back the same.
+    let json = serde_json::to_string(&project).unwrap();
+    let back: Project = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, project);
 }
 
 #[test]
