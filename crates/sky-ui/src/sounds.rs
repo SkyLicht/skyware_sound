@@ -420,7 +420,7 @@ impl App {
             && self.view.project.track(b.track).is_ok()
         {
             self.sel.select_track(b.track);
-            self.tab = Tab::Instrument;
+            self.workspace.show(Tab::Instrument);
         }
         match self.dialogs.load_sounds.as_mut() {
             Some(d) => {
@@ -454,7 +454,7 @@ impl App {
         if let Some(id) = self.report(r) {
             self.refresh();
             self.sel.select_clip(track, id);
-            self.tab = Tab::Editor;
+            self.workspace.show(Tab::Editor);
         }
     }
 }

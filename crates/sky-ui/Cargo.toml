@@ -26,8 +26,13 @@ tracing.workspace = true
 directories.workspace = true
 egui.workspace = true
 # OpenGL through glow works on both Linux and Windows without a GPU driver
-# stack beyond OpenGL 2+, and keeps the build light.
-eframe = { workspace = true, features = ["default_fonts", "glow", "x11", "wayland"] }
+# stack beyond OpenGL 2+, and keeps the build light. Persistence keeps the
+# window's size and place, the zoom and the workspace layout between runs.
+eframe = { workspace = true, features = ["default_fonts", "glow", "x11", "wayland", "persistence"] }
+# The dockable workspace; serde saves its layout.
+egui_dock = { workspace = true, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
 # Native file dialogs. The portal backend talks to the desktop through a
 # runtime-loaded libdbus (falling back to zenity), so no GTK is needed to build.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

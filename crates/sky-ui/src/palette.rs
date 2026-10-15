@@ -6,7 +6,7 @@ use sky_dsp::EffectType;
 use sky_model::ChannelRef;
 
 use crate::actions::NewTrack;
-use crate::app::{Action, App};
+use crate::app::{Action, App, Tab};
 use crate::theme;
 
 #[derive(Default)]
@@ -113,15 +113,6 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Import audio…", "", Action::ImportAudio),
         entry("Load sounds from a sample pack…", "", Action::LoadSounds),
         entry(
-            if app.browser.open {
-                "Hide the browser"
-            } else {
-                "Show the browser"
-            },
-            "Ctrl+B",
-            Action::ToggleBrowser,
-        ),
-        entry(
             "Add a folder of samples to the browser…",
             "",
             Action::AddBrowserFolder,
@@ -135,6 +126,28 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Export WAV…", "", Action::ExportWav),
         entry("Audio settings…", "", Action::OpenSettings),
     ]);
+    for tab in Tab::ALL {
+        let name = match tab {
+            Tab::Arrange => continue,
+            Tab::Browser => "the browser",
+            Tab::Editor => "the clip editor",
+            Tab::Mixer => "the mixer",
+            Tab::Instrument => "the instrument panel",
+            Tab::Ai => "AI activity",
+        };
+        let verb = if app.workspace.is_open(tab) {
+            "Hide"
+        } else {
+            "Show"
+        };
+        let shortcut = if tab == Tab::Browser { "Ctrl+B" } else { "" };
+        out.push(entry(
+            format!("{verb} {name}"),
+            shortcut,
+            Action::TogglePanel(tab),
+        ));
+    }
+    out.push(entry("Reset the panel layout", "", Action::ResetLayout));
     out
 }
 

@@ -433,6 +433,7 @@ fn run_app(
         }),
         demo_tracks: stress_ui,
         browser_store: config::browser_folders_file(),
+        layout_store: config::layout_file(),
     };
     let result = sky_ui::run(session, config);
     if let Some((srv, _)) = server {

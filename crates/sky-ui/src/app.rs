@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The application state and the per-frame layout.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,8 @@ use crate::piano_roll::PianoState;
 use crate::step_editor::StepState;
 use crate::waveform::{Peaks, WaveformCache};
 use crate::widgets::Gestures;
+pub use crate::workspace::Tab;
+use crate::workspace::Workspace;
 use crate::{McpInfo, UiConfig, theme};
 
 pub const WINDOW_TITLE: &str = "Skyware Sound";
@@ -46,14 +49,23 @@ pub enum Action {
     NewTechno,
     NewAcid,
     Open,
+    /// Open a project from File > Open recent.
+    OpenRecent(PathBuf),
+    ClearRecent,
     Save,
     SaveAs,
     ImportAudio,
     /// Load sounds from a sample pack into the selected sample bank, or a
     /// new one.
     LoadSounds,
-    /// Show or hide the browser.
-    ToggleBrowser,
+    /// Close an open panel or open a closed one.
+    TogglePanel(Tab),
+    /// Put the panels back where they are on a first run.
+    ResetLayout,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    About,
     /// Add a folder of samples to the browser.
     AddBrowserFolder,
     ExportLoop,
@@ -63,6 +75,8 @@ pub enum Action {
     GameAssets,
     ToggleLoop,
     PlayStop,
+    /// Stop, or go back to the start when already stopped.
+    Stop,
     Undo,
     Redo,
     SetTempo(f64),
@@ -72,16 +86,6 @@ pub enum Action {
     OpenPalette,
     DeleteSelection,
     Quit,
-}
-
-/// The tabs of the bottom panel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Tab {
-    #[default]
-    Editor,
-    Mixer,
-    Instrument,
-    Ai,
 }
 
 /// Which area the Delete key acts on.
@@ -175,12 +179,18 @@ pub struct App {
     pub jobs: Jobs,
     pub gestures: Gestures,
     pub waveforms: WaveformCache,
-    pub tab: Tab,
+    /// The panels, where they are, and the recent projects.
+    pub workspace: Workspace,
+    /// Help > About is open.
+    pub about: bool,
     pub notice: Option<Notice>,
     /// Seconds since start, from egui.
     pub now: f64,
     project_id: ProjectId,
     pool_len: usize,
+    /// The project's folder last frame, to notice opens and saves for the
+    /// recent list.
+    last_path: Option<PathBuf>,
     title: String,
     allow_close: bool,
 }
@@ -213,15 +223,24 @@ impl App {
             jobs: Jobs::default(),
             gestures: Gestures::default(),
             waveforms: WaveformCache::default(),
-            tab: Tab::default(),
+            workspace: Workspace::default(),
+            about: false,
             notice: None,
             now: 0.0,
             project_id,
             pool_len,
+            last_path: None,
             title: String::new(),
             allow_close: false,
             view,
             session,
+        }
+    }
+
+    /// Takes back the layout and recent projects saved by an earlier run.
+    pub fn restore(&mut self, storage: &dyn eframe::Storage) {
+        if let Some(json) = storage.get_string(crate::workspace::STORAGE_KEY) {
+            self.workspace.restore(&json);
         }
     }
 
@@ -272,6 +291,13 @@ impl App {
         self.shortcuts(&ctx);
         self.take_dropped_files(&ctx);
 
+        Panel::top("menu")
+            .frame(
+                Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(Margin::symmetric(6, 2)),
+            )
+            .show(ui, |ui| crate::menu::bar(self, ui));
         Panel::top("transport")
             .frame(
                 Frame::new()
@@ -295,35 +321,12 @@ impl App {
                     .inner_margin(Margin::symmetric(10, 3)),
             )
             .show(ui, |ui| self.status_bar(ui));
-        if self.browser.open {
-            Panel::left("browser")
-                .resizable(true)
-                .default_size(260.0)
-                .size_range(180.0..=480.0)
-                .frame(
-                    Frame::new()
-                        .fill(theme::PANEL)
-                        .inner_margin(Margin::symmetric(6, 6)),
-                )
-                .show(ui, |ui| crate::browser::panel(self, ui));
-        }
-        // Leave the arrangement room for a few tracks in a small window.
-        let height = ui.available_height();
-        Panel::bottom("editor")
-            .resizable(true)
-            .default_size((height * 0.4).clamp(150.0, 330.0))
-            .size_range(150.0..=(height - 200.0).max(150.0))
-            .frame(
-                Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(Margin::symmetric(8, 6)),
-            )
-            .show(ui, |ui| self.bottom_panel(ui));
         CentralPanel::default()
             .frame(Frame::new().fill(theme::BG).inner_margin(Margin::same(0)))
-            .show(ui, |ui| crate::arrange::show(self, ui));
+            .show(ui, |ui| crate::workspace::show(self, ui));
 
         crate::mixer::effect_window(self, &ctx);
+        crate::menu::about_window(self, &ctx);
         crate::dialogs::show(self, &ctx);
         crate::palette::show(self, &ctx);
         crate::browser::overlays(self, &ctx);
@@ -338,6 +341,15 @@ impl App {
         }
         self.view = self.session.view();
         self.transport = self.session.transport();
+        self.workspace.apply();
+        self.browser.open = self.workspace.is_open(Tab::Browser);
+        // A project opened or saved somewhere new, here or by an AI.
+        if self.view.path != self.last_path {
+            if let Some(path) = &self.view.path {
+                self.workspace.remember(path);
+            }
+            self.last_path = self.view.path.clone();
+        }
         let project = self.view.project.clone();
         if project.id != self.project_id {
             // A different project: nothing selected or cached carries over.
@@ -433,7 +445,7 @@ impl App {
                 wanted.push(Action::Open);
             }
             if i.consume_shortcut(&cmd(Key::B)) {
-                wanted.push(Action::ToggleBrowser);
+                wanted.push(Action::TogglePanel(Tab::Browser));
             }
             if text_focus {
                 return;
@@ -466,7 +478,7 @@ impl App {
                     self.refresh();
                     self.sel.select_track(id);
                     if matches!(kind, NewTrack::Instrument(_)) {
-                        self.tab = Tab::Instrument;
+                        self.workspace.show(Tab::Instrument);
                     }
                     // A sample bank does nothing until it has sounds.
                     if kind == NewTrack::Instrument(InstrumentType::Bank) {
@@ -485,6 +497,7 @@ impl App {
             | Action::NewTechno
             | Action::NewAcid
             | Action::Open
+            | Action::OpenRecent(_)
             | Action::Quit => {
                 if self.view.dirty && !(action == Action::Quit && self.allow_close) {
                     self.dialogs.confirm = Some(Confirm { then: action });
@@ -512,7 +525,13 @@ impl App {
                 });
                 self.open_load_sounds(bank_track);
             }
-            Action::ToggleBrowser => self.browser.open = !self.browser.open,
+            Action::ClearRecent => self.workspace.recent.clear(),
+            Action::TogglePanel(tab) => self.workspace.toggle(tab),
+            Action::ResetLayout => self.workspace.reset(),
+            Action::ZoomIn => egui::gui_zoom::zoom_in(ctx),
+            Action::ZoomOut => egui::gui_zoom::zoom_out(ctx),
+            Action::ZoomReset => ctx.set_zoom_factor(1.0),
+            Action::About => self.about = true,
             Action::AddBrowserFolder => self.request_path(ctx, PathPurpose::BrowseFolder),
             Action::ExportLoop => self.open_export_loop(),
             Action::ExportWav => self.open_export_wav(),
@@ -522,6 +541,7 @@ impl App {
                 self.report(r);
             }
             Action::PlayStop => self.play_stop(),
+            Action::Stop => self.stop(),
             Action::Undo => match self.session.undo() {
                 Ok(label) => self.info(format!("Undid “{label}”")),
                 Err(e) => self.info(e.to_string()),
@@ -550,6 +570,15 @@ impl App {
             Action::NewTechno => self.session.new_project(techno_project()),
             Action::NewAcid => self.session.new_project(acid_project()),
             Action::Open => self.request_path(ctx, PathPurpose::OpenProject),
+            Action::OpenRecent(path) => {
+                if self
+                    .path_chosen(ctx, PathPurpose::OpenProject, path.clone())
+                    .is_some()
+                {
+                    // Moved or deleted since: no use listing it.
+                    self.workspace.forget(&path);
+                }
+            }
             Action::Quit => {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -752,49 +781,15 @@ impl App {
             });
         });
     }
-
-    fn bottom_panel(&mut self, ui: &mut Ui) {
-        // Keep the panel at its set height whatever the tab holds.
-        ui.set_min_size(ui.available_size());
-        ui.horizontal(|ui| {
-            let ai_count = self.view.activity.len();
-            for (tab, label) in [
-                (Tab::Editor, "Editor".to_string()),
-                (Tab::Mixer, "Mixer".to_string()),
-                (Tab::Instrument, "Instrument".to_string()),
-                (
-                    Tab::Ai,
-                    if ai_count > 0 {
-                        format!("AI activity ({ai_count})")
-                    } else {
-                        "AI activity".to_string()
-                    },
-                ),
-            ] {
-                let selected = self.tab == tab;
-                let text = if selected {
-                    RichText::new(label).strong().color(theme::TEXT)
-                } else {
-                    RichText::new(label).color(theme::TEXT_WEAK)
-                };
-                if ui.add(egui::Button::selectable(selected, text)).clicked() {
-                    self.tab = tab;
-                }
-            }
-        });
-        ui.separator();
-        match self.tab {
-            Tab::Editor => crate::pattern_editor::clip_editor(self, ui),
-            Tab::Mixer => crate::mixer::show(self, ui),
-            Tab::Instrument => crate::params::instrument_panel(self, ui),
-            Tab::Ai => crate::ai_panel::show(self, ui),
-        }
-    }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(crate::workspace::STORAGE_KEY, self.workspace.saved_json());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

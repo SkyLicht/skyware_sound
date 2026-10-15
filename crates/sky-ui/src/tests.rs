@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use egui::accesskit::Role;
 use egui::{
     Context, Event, FontId, Id, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2,
 };
@@ -24,9 +25,7 @@ use crate::audition::{ButtonState, PreviewKey};
 use crate::dialogs::PathPurpose;
 use crate::waveform::Peaks;
 use crate::widgets::Gestures;
-use crate::{UiConfig, arrange, game, palette, pattern_editor, sounds, theme};
-
-const TABS: [Tab; 4] = [Tab::Editor, Tab::Mixer, Tab::Instrument, Tab::Ai];
+use crate::{UiConfig, arrange, game, menu, palette, pattern_editor, sounds, theme};
 
 /// The app in a bare egui context, fed with synthetic input.
 struct Harness {
@@ -42,6 +41,9 @@ struct Harness {
     dropped: Vec<egui::DroppedFileHandle>,
     /// Files held over the window.
     hovered: Vec<egui::HoveredFile>,
+    /// Labelled widgets and where they were drawn last frame, once
+    /// [`accessible`](Self::accessible) is on.
+    access: Vec<(String, Rect, Role)>,
 }
 
 impl Harness {
@@ -69,6 +71,7 @@ impl Harness {
             engine,
             dropped: Vec::new(),
             hovered: Vec::new(),
+            access: Vec::new(),
         };
         h.frames(3);
         h
@@ -119,6 +122,22 @@ impl Harness {
         let mut out = self.ctx.run_ui(input, |ui| app.frame(ui));
         // No renderer here to take the font atlas.
         out.textures_delta.clear();
+        if let Some(tree) = out.platform_output.accesskit_update.take() {
+            self.access = tree
+                .nodes
+                .iter()
+                .filter_map(|(_, node)| {
+                    let b = node.bounds()?;
+                    let rect = Rect::from_min_max(
+                        pos2(b.x0 as f32, b.y0 as f32),
+                        pos2(b.x1 as f32, b.y1 as f32),
+                    );
+                    // Plain text carries its words as a value.
+                    let label = node.label().or(node.value())?;
+                    Some((label.to_string(), rect, node.role()))
+                })
+                .collect();
+        }
         self.time += 1.0 / 60.0;
     }
 
@@ -208,6 +227,49 @@ impl Harness {
         self.frame();
     }
 
+    /// Reads widget labels from the accessibility tree from now on, for
+    /// [`find`](Self::find) and [`click_label`](Self::click_label).
+    fn accessible(&mut self) {
+        self.ctx.enable_accesskit();
+        self.frames(2);
+    }
+
+    /// Where the widget with this label, or this label and a shortcut, was
+    /// drawn last frame; the topmost one if there are several.
+    fn find(&self, label: &str) -> Option<Rect> {
+        self.find_role(label, None)
+    }
+
+    /// Like [`find`](Self::find), for one kind of widget only.
+    fn find_role(&self, label: &str, role: Option<Role>) -> Option<Rect> {
+        let with_shortcut = format!("{label} ");
+        self.access
+            .iter()
+            .rev()
+            .filter(|(_, _, r)| role.is_none_or(|role| *r == role))
+            .find(|(l, _, _)| l == label || l.starts_with(&with_shortcut))
+            .map(|(_, r, _)| *r)
+    }
+
+    fn click_label(&mut self, label: &str) {
+        self.click_role(label, None);
+    }
+
+    fn click_role(&mut self, label: &str, role: Option<Role>) {
+        let rect = self.find_role(label, role).unwrap_or_else(|| {
+            let labels: Vec<&str> = self.access.iter().map(|(l, _, _)| l.as_str()).collect();
+            panic!("no widget labelled {label:?} among {labels:?}")
+        });
+        self.click(rect.center());
+    }
+
+    /// The rectangle of the tab group a panel is in.
+    fn panel_rect(&self, tab: Tab) -> Rect {
+        let dock = self.app.workspace.dock();
+        let path = dock.find_tab(&tab).expect("panel is open");
+        dock.leaf(path.node_path()).expect("a tab group").rect
+    }
+
     /// Marks the known sample packs as unreadable, so a search in the
     /// browser does not go to the network for them.
     fn offline_packs(&mut self) {
@@ -232,10 +294,10 @@ impl Harness {
         self.frames(2);
     }
 
-    /// Renders every bottom tab once.
+    /// Brings every panel to the front once.
     fn every_tab(&mut self) {
-        for tab in TABS {
-            self.app.tab = tab;
+        for tab in Tab::ALL {
+            self.app.workspace.show(tab);
             self.frames(2);
         }
     }
@@ -404,7 +466,7 @@ fn actions_change_the_project_and_undo_restores_it() {
     let p = h.project();
     assert_eq!(p.tracks.len(), tracks + 1);
     let track = h.app.sel.track.expect("new track selected");
-    assert_eq!(h.app.tab, Tab::Instrument);
+    assert!(h.app.workspace.is_front(Tab::Instrument));
     let new = p.track(track).expect("track exists");
     assert_eq!(new.kind, sky_model::TrackKind::Instrument);
     assert!(new.clips.is_empty());
@@ -560,7 +622,7 @@ fn double_click_on_an_empty_lane_adds_a_bar_long_clip() {
     let new = new.expect("a one-bar clip at bar 7");
     assert!(matches!(new.content, ClipContent::Midi { .. }));
     assert_eq!(h.app.sel.clip, Some(new.id));
-    assert_eq!(h.app.tab, Tab::Editor);
+    assert!(h.app.workspace.is_front(Tab::Editor));
     // The piano roll shows it.
     h.frames(3);
 
@@ -805,7 +867,7 @@ fn pattern_edits_apply_on_enter() {
         other => panic!("{other:?}"),
     };
     h.app.sel.select_clip(drums.id, clip);
-    h.app.tab = Tab::Editor;
+    h.app.workspace.show(Tab::Editor);
     h.frames(3);
     let text_id = Id::new(("pattern_text", clip));
     h.ctx.memory_mut(|m| m.request_focus(text_id));
@@ -854,7 +916,7 @@ fn pattern_controls_apply_on_enter_and_follow_undo() {
         other => panic!("{other:?}"),
     };
     h.app.sel.select_clip(drums.id, clip);
-    h.app.tab = Tab::Editor;
+    h.app.workspace.show(Tab::Editor);
     h.frames(3);
     h.app
         .report(actions::set_pattern_control(
@@ -940,7 +1002,7 @@ fn a_new_duck_follows_the_drums() {
     assert_eq!(bass.channel.effect(id).unwrap().sidechain, Some(drums.id));
     // The window shows who it follows and survives the drums being deleted.
     h.app.mixer.open_effect = Some((sky_model::ChannelRef::Track(bass.id), id));
-    h.app.tab = Tab::Mixer;
+    h.app.workspace.show(Tab::Mixer);
     h.frames(3);
     h.app
         .report(actions::apply(
@@ -1006,7 +1068,7 @@ fn step_clips_are_edited_by_clicking_steps() {
         .unwrap();
     assert_eq!(steps_of(&h, id).lanes.len(), 3);
     h.app.sel.select_clip(drums.id, id);
-    h.app.tab = Tab::Editor;
+    h.app.workspace.show(Tab::Editor);
     h.frames(3);
     let cell = |h: &Harness, lane: usize, step: usize| {
         h.app
@@ -1053,7 +1115,7 @@ fn step_clips_are_edited_by_clicking_steps() {
     assert_eq!(steps.lanes[2].len(), 12);
     assert_eq!(steps.locked_params(), ["hat_decay"]);
     // The arrange view draws the clip, and an Acid track starts from a line.
-    h.app.tab = Tab::Editor;
+    h.app.workspace.show(Tab::Editor);
     h.show_bars(16);
     let acid = Track::new_instrument("Acid", sky_dsp::InstrumentType::Acid);
     assert!(
@@ -1102,7 +1164,7 @@ fn ai_changes_flash_the_indicator_and_can_be_undone() {
             .as_deref()
             .is_some_and(|l| l.contains("test-client"))
     );
-    h.app.tab = Tab::Ai;
+    h.app.workspace.show(Tab::Ai);
     h.frames(3);
     let seq = h.app.view.activity.last().map(|a| a.seq).expect("activity");
     assert!(h.app.session.undo_to(seq).is_ok());
@@ -1280,7 +1342,7 @@ fn exports_run_on_threads() {
     let clip = h.app.sel.clip.expect("the new clip is selected");
     assert!(matches!(h.clip(clip).content, ClipContent::Audio { .. }));
     // The waveform is computed in the background and then drawn.
-    h.app.tab = Tab::Editor;
+    h.app.workspace.show(Tab::Editor);
     h.frames(2);
     h.wait_jobs();
     h.frames(2);
@@ -1370,7 +1432,7 @@ fn sample_banks_load_from_a_pack_and_exports_credit_it() {
     h.wait_jobs();
     let kit = h.track_named("Kit");
     assert_eq!(h.app.sel.track, Some(kit.id));
-    assert_eq!(h.app.tab, Tab::Instrument);
+    assert!(h.app.workspace.is_front(Tab::Instrument));
     let slot = kit.instrument.clone().expect("instrument");
     assert_eq!(slot.kind, InstrumentType::Bank);
     let bank = slot.bank.clone().expect("bank");
@@ -1435,7 +1497,7 @@ fn sample_banks_load_from_a_pack_and_exports_credit_it() {
 
     // The bank panel draws, and its pattern clip plays the drums.
     h.app.sel.select_track(kit.id);
-    h.app.tab = Tab::Instrument;
+    h.app.workspace.show(Tab::Instrument);
     h.frames(3);
     h.app.add_bank_pattern(kit.id);
     let clip = h.app.sel.clip.expect("the pattern clip is selected");
@@ -1533,6 +1595,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("game.rs"),
         include_str!("jobs.rs"),
         include_str!("lib.rs"),
+        include_str!("menu.rs"),
         include_str!("mixer.rs"),
         include_str!("palette.rs"),
         include_str!("params.rs"),
@@ -1544,6 +1607,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("transport.rs"),
         include_str!("waveform.rs"),
         include_str!("widgets.rs"),
+        include_str!("workspace.rs"),
     ];
     let mut symbols: Vec<char> = sources
         .iter()
@@ -1705,7 +1769,7 @@ fn piano_keys_and_placed_notes_are_heard() {
     let bass = h.track_named("Bass");
     let clip = bass.clips[0].id;
     h.app.sel.select_clip(bass.id, clip);
-    h.app.tab = Tab::Editor;
+    h.app.workspace.show(Tab::Editor);
     h.frames(3);
     let history = h.history_len();
     assert_eq!(h.heard(), 0.0, "nothing plays while stopped");
@@ -1755,7 +1819,7 @@ fn the_instrument_keyboard_plays_the_track() {
     let mut h = Harness::with_engine(demo_project());
     let pad = h.track_named("Pad");
     h.app.sel.select_track(pad.id);
-    h.app.tab = Tab::Instrument;
+    h.app.workspace.show(Tab::Instrument);
     h.frames(3);
     let keys = h.rect_of(crate::audition::keyboard_id(pad.id));
     let at = keys.left_bottom() + vec2(keys.width() / 2.0, -4.0);
@@ -1771,7 +1835,7 @@ fn the_instrument_keyboard_plays_the_track() {
     let mut off = Harness::demo();
     let pad = off.track_named("Pad");
     off.app.sel.select_track(pad.id);
-    off.app.tab = Tab::Instrument;
+    off.app.workspace.show(Tab::Instrument);
     off.frames(3);
     let keys = off.rect_of(crate::audition::keyboard_id(pad.id));
     off.click(keys.center());
@@ -2206,7 +2270,7 @@ fn browser_pack_sounds_play_and_drop_into_a_sample_bank() {
     assert_eq!(bank.sounds["bd"].len(), 1);
     let source = p.audio_pool[0].source.clone().expect("credited");
     assert_eq!(source.license, License::Cc0);
-    assert_eq!(h.app.tab, Tab::Instrument);
+    assert!(h.app.workspace.is_front(Tab::Instrument));
 
     // "Load this bank…" opens Load sounds on it, for the selected bank,
     // without reading the pack again.
@@ -2329,4 +2393,339 @@ fn the_browser_keeps_its_folders_between_runs() {
     first.remove_folder(&dir.path().join("b"));
     assert_eq!(BrowserState::new(Some(store)).folders, [a]);
     assert!(BrowserState::new(None).folders.is_empty());
+}
+
+#[test]
+fn panels_split_float_close_and_reset() {
+    let mut h = Harness::demo();
+    h.accessible();
+
+    // A first run: the browser on the left, the arrangement above the
+    // editor, and the mixer, instrument and AI tabs behind the editor.
+    for tab in Tab::ALL {
+        assert!(h.app.workspace.is_open(tab), "{tab:?} is open");
+    }
+    for tab in [Tab::Arrange, Tab::Browser, Tab::Editor] {
+        assert!(h.app.workspace.is_front(tab), "{tab:?} is in front");
+    }
+    assert!(!h.app.workspace.is_front(Tab::Mixer));
+    let browser = h.panel_rect(Tab::Browser);
+    let arrange = h.panel_rect(Tab::Arrange);
+    let lower = h.panel_rect(Tab::Editor);
+    assert!(browser.left() < 1.0, "{browser:?}");
+    assert!((0.15..0.21).contains(&(browser.width() / h.screen.width())));
+    assert!(arrange.left() >= browser.right() - 1.0);
+    assert!(arrange.bottom() <= lower.top() + 1.0);
+    assert!(arrange.height() > lower.height());
+    assert_eq!(h.panel_rect(Tab::Mixer), lower);
+
+    // Dragging the mixer's tab onto the right-hand drop button puts it
+    // beside the editor, and both show.
+    let tab = h.find("Mixer").expect("the mixer's tab");
+    let overlay = egui_dock::Style::from_egui(&h.ctx.global_style()).overlay;
+    let gap = overlay.button_spacing;
+    let area = lower.shrink(gap);
+    let side = ((area.width() - 2.0 * gap) / 3.0)
+        .min((area.height() - 2.0 * gap) / 3.0)
+        .min(overlay.max_button_size);
+    let right = area.center() + vec2(side + gap, 0.0);
+    h.move_to(tab.center());
+    h.pointer(tab.center(), true);
+    h.frame();
+    for step in 1..=12 {
+        h.move_to(tab.center().lerp(right, step as f32 / 12.0));
+    }
+    h.frames(3);
+    h.pointer(right, false);
+    h.frames(3);
+    assert!(h.app.workspace.is_front(Tab::Mixer));
+    assert!(h.app.workspace.is_front(Tab::Editor));
+    let editor = h.panel_rect(Tab::Editor);
+    let mixer = h.panel_rect(Tab::Mixer);
+    assert!(mixer.left() >= editor.right() - 3.0, "{editor:?} {mixer:?}");
+    assert_eq!(h.panel_rect(Tab::Instrument), editor);
+
+    // Ctrl+B hides the browser and brings it back on the left.
+    h.key(Key::B, COMMAND);
+    assert!(!h.app.workspace.is_open(Tab::Browser));
+    assert!(!h.app.browser.open);
+    assert!(h.panel_rect(Tab::Arrange).left() < 1.0);
+    h.key(Key::B, COMMAND);
+    assert!(h.app.browser.open);
+    assert!(h.panel_rect(Tab::Browser).left() < 1.0);
+
+    // View > Instrument closes it; again, it comes back beside the editor.
+    h.click_label("View");
+    h.click_role("Instrument", Some(Role::CheckBox));
+    assert!(!h.app.workspace.is_open(Tab::Instrument));
+    h.click_label("View");
+    h.click_role("Instrument", Some(Role::CheckBox));
+    assert!(h.app.workspace.is_front(Tab::Instrument));
+    assert_eq!(h.panel_rect(Tab::Instrument), h.panel_rect(Tab::Editor));
+
+    // The arrangement cannot be closed.
+    h.run(Action::TogglePanel(Tab::Arrange));
+    assert!(h.app.workspace.is_open(Tab::Arrange));
+
+    // A floating panel still draws, and comes forward when asked.
+    let path = h.app.workspace.dock().find_tab(&Tab::Ai).expect("AI tab");
+    let window = Rect::from_min_size(pos2(500.0, 200.0), vec2(420.0, 300.0));
+    h.app.workspace.dock_mut().detach_tab(path, window);
+    h.frames(2);
+    let path = h.app.workspace.dock().find_tab(&Tab::Ai).expect("AI tab");
+    assert!(!path.surface.is_main());
+    h.every_tab();
+    assert!(h.app.workspace.is_front(Tab::Ai));
+
+    // Reset puts every panel back where a first run has it.
+    h.click_label("View");
+    h.click_label("Reset the panel layout");
+    h.frames(1);
+    assert_eq!(h.panel_rect(Tab::Mixer), h.panel_rect(Tab::Editor));
+    assert!(
+        h.app
+            .workspace
+            .dock()
+            .find_tab(&Tab::Ai)
+            .is_some_and(|p| p.surface.is_main())
+    );
+    assert!(h.app.workspace.is_front(Tab::Editor));
+}
+
+/// eframe's storage, in memory.
+#[derive(Default)]
+struct MemoryStorage(std::collections::HashMap<String, String>);
+
+impl eframe::Storage for MemoryStorage {
+    fn get_string(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+
+    fn set_string(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
+    }
+
+    fn remove_string(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+
+    fn flush(&mut self) {}
+}
+
+/// The items of a submenu, by label.
+fn submenu<'a>(entries: &'a [menu::Entry], label: &str) -> &'a [menu::Entry] {
+    entries
+        .iter()
+        .find_map(|e| match e {
+            menu::Entry::Sub(l, list) if l == label => Some(list.as_slice()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no submenu {label}"))
+}
+
+fn menu_entries<'a>(menus: &'a [menu::Menu], title: &str) -> &'a [menu::Entry] {
+    &menus
+        .iter()
+        .find(|m| m.title == title)
+        .unwrap_or_else(|| panic!("no menu {title}"))
+        .entries
+}
+
+fn item_labels(entries: &[menu::Entry]) -> Vec<&str> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            menu::Entry::Item(it) => Some(it.label.as_str()),
+            menu::Entry::Note(text) => Some(*text),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_layout_and_recent_projects_come_back_next_run() {
+    use crate::workspace::STORAGE_KEY;
+    use eframe::Storage as _;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut h = Harness::demo();
+
+    // Saving a project, then a second one, lists both, newest first.
+    let first = dir.path().join("First.skyproj");
+    let second = dir.path().join("Second.skyproj");
+    h.app.session.save(Some(&first)).expect("saved");
+    h.frames(2);
+    h.app.session.new_project(empty_project("Second"));
+    h.app.session.save(Some(&second)).expect("saved");
+    h.frames(2);
+    assert_eq!(h.app.workspace.recent, [second.clone(), first.clone()]);
+
+    // Hide the browser and AI activity, bring the mixer forward, and quit.
+    h.run(Action::TogglePanel(Tab::Browser));
+    h.run(Action::TogglePanel(Tab::Ai));
+    h.app.workspace.show(Tab::Mixer);
+    h.frames(2);
+    let mut storage = MemoryStorage::default();
+    eframe::App::save(&mut h.app, &mut storage);
+
+    // The next run starts as this one ended.
+    let mut next = Harness::demo();
+    next.app.restore(&storage);
+    next.frames(2);
+    assert!(!next.app.workspace.is_open(Tab::Browser));
+    assert!(!next.app.browser.open);
+    assert!(!next.app.workspace.is_open(Tab::Ai));
+    assert!(next.app.workspace.is_front(Tab::Mixer));
+    assert_eq!(next.app.workspace.recent, [second.clone(), first.clone()]);
+
+    // File > Open recent lists them and opens one.
+    let menus = menu::menus(&next.app);
+    let recent = submenu(menu_entries(&menus, "File"), "Open recent");
+    assert_eq!(
+        item_labels(recent),
+        ["Second.skyproj", "First.skyproj", "Clear the list"]
+    );
+    next.run(Action::OpenRecent(first.clone()));
+    next.wait_jobs();
+    assert_eq!(next.app.view.path.as_deref(), Some(first.as_path()));
+    assert_eq!(next.app.workspace.recent, [first.clone(), second.clone()]);
+
+    // One that has gone says so and leaves the list.
+    let gone = dir.path().join("Gone.skyproj");
+    next.app.workspace.remember(&gone);
+    next.run(Action::OpenRecent(gone.clone()));
+    assert!(next.app.notice.as_ref().is_some_and(|n| n.error));
+    assert!(!next.app.workspace.recent.contains(&gone));
+    assert_eq!(next.app.view.path.as_deref(), Some(first.as_path()));
+
+    next.run(Action::ClearRecent);
+    let menus = menu::menus(&next.app);
+    let recent = submenu(menu_entries(&menus, "File"), "Open recent");
+    assert_eq!(item_labels(recent), ["No recent projects"]);
+
+    // A layout this version cannot use leaves the first-run layout in
+    // place, and keeps the recent projects when it can read them.
+    let no_arrange = egui_dock::DockState::new(vec![Tab::Mixer]);
+    let twice = egui_dock::DockState::new(vec![Tab::Arrange, Tab::Mixer, Tab::Mixer]);
+    for (saved, recent) in [
+        ("not json".to_string(), 0),
+        (r#"{"dock": 5, "recent": ["a.skyproj"]}"#.to_string(), 1),
+        (
+            serde_json::json!({ "dock": no_arrange, "recent": ["a.skyproj"] }).to_string(),
+            1,
+        ),
+        (
+            serde_json::json!({ "dock": twice, "recent": ["a.skyproj"] }).to_string(),
+            1,
+        ),
+    ] {
+        let mut storage = MemoryStorage::default();
+        storage.set_string(STORAGE_KEY, saved.clone());
+        let mut h = Harness::demo();
+        h.app.restore(&storage);
+        h.frames(2);
+        assert!(
+            Tab::ALL.iter().all(|t| h.app.workspace.is_open(*t)),
+            "{saved}"
+        );
+        assert_eq!(h.app.workspace.recent.len(), recent, "{saved}");
+    }
+}
+
+#[test]
+fn the_menu_bar_opens_and_runs_what_it_lists() {
+    let mut h = Harness::demo();
+    h.accessible();
+
+    // Each menu opens on a click.
+    for (title, first) in [
+        ("File", "New empty project"),
+        ("Edit", "Delete"),
+        ("Track", "Add synth track"),
+        ("Transport", "Set tempo…"),
+        ("View", "Reset the panel layout"),
+        ("Help", "Command palette…"),
+    ] {
+        h.click_label(title);
+        assert!(h.find(first).is_some(), "{title} lists {first}");
+        h.key(Key::Escape, Modifiers::NONE);
+        assert!(h.find(first).is_none(), "{title} closes");
+    }
+
+    // A submenu: File > Open recent.
+    h.click_label("File");
+    h.click_label("Open recent");
+    assert!(h.find("No recent projects").is_some());
+    h.key(Key::Escape, Modifiers::NONE);
+
+    // View > Mixer closes the mixer.
+    h.click_label("View");
+    h.click_role("Mixer", Some(Role::CheckBox));
+    assert!(!h.app.workspace.is_open(Tab::Mixer));
+
+    // Help > About.
+    h.click_label("Help");
+    h.click_label("About Skyware Sound");
+    assert!(h.app.about);
+    assert!(
+        h.find(&format!("Version {}", env!("CARGO_PKG_VERSION")))
+            .is_some()
+    );
+
+    // Edit names what Undo would undo, and is greyed out with nothing to undo.
+    let undo = |h: &Harness| {
+        let menus = menu::menus(&h.app);
+        match &menu_entries(&menus, "Edit")[0] {
+            menu::Entry::Item(it) => (it.label.clone(), it.enabled),
+            _ => panic!("Undo first"),
+        }
+    };
+    assert_eq!(undo(&h), ("Undo".to_string(), false));
+    h.run(Action::AddTrack(NewTrack::Audio));
+    let (label, enabled) = undo(&h);
+    assert!(enabled && label.starts_with("Undo “"), "{label}");
+
+    // Track offers effects for the selected track, and Transport shows
+    // whether the loop is on.
+    let menus = menu::menus(&h.app);
+    let track = h.app.sel.track.expect("the new track is selected");
+    let name = h.project().track(track).expect("track").name.clone();
+    submenu(
+        menu_entries(&menus, "Track"),
+        &format!("Add effect to {name}"),
+    );
+    let looping = menu_entries(&menus, "Transport").iter().any(|e| {
+        matches!(e, menu::Entry::Item(it) if it.label == "Loop"
+            && it.checked == Some(h.project().loop_enabled))
+    });
+    assert!(looping);
+
+    // Every item runs without trouble.
+    fn actions(entries: &[menu::Entry], out: &mut Vec<Action>) {
+        for e in entries {
+            match e {
+                menu::Entry::Item(it) => out.push(it.action.clone()),
+                menu::Entry::Sub(_, list) => actions(list, out),
+                _ => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    for m in menu::menus(&h.app) {
+        actions(&m.entries, &mut all);
+    }
+    assert!(all.len() > 40, "{} items", all.len());
+    for action in all {
+        // Loading sounds would read sample packs over the network.
+        if action == Action::LoadSounds {
+            continue;
+        }
+        h.run(action);
+        h.wait_jobs();
+        h.app.dialogs = Default::default();
+        h.app.palette.close();
+        h.app.about = false;
+    }
+    h.ctx.set_zoom_factor(1.0);
+    h.every_tab();
 }

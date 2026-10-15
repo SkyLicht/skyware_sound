@@ -6,7 +6,7 @@ use egui::{
     Sense, Shape, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType, pos2, vec2,
 };
 
-use crate::actions::{self, NewTrack};
+use crate::actions;
 use crate::app::{Action, App, Tab};
 use crate::theme;
 
@@ -268,44 +268,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
 
         ui.separator();
 
-        // Project menu, save and export.
-        ui.menu_button("Project", |ui| {
-            let items = [
-                ("New empty project", Action::NewEmpty),
-                ("New demo project", Action::NewDemo),
-                ("New techno loop", Action::NewTechno),
-                ("New acid loop", Action::NewAcid),
-                ("Open project…", Action::Open),
-                ("Save as…", Action::SaveAs),
-                ("Import audio…", Action::ImportAudio),
-                ("Add a folder to the browser…", Action::AddBrowserFolder),
-                ("Game assets…", Action::GameAssets),
-            ];
-            for (label, action) in items {
-                if ui.button(label).clicked() {
-                    wanted.push(action);
-                }
-            }
-            ui.separator();
-            for kind in NewTrack::ALL {
-                if ui
-                    .button(format!("Add {} track", kind.label().to_lowercase()))
-                    .clicked()
-                {
-                    wanted.push(Action::AddTrack(kind));
-                }
-            }
-            ui.separator();
-            if ui.button("Audio settings…").clicked() {
-                wanted.push(Action::OpenSettings);
-            }
-            if ui.button("Command palette (Ctrl+K)").clicked() {
-                wanted.push(Action::OpenPalette);
-            }
-            if ui.button("Quit").clicked() {
-                wanted.push(Action::Quit);
-            }
-        });
+        // Save and export; the rest is in the menu bar.
         let save_text = if app.view.dirty { "Save •" } else { "Save" };
         let save_tip = match &app.view.path {
             Some(p) => format!("Save to {} (Ctrl+S)", p.display()),
@@ -354,7 +317,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
                 wanted.push(Action::OpenPalette);
             }
             if ui.available_width() > 50.0 && ai_indicator(app, ui).clicked() {
-                app.tab = Tab::Ai;
+                app.workspace.show(Tab::Ai);
             }
             engine_health(app, ui);
         });
