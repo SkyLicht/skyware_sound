@@ -277,6 +277,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
                 ("Open project…", Action::Open),
                 ("Save as…", Action::SaveAs),
                 ("Import audio…", Action::ImportAudio),
+                ("Add a folder to the browser…", Action::AddBrowserFolder),
                 ("Game assets…", Action::GameAssets),
             ];
             for (label, action) in items {

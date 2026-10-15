@@ -38,6 +38,10 @@ struct Harness {
     screen: Rect,
     /// The audio-thread end of the engine, run by hand, when there is one.
     engine: Option<sky_engine::Engine>,
+    /// Files dropped on the window in the next frame.
+    dropped: Vec<egui::DroppedFileHandle>,
+    /// Files held over the window.
+    hovered: Vec<egui::HoveredFile>,
 }
 
 impl Harness {
@@ -63,6 +67,8 @@ impl Harness {
             modifiers: Modifiers::NONE,
             screen: Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0)),
             engine,
+            dropped: Vec::new(),
+            hovered: Vec::new(),
         };
         h.frames(3);
         h
@@ -105,6 +111,8 @@ impl Harness {
             screen_rect: Some(self.screen),
             time: Some(self.time),
             events: std::mem::take(&mut self.events),
+            dropped_files: std::mem::take(&mut self.dropped),
+            hovered_files: self.hovered.clone(),
             ..RawInput::default()
         };
         let app = &mut self.app;
@@ -198,6 +206,15 @@ impl Harness {
     fn type_text(&mut self, text: &str) {
         self.events.push(Event::Text(text.to_string()));
         self.frame();
+    }
+
+    /// Marks the known sample packs as unreadable, so a search in the
+    /// browser does not go to the network for them.
+    fn offline_packs(&mut self) {
+        for info in sky_library::PACKS {
+            self.app
+                .browser_pack_read(info.map.to_string(), Err("not read in tests".into()));
+        }
     }
 
     /// Waits for background jobs and hands their results to the app.
@@ -1416,6 +1433,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("arrange.rs"),
         include_str!("audio.rs"),
         include_str!("audition.rs"),
+        include_str!("browser.rs"),
         include_str!("dialogs.rs"),
         include_str!("game.rs"),
         include_str!("jobs.rs"),
@@ -1833,4 +1851,387 @@ fn the_loop_region_and_pack_sounds_are_heard_before_export_or_load() {
     h.heard();
     h.heard();
     assert_eq!(h.app.session.previewing(), None);
+}
+
+#[derive(Debug)]
+struct TestFile(std::path::PathBuf);
+
+impl egui::DroppedFile for TestFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+fn tone_file(path: &Path, seconds: f32) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).expect("folder");
+    }
+    let frames = (seconds * 48_000.0) as usize;
+    let tone: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.06).sin() * 0.5).collect();
+    let audio = AudioData {
+        sample_rate: 48_000,
+        channels: vec![tone],
+    };
+    sky_io::write_wav(path, &audio, sky_io::WavFormat::Pcm16, false).expect("write wav");
+}
+
+/// A point in a track's lane at `tick`.
+fn lane_point(h: &Harness, track: sky_core::TrackId, tick: i64) -> Pos2 {
+    let (_, lane) = h
+        .app
+        .arrange
+        .lanes
+        .iter()
+        .find(|(t, _)| *t == track)
+        .expect("the track has a lane");
+    pos2(h.app.arrange.x_of(tick as f64), lane.center().y)
+}
+
+#[test]
+fn the_browser_lists_plays_and_drops_folder_samples() {
+    use crate::browser::{Item, item_id, row_id};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let samples = dir.path().join("samples");
+    let kick = samples.join("kicks").join("kick 909.wav");
+    let snare = samples.join("snare.wav");
+    tone_file(&kick, 0.5);
+    tone_file(&snare, 0.25);
+    tone_file(&samples.join(".hidden").join("skip.wav"), 0.1);
+    std::fs::write(samples.join("readme.txt"), "not audio").expect("text");
+
+    let mut project = empty_project("Browse");
+    project.tracks.push(Track::new_audio("Vox"));
+    project
+        .tracks
+        .push(Track::new_instrument("Lead", InstrumentType::Synth));
+    let mut h = Harness::with_engine(project);
+    h.offline_packs();
+    let vox = h.track_named("Vox").id;
+    let lead = h.track_named("Lead").id;
+
+    // A folder is looked through in the background, leaving out hidden
+    // folders and files that are not audio.
+    assert!(h.app.browser.add_folder(samples.clone()));
+    assert!(!h.app.browser.add_folder(samples.clone()), "only once");
+    h.frames(2);
+    h.wait_jobs();
+    let index = h.app.browser.folder_index(&samples).expect("indexed");
+    // A folder's own files come before its subfolders'.
+    assert_eq!(index.all, [snare.clone(), kick.clone()]);
+    let kick_item = Item::File(kick.clone());
+    let snare_item = Item::File(snare.clone());
+    assert!(
+        h.ctx.read_response(item_id(&kick_item)).is_none(),
+        "the subfolder starts closed"
+    );
+
+    // Clicking a sample plays it, and changes nothing.
+    let history = h.history_len();
+    let snare_row = h.rect_of(item_id(&snare_item)).center();
+    h.click(snare_row);
+    assert_eq!(h.app.browser.selected.as_ref(), Some(&snare_item));
+    h.wait_jobs();
+    assert!(h.heard() > 0.1, "the sample plays");
+    assert_eq!(h.history_len(), history);
+    h.app.stop_preview();
+    h.quiet();
+
+    // Opening the subfolder shows its file; a search finds it too.
+    let kicks = row_id(&crate::browser::folder_key(&samples.join("kicks")));
+    h.click(h.rect_of(kicks).center());
+    assert!(h.ctx.read_response(item_id(&kick_item)).is_some());
+    h.click(h.rect_of(kicks).center());
+    h.app.browser.search = "909".into();
+    h.frames(2);
+    assert!(h.ctx.read_response(item_id(&kick_item)).is_some());
+    assert!(h.ctx.read_response(item_id(&snare_item)).is_none());
+
+    // Dragged onto Vox at bar 3, it lands there as one undo step.
+    let bar = h.project().ticks_per_bar();
+    let from = h.rect_of(item_id(&kick_item)).center();
+    let to = lane_point(&h, vox, bar * 2);
+    h.drag(from, to);
+    h.wait_jobs();
+    let p = h.project();
+    let clips = &p.track(vox).expect("vox").clips;
+    assert_eq!(clips.len(), 1);
+    assert_eq!(clips[0].start, bar * 2);
+    assert_eq!(clips[0].name, "kick 909");
+    assert_eq!(h.app.sel.clip, Some(clips[0].id));
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(p.audio_pool.len(), 1);
+
+    // A synth takes no audio: nothing changes, and it says why.
+    let from = h.rect_of(item_id(&kick_item)).center();
+    let to = lane_point(&h, lead, 0);
+    h.drag(from, to);
+    h.wait_jobs();
+    assert_eq!(h.history_len(), history + 1);
+    let notice = h.app.notice.as_ref().expect("a notice");
+    assert!(
+        notice.error && notice.text.contains("Lead plays"),
+        "{}",
+        notice.text
+    );
+
+    // Below the tracks, it goes on a new audio track.
+    h.app.browser.search.clear();
+    h.frames(2);
+    let from = h.rect_of(item_id(&snare_item)).center();
+    let below = h
+        .app
+        .arrange
+        .lanes
+        .iter()
+        .map(|(_, r)| r.bottom())
+        .fold(0.0, f32::max)
+        + 30.0;
+    h.drag(from, pos2(lane_point(&h, vox, 0).x, below));
+    h.wait_jobs();
+    let p = h.project();
+    assert_eq!(p.tracks.len(), 3);
+    assert_eq!(p.tracks[2].name, "snare");
+    assert_eq!(p.tracks[2].clips[0].start, 0);
+
+    // Project audio is listed too; a double-click adds it where Import
+    // audio would: on the selected audio track, at the playhead's bar.
+    let pool_item = Item::Pool(p.audio_pool[0].id);
+    h.app.sel.select_track(vox);
+    h.frames(2);
+    h.double_click(h.rect_of(item_id(&pool_item)).center());
+    h.wait_jobs();
+    let p = h.project();
+    assert_eq!(p.track(vox).expect("vox").clips.len(), 2);
+    assert_eq!(p.audio_pool.len(), 2, "pool audio is used again");
+
+    // A search looks inside folders that were never opened.
+    let more = dir.path().join("more");
+    let hat = more.join("open hat.wav");
+    tone_file(&hat, 0.1);
+    h.app.browser.add_folder(more.clone());
+    h.app
+        .browser
+        .set_expanded(&crate::browser::folder_key(&more), false);
+    h.frames(2);
+    assert!(h.app.browser.folder_index(&more).is_none());
+    h.app.browser.search = "hat".into();
+    h.frames(2);
+    h.wait_jobs();
+    assert!(
+        h.ctx
+            .read_response(item_id(&Item::File(hat.clone())))
+            .is_some()
+    );
+    h.app.browser.search.clear();
+
+    // Removing the folder forgets it.
+    h.app.browser.remove_folder(&samples);
+    h.frames(2);
+    assert!(h.ctx.read_response(item_id(&snare_item)).is_none());
+}
+
+#[test]
+fn browser_pack_sounds_play_and_drop_into_a_sample_bank() {
+    use crate::browser::{Item, PackListing, item_id, pack_key, row_id};
+    use sky_library::{Library, PACKS, PackSource};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let folder = dir.path().join("kit");
+    write_pack(&folder);
+    let mut project = empty_project("Packs");
+    project
+        .tracks
+        .push(Track::new_instrument("Drums", InstrumentType::Bank));
+    let mut h = Harness::with_engine(project);
+    let drums = h.track_named("Drums").id;
+    let library = Library::new(dir.path().join("cache"));
+    h.app.session.set_library(library.clone());
+    h.offline_packs();
+
+    // Stand the local pack in for the first known one, as if read.
+    let info = &PACKS[0];
+    let pack = library
+        .open(&PackSource::parse(
+            &folder.to_string_lossy(),
+            Some(License::Cc0),
+        ))
+        .expect("pack");
+    h.app.browser_pack_read(
+        info.map.to_string(),
+        Ok(Arc::new(PackListing::new(Arc::new(pack)))),
+    );
+    h.app.browser.set_expanded(&pack_key(info), true);
+    h.app
+        .browser
+        .set_expanded(&crate::browser::bank_key(info, "Kit"), true);
+    h.frames(2);
+    assert!(h.ctx.read_response(row_id(&pack_key(info))).is_some());
+    let bd = Item::PackSound {
+        map: info.map.to_string(),
+        bank: Some("Kit".into()),
+        sound: "bd".into(),
+    };
+    let keys = Item::PackSound {
+        map: info.map.to_string(),
+        bank: None,
+        sound: "keys".into(),
+    };
+    assert!(h.ctx.read_response(item_id(&keys)).is_some());
+
+    h.click(h.rect_of(item_id(&bd)).center());
+    h.wait_jobs();
+    assert!(h.heard() > 0.01, "the pack sound plays");
+    h.app.stop_preview();
+    h.quiet();
+
+    // Onto the bank's header: a sound named after it, from the pack.
+    let header = h
+        .app
+        .arrange
+        .lanes
+        .iter()
+        .find(|(t, _)| *t == drums)
+        .map(|(_, r)| pos2(r.left() - 40.0, r.center().y))
+        .expect("drums lane");
+    h.drag(h.rect_of(item_id(&bd)).center(), header);
+    h.wait_jobs();
+    let p = h.project();
+    let bank = p
+        .track(drums)
+        .expect("drums")
+        .instrument
+        .as_ref()
+        .and_then(|i| i.bank.clone())
+        .expect("a bank");
+    assert_eq!(bank.sounds["bd"].len(), 1);
+    let source = p.audio_pool[0].source.clone().expect("credited");
+    assert_eq!(source.license, License::Cc0);
+    assert_eq!(h.app.tab, Tab::Instrument);
+
+    // "Load this bank…" opens Load sounds on it, for the selected bank,
+    // without reading the pack again.
+    let ctx = h.ctx();
+    h.app.open_load_sounds_on(&ctx, info, Some("Kit"));
+    h.frames(2);
+    let d = h
+        .app
+        .dialogs
+        .load_sounds
+        .as_ref()
+        .expect("Load sounds opens");
+    assert_eq!(d.track, Some(drums));
+    assert_eq!(d.pack, Some(0));
+    assert_eq!(d.bank.as_deref(), Some("Kit"));
+    assert_eq!(d.reading, None);
+    assert_eq!(d.offered().len(), 3);
+    h.app.dialogs.load_sounds = None;
+
+    // Searching finds sounds inside a pack that has been read.
+    h.app.browser.search = "kit sd".into();
+    h.frames(2);
+    let sd = Item::PackSound {
+        map: info.map.to_string(),
+        bank: Some("Kit".into()),
+        sound: "sd".into(),
+    };
+    assert!(h.ctx.read_response(item_id(&sd)).is_some());
+    assert!(h.ctx.read_response(item_id(&keys)).is_none());
+}
+
+#[test]
+fn files_dropped_on_the_window_come_in() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let one = dir.path().join("loop.wav");
+    let two = dir.path().join("hit.wav");
+    let three = dir.path().join("riser.flac.txt");
+    tone_file(&one, 0.5);
+    tone_file(&two, 0.1);
+    std::fs::write(&three, "text").expect("text");
+    let folder = dir.path().join("more");
+    std::fs::create_dir_all(&folder).expect("folder");
+    let mut h = Harness::with_project(empty_project("Drops"));
+    let drop = |h: &mut Harness, paths: &[&Path]| {
+        h.dropped = paths
+            .iter()
+            .map(|p| Arc::new(TestFile(p.to_path_buf())) as egui::DroppedFileHandle)
+            .collect();
+        h.frame();
+        h.wait_jobs();
+    };
+
+    // Held over the window: a note says what dropping does.
+    h.hovered = vec![egui::HoveredFile::default()];
+    h.frames(2);
+    h.hovered.clear();
+
+    // One file goes on a new track, as Import audio would put it.
+    drop(&mut h, &[&one]);
+    let p = h.project();
+    assert_eq!(p.tracks.len(), 1);
+    assert_eq!(p.tracks[0].name, "loop");
+    let notice = h.app.notice.as_ref().expect("a notice");
+    assert_eq!(notice.text, "Added loop on a new track");
+    let history = h.history_len();
+
+    // Several go into the project's audio as one step; a folder joins the
+    // browser; anything else is turned away.
+    drop(&mut h, &[&one, &two, &folder, &three]);
+    let p = h.project();
+    assert_eq!(p.audio_pool.len(), 3);
+    assert_eq!(p.tracks.len(), 1);
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(h.app.browser.folders, [folder]);
+    let notice = h.app.notice.as_ref().expect("a notice");
+    assert!(
+        notice.text.starts_with("Imported 2 files"),
+        "{}",
+        notice.text
+    );
+    assert!(
+        notice.text.contains("Not riser.flac.txt"),
+        "{}",
+        notice.text
+    );
+    h.app.session.undo().expect("undo");
+    assert_eq!(h.project().audio_pool.len(), 1);
+
+    // A strudel.json opens Load sounds on its pack.
+    let pack = dir.path().join("pack");
+    write_pack(&pack);
+    drop(&mut h, &[&pack.join("strudel.json")]);
+    let d = h
+        .app
+        .dialogs
+        .load_sounds
+        .as_ref()
+        .expect("Load sounds opens");
+    assert_eq!(d.pack, None);
+    assert!(d.address.ends_with("strudel.json"));
+    assert!(d.listing.as_ref().is_some_and(|l| l.pack.is_ok()));
+}
+
+#[test]
+fn the_browser_keeps_its_folders_between_runs() {
+    use crate::browser::BrowserState;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = dir.path().join("config").join("browser-folders.txt");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let mut first = BrowserState::new(Some(store.clone()));
+    assert!(first.folders.is_empty());
+    first.add_folder(a.clone());
+    first.add_folder(b.clone());
+    assert_eq!(
+        BrowserState::new(Some(store.clone())).folders,
+        [a.clone(), b]
+    );
+    first.remove_folder(&dir.path().join("b"));
+    assert_eq!(BrowserState::new(Some(store)).folders, [a]);
+    assert!(BrowserState::new(None).folders.is_empty());
 }

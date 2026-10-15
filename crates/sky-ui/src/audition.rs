@@ -21,6 +21,7 @@ use sky_model::{GameAssetKind, Track};
 use sky_session::{PreviewOptions, SessionError};
 
 use crate::app::App;
+use crate::browser::Item;
 use crate::jobs::JobOutput;
 use crate::theme;
 
@@ -48,6 +49,8 @@ pub enum PreviewKey {
     LoopRegion { join: bool },
     /// A sound of the pack in the Load sounds dialog.
     PackSound(String),
+    /// Something in the browser.
+    Browser(Item),
 }
 
 /// Audio rendered or fetched to be heard.
@@ -360,6 +363,49 @@ impl App {
                     })
                 })
             }
+            PreviewKey::Browser(item) => match item {
+                Item::Pool(id) => {
+                    let Some(audio) = session.audio(*id) else {
+                        self.error("That audio is no longer in the project");
+                        return;
+                    };
+                    // Already decoded: no need for a job.
+                    let rendered = Rendered {
+                        audio: vec![audio],
+                        loop_start: None,
+                        revision,
+                    };
+                    self.audition.pending = Some(key.clone());
+                    self.preview_ready(key, Ok(rendered));
+                    return;
+                }
+                Item::File(path) => {
+                    let path = path.clone();
+                    Box::new(move || {
+                        let audio = sky_io::read_audio(&path).map_err(|e| e.to_string())?;
+                        Ok(Rendered {
+                            audio: vec![Arc::new(audio)],
+                            loop_start: None,
+                            revision,
+                        })
+                    })
+                }
+                Item::PackSound { map, bank, sound } => {
+                    let Some((pack, file)) = self.browser.pack_file(map, bank.as_deref(), sound)
+                    else {
+                        return;
+                    };
+                    let library = self.session.library();
+                    Box::new(move || {
+                        let audio = library.fetch(&pack, &file)?;
+                        Ok(Rendered {
+                            audio: vec![Arc::new(audio)],
+                            loop_start: None,
+                            revision,
+                        })
+                    })
+                }
+            },
         };
         self.audition.pending = Some(key.clone());
         self.jobs.spawn(ctx, None, move || JobOutput::Previewed {
@@ -487,6 +533,7 @@ impl App {
             PreviewKey::GameLoop { .. } | PreviewKey::GameSfx(_) => self.dialogs.game.is_some(),
             PreviewKey::LoopRegion { .. } => self.dialogs.export_loop.is_some(),
             PreviewKey::PackSound(_) => self.dialogs.load_sounds.is_some(),
+            PreviewKey::Browser(_) => self.browser.open,
         };
         let orphaned = self
             .audition

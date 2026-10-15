@@ -11,7 +11,7 @@ use egui::{
 use sky_core::{ClipId, NoteId, ProjectId, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::templates::{demo_project, empty_project, techno_project};
-use sky_model::{ChannelRef, ClipContent, Origin, Project, TrackKind};
+use sky_model::{ChannelRef, ClipContent, Project};
 use sky_session::{ProjectView, Session, TransportState};
 
 use crate::actions::{self, NewTrack};
@@ -19,6 +19,7 @@ use crate::ai_panel::AiState;
 use crate::arrange::ArrangeState;
 use crate::audio::AudioState;
 use crate::audition::Audition;
+use crate::browser::BrowserState;
 use crate::dialogs::{Confirm, Dialogs, PathPurpose};
 use crate::jobs::{JobOutput, Jobs};
 use crate::mixer::MixerState;
@@ -49,6 +50,10 @@ pub enum Action {
     /// Load sounds from a sample pack into the selected sample bank, or a
     /// new one.
     LoadSounds,
+    /// Show or hide the browser.
+    ToggleBrowser,
+    /// Add a folder of samples to the browser.
+    AddBrowserFolder,
     ExportLoop,
     ExportWav,
     /// The Game assets window: loops and SFX sets for a game, and their
@@ -161,6 +166,7 @@ pub struct App {
     pub mixer: MixerState,
     pub ai: AiState,
     pub audition: Audition,
+    pub browser: BrowserState,
     pub palette: PaletteState,
     pub dialogs: Dialogs,
     pub jobs: Jobs,
@@ -197,6 +203,7 @@ impl App {
             mixer: MixerState::default(),
             ai: AiState::new(&view),
             audition: Audition::default(),
+            browser: BrowserState::new(config.browser_store),
             palette: PaletteState::default(),
             dialogs: Dialogs::default(),
             jobs: Jobs::default(),
@@ -259,6 +266,7 @@ impl App {
         let ctx = ui.ctx().clone();
         self.begin_frame(&ctx);
         self.shortcuts(&ctx);
+        self.take_dropped_files(&ctx);
 
         Panel::top("transport")
             .frame(
@@ -283,6 +291,18 @@ impl App {
                     .inner_margin(Margin::symmetric(10, 3)),
             )
             .show(ui, |ui| self.status_bar(ui));
+        if self.browser.open {
+            Panel::left("browser")
+                .resizable(true)
+                .default_size(260.0)
+                .size_range(180.0..=480.0)
+                .frame(
+                    Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(Margin::symmetric(6, 6)),
+                )
+                .show(ui, |ui| crate::browser::panel(self, ui));
+        }
         // Leave the arrangement room for a few tracks in a small window.
         let height = ui.available_height();
         Panel::bottom("editor")
@@ -302,6 +322,7 @@ impl App {
         crate::mixer::effect_window(self, &ctx);
         crate::dialogs::show(self, &ctx);
         crate::palette::show(self, &ctx);
+        crate::browser::overlays(self, &ctx);
         self.end_frame(&ctx);
     }
 
@@ -407,6 +428,9 @@ impl App {
             if i.consume_shortcut(&cmd(Key::O)) {
                 wanted.push(Action::Open);
             }
+            if i.consume_shortcut(&cmd(Key::B)) {
+                wanted.push(Action::ToggleBrowser);
+            }
             if text_focus {
                 return;
             }
@@ -483,6 +507,8 @@ impl App {
                 });
                 self.open_load_sounds(bank_track);
             }
+            Action::ToggleBrowser => self.browser.open = !self.browser.open,
+            Action::AddBrowserFolder => self.request_path(ctx, PathPurpose::BrowseFolder),
             Action::ExportLoop => self.open_export_loop(),
             Action::ExportWav => self.open_export_wav(),
             Action::GameAssets => self.open_game_assets(),
@@ -615,13 +641,10 @@ impl App {
                 }
                 Err(e) => self.error(format!("Open failed: {e}")),
             },
-            JobOutput::Imported { name, result } => match result {
-                Ok(id) => {
-                    self.refresh();
-                    self.place_imported(id, &name);
-                }
-                Err(e) => self.error(format!("Import failed: {e}")),
-            },
+            JobOutput::Placed { name, result } => self.audio_placed(&name, result),
+            JobOutput::FilesImported(result) => self.files_imported(result),
+            JobOutput::BrowserPack { map, result } => self.browser_pack_read(map, result),
+            JobOutput::FolderIndexed { path, result } => self.folder_indexed(path, result),
             JobOutput::LoopExported(result) => {
                 if let Some(d) = self.dialogs.export_loop.as_mut() {
                     d.running = false;
@@ -656,65 +679,6 @@ impl App {
             JobOutput::BankLoaded(result) => self.bank_loaded(result),
             JobOutput::Previewed { key, result } => self.preview_ready(key, result),
         }
-    }
-
-    /// Puts freshly imported audio where it is most likely wanted: on the
-    /// selected audio track, into the selected sampler, or on a new track.
-    fn place_imported(&mut self, id: sky_core::AudioId, name: &str) {
-        let project = self.view.project.clone();
-        let bar = project.ticks_per_bar().max(1);
-        let start = (self.transport.position_ticks.max(0.0) as i64 / bar) * bar;
-        let selected = self.sel.track.and_then(|t| project.track(t).ok());
-        match selected {
-            Some(t) if t.kind == TrackKind::Audio => {
-                let r = actions::add_audio_clip(&self.session, t.id, start, id);
-                if let Some(clip) = self.report(r) {
-                    self.sel.select_clip(t.id, clip);
-                }
-            }
-            Some(t)
-                if t.instrument
-                    .as_ref()
-                    .is_some_and(|i| i.kind == InstrumentType::Sampler) =>
-            {
-                if let Some(mut slot) = t.instrument.clone() {
-                    slot.sample = Some(id);
-                    let r = actions::set_instrument(
-                        &self.session,
-                        t.id,
-                        slot,
-                        &format!("Load {name} into sampler"),
-                    );
-                    self.report(r);
-                }
-            }
-            _ => {
-                let mut track =
-                    sky_model::Track::new_audio(actions::unique_track_name(&project, name));
-                track.color = [86, 156, 214];
-                let track_id = track.id;
-                let r = actions::apply(
-                    &self.session,
-                    sky_model::Transaction::new(
-                        format!("Add track for {name}"),
-                        Origin::User,
-                        vec![sky_model::Command::AddTrack {
-                            track: Box::new(track),
-                            index: None,
-                        }],
-                    ),
-                    None,
-                );
-                if self.report(r).is_some() {
-                    let r = actions::add_audio_clip(&self.session, track_id, start, id);
-                    if let Some(clip) = self.report(r) {
-                        self.sel.select_clip(track_id, clip);
-                    }
-                }
-            }
-        }
-        self.info(format!("Imported {name}"));
-        self.refresh();
     }
 
     fn audio_lost_banner(&mut self, ui: &mut Ui) {
