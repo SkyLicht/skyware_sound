@@ -48,6 +48,18 @@ fn the_techno_loop_passes_every_check() {
     assert_eq!(check.frames, 360_000);
 }
 
+/// The phase 2 gate: a 12-step Acid bass line with accents and slides over
+/// a 16-step beat, made only of step clips and without samples, exports
+/// and loops.
+#[test]
+fn the_acid_loop_passes_every_check() {
+    let (session, _) = Session::new(sky_model::templates::acid_project(), None);
+    let check = check_loop(&session, &LoopOptions::default()).unwrap();
+    let failed: Vec<_> = check.checks.iter().filter(|c| !c.passed).collect();
+    assert!(check.passed, "{failed:#?}");
+    assert_eq!(check.frames, 360_000);
+}
+
 #[test]
 fn without_a_folder_the_export_is_cleaned_up() {
     let (session, _) = Session::new(check_project(4), None);

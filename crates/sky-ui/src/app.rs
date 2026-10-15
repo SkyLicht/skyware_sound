@@ -10,7 +10,7 @@ use egui::{
 };
 use sky_core::{ClipId, NoteId, ProjectId, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
-use sky_model::templates::{demo_project, empty_project, techno_project};
+use sky_model::templates::{acid_project, demo_project, empty_project, techno_project};
 use sky_model::{ChannelRef, ClipContent, Origin, Project, TrackKind};
 use sky_session::{ProjectView, Session, TransportState};
 
@@ -24,6 +24,7 @@ use crate::mixer::MixerState;
 use crate::palette::PaletteState;
 use crate::pattern_editor::PatternState;
 use crate::piano_roll::PianoState;
+use crate::step_editor::StepState;
 use crate::waveform::{Peaks, WaveformCache};
 use crate::widgets::Gestures;
 use crate::{McpInfo, UiConfig, theme};
@@ -41,6 +42,7 @@ pub enum Action {
     NewEmpty,
     NewDemo,
     NewTechno,
+    NewAcid,
     Open,
     Save,
     SaveAs,
@@ -157,6 +159,7 @@ pub struct App {
     pub arrange: ArrangeState,
     pub piano: PianoState,
     pub pattern: PatternState,
+    pub steps: StepState,
     pub mixer: MixerState,
     pub ai: AiState,
     pub palette: PaletteState,
@@ -192,6 +195,7 @@ impl App {
             arrange: ArrangeState::default(),
             piano: PianoState::default(),
             pattern: PatternState::default(),
+            steps: StepState::default(),
             mixer: MixerState::default(),
             ai: AiState::new(&view),
             palette: PaletteState::default(),
@@ -449,6 +453,7 @@ impl App {
             Action::NewEmpty
             | Action::NewDemo
             | Action::NewTechno
+            | Action::NewAcid
             | Action::Open
             | Action::Quit => {
                 if self.view.dirty && !(action == Action::Quit && self.allow_close) {
@@ -511,6 +516,7 @@ impl App {
             Action::NewEmpty => self.session.new_project(empty_project("Untitled")),
             Action::NewDemo => self.session.new_project(demo_project()),
             Action::NewTechno => self.session.new_project(techno_project()),
+            Action::NewAcid => self.session.new_project(acid_project()),
             Action::Open => self.request_path(ctx, PathPurpose::OpenProject),
             Action::Quit => {
                 self.allow_close = true;

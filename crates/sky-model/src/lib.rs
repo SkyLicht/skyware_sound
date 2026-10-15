@@ -13,6 +13,7 @@ pub mod history;
 pub mod licenses;
 pub mod notes;
 pub mod project;
+pub mod steps;
 pub mod summary;
 pub mod templates;
 
@@ -21,3 +22,4 @@ pub use error::ModelError;
 pub use history::{Applied, History, Origin, Transaction};
 pub use licenses::{LicenseReport, license_report};
 pub use project::*;
+pub use steps::{Condition, Step, StepClip, StepKind, StepLane};

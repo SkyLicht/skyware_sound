@@ -68,7 +68,7 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
 }
 
 #[inline]
-fn oscillator(wave: u8, phase: f32, dt: f32) -> f32 {
+pub(crate) fn oscillator(wave: u8, phase: f32, dt: f32) -> f32 {
     match wave {
         1 => {
             let naive = if phase < 0.5 { 1.0 } else { -1.0 };

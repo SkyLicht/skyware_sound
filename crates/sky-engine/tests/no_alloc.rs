@@ -65,6 +65,28 @@ fn processing_never_allocates() {
         content: ClipContent::pattern("bd*16", 0, project.ticks_per_bar()),
     });
     project.tracks.push(bank);
+    // Step clips with locks, ratchets and slides, on drums and the Acid.
+    let bar = project.ticks_per_bar();
+    let mut beat = sky_model::StepLane::parse(42, "x*4 x?50 x@1:2 x>20").unwrap();
+    sky_model::steps::parse_locks(&mut beat.steps, "hat_decay", "0.5 . 2 .").unwrap();
+    project.tracks[0].clips.push(Clip {
+        id: ClipId::new(),
+        name: "s".into(),
+        start: 0,
+        length: bar,
+        content: ClipContent::Steps(sky_model::StepClip::new(16, vec![beat])),
+    });
+    let mut acid = Track::new_instrument("Acid", InstrumentType::Acid);
+    let mut line = sky_model::StepLane::parse(36, "c2/ g2! - c3/ . c2*3 d#2 x").unwrap();
+    sky_model::steps::parse_locks(&mut line.steps, "cutoff", "200 . . 2000 . . . .").unwrap();
+    acid.clips.push(Clip {
+        id: ClipId::new(),
+        name: "a".into(),
+        start: 0,
+        length: bar,
+        content: ClipContent::Steps(sky_model::StepClip::new(16, vec![line])),
+    });
+    project.tracks.push(acid);
     let (mut handle, mut engine) = create_engine(compile(&project, &cache, 48_000, 1));
     let mut out = vec![0.0f32; 2 * 1_024];
     handle.send(EngineMsg::Play);
