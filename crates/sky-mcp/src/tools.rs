@@ -343,20 +343,13 @@ fn wav_format(bits: Option<u16>) -> Result<WavFormat, String> {
 }
 
 fn category(name: Option<&str>) -> Result<Category, String> {
-    Ok(
-        match name.unwrap_or("music").to_ascii_lowercase().as_str() {
-            "music" => Category::Music,
-            "sfx" => Category::Sfx,
-            "ui" => Category::Ui,
-            "voice" => Category::Voice,
-            "ambience" => Category::Ambience,
-            other => {
-                return Err(format!(
-                    "category {other:?} is not one of music, sfx, ui, voice, ambience"
-                ));
-            }
-        },
-    )
+    let name = name.unwrap_or("music");
+    Category::parse(name).ok_or_else(|| {
+        format!(
+            "category {name:?} is not one of {}",
+            names(Category::ALL.iter().map(|c| c.name()))
+        )
+    })
 }
 
 fn selection(name: &str) -> Result<Selection, String> {
@@ -2180,20 +2173,16 @@ impl SkywareMcp {
                     .collect::<Result<Option<Vec<_>>, _>>()?
                     .unwrap_or_default(),
                 (None, Some(r)) => r.split(a.count.unwrap_or(1)),
-                (None, None) => match (a.count, old_variations.first(), old_variations.last()) {
-                    (Some(n), Some(first), Some(last)) => TimeRange {
-                        start: first.start,
-                        end: last.end,
-                    }
-                    .split(n),
-                    (_, None, _) | (_, _, None) => {
+                (None, None) => match (a.count, TimeRange::covering(&old_variations)) {
+                    (Some(n), Some(span)) => span.split(n),
+                    (_, None) => {
                         return Err(
                             "give start_bar and end_bar (and count), or variations, for \
                                     the bars the SFX set is rendered from"
                                 .into(),
                         );
                     }
-                    (None, _, _) => old_variations,
+                    (None, _) => old_variations,
                 },
             };
             GameAssetKind::Sfx {

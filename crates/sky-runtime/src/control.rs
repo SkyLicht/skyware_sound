@@ -218,12 +218,13 @@ impl Control {
                              asset: &str,
                              warnings: &mut Vec<LoadWarning>|
          -> Result<Arc<AudioData>, RuntimeError> {
-            let (path, audio) = match cache.get(&file.path) {
+            let key = cache_key(&file.path);
+            let (path, audio) = match cache.get(&key) {
                 Some((path, audio)) => (path.clone(), Arc::clone(audio)),
                 None => {
                     let (path, audio) = open(&file.path)?;
                     let audio = Arc::new(audio);
-                    cache.insert(file.path.clone(), (path.clone(), Arc::clone(&audio)));
+                    cache.insert(key, (path.clone(), Arc::clone(&audio)));
                     (path, audio)
                 }
             };
@@ -354,7 +355,10 @@ impl Control {
 
         let base_rate = f64::from(audio.sample_rate) / output_rate;
         let stereo = audio.right.is_some();
-        let rate = pitch_rate(params.pitch_semitones + pitch_offset, base_rate);
+        let rate = pitch_rate(
+            finite_or_zero(params.pitch_semitones) + pitch_offset,
+            base_rate,
+        );
         let pan = pan_gains(finite_or_zero(params.pan), stereo);
         let fade_in_frames = ms_to_frames(params.fade_in_ms, self.sample_rate);
 
@@ -379,7 +383,7 @@ impl Control {
                 audio,
                 region,
                 rate,
-                gain: db_to_amp(params.gain_db + gain_offset),
+                gain: db_to_amp(finite_or_zero(params.gain_db) + gain_offset),
                 fade_in_frames,
                 pan,
                 category,
@@ -444,7 +448,7 @@ impl Control {
         self.live(voice).map(|s| MixCommand::Gain {
             slot: voice.slot,
             generation: voice.generation,
-            amp: db_to_amp(gain_db + s.random_gain_db),
+            amp: db_to_amp(finite_or_zero(gain_db) + s.random_gain_db),
             frames: ms_to_frames(ramp_ms, self.sample_rate),
         })
     }
@@ -471,13 +475,13 @@ impl Control {
         self.live(voice).map(|s| MixCommand::Rate {
             slot: voice.slot,
             generation: voice.generation,
-            rate: pitch_rate(semitones + s.random_pitch, s.base_rate),
+            rate: pitch_rate(finite_or_zero(semitones) + s.random_pitch, s.base_rate),
         })
     }
 
     pub(crate) fn set_master_gain(&self, gain_db: f32) -> MixCommand {
         MixCommand::Master {
-            amp: db_to_amp(gain_db),
+            amp: db_to_amp(finite_or_zero(gain_db)),
             frames: ms_to_frames(MASTER_RAMP_MS, self.sample_rate),
         }
     }
@@ -631,6 +635,19 @@ fn resolve(base_dir: &Path, relative: &str) -> PathBuf {
     path
 }
 
+/// A manifest path spelled one way, so files listed as `sfx/hit.wav` and
+/// `./sfx\hit.wav` are read once.
+fn cache_key(relative: &str) -> String {
+    if Path::new(relative).is_absolute() {
+        return relative.to_string();
+    }
+    relative
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn sanitize_range(range: RandomRange) -> RandomRange {
     RandomRange::new(finite_or_zero(range.min), finite_or_zero(range.max))
 }
@@ -684,6 +701,13 @@ mod tests {
         assert!((pitch_rate(12.0, 0.5) - 1.0).abs() < 1e-12);
         assert_eq!(pitch_rate(f32::NAN, 2.0), 2.0);
         assert!((pitch_rate(1000.0, 1.0) - 16.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paths_spelled_differently_share_a_cache_key() {
+        assert_eq!(cache_key("./sfx\\hit.wav"), cache_key("sfx//hit.wav"));
+        assert_eq!(cache_key("sfx/hit.wav"), "sfx/hit.wav");
+        assert_ne!(cache_key("sfx/Hit.wav"), cache_key("sfx/hit.wav"));
     }
 
     #[test]

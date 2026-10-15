@@ -1310,6 +1310,34 @@ fn unique_names_and_new_tracks() {
 }
 
 #[test]
+fn opening_game_assets_changes_nothing() {
+    use crate::game;
+    use sky_core::manifest::RandomRange;
+    use sky_model::GameAssetKind;
+
+    let mut h = Harness::demo();
+    // Ranges the model takes but the window shows only roughly.
+    let mut hits = h.project().game.find("demo_hits").expect("hits").clone();
+    if let GameAssetKind::Sfx {
+        pitch_semitones,
+        gain_db,
+        ..
+    } = &mut hits.kind
+    {
+        *pitch_semitones = RandomRange::new(-24.0, 24.0);
+        *gain_db = RandomRange::new(1.0, 3.0);
+    }
+    assert!(game::update(&h.app.session, hits.clone(), None).is_ok());
+    let revision = h.app.session.view().revision;
+    let ctx = h.ctx();
+    h.app.run_action(&ctx, Action::GameAssets);
+    h.frames(3);
+    assert!(h.app.dialogs.game.is_some());
+    assert_eq!(h.app.session.view().revision, revision);
+    assert_eq!(h.project().game.find("demo_hits"), Some(&hits));
+}
+
+#[test]
 fn game_assets_are_added_edited_and_exported() {
     use crate::game;
     use sky_model::GameAssetKind;

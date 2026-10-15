@@ -91,6 +91,11 @@ pub fn render_loop(
 /// more, then keeps the intro from the first time through and the body from
 /// the second. The body repeats seamlessly, as with [`render_loop`]; the
 /// result is `loop_start - intro_start` intro frames followed by the body.
+///
+/// The body is what follows its own end, so a note held from the intro into
+/// the body is not in it. When the two differ, the last 20 ms of the intro
+/// cross-fade into the end of the body, so entering the body from the intro
+/// is as smooth as the loop point instead of a cut.
 pub fn render_intro_loop(
     mut snapshot: EngineSnapshot,
     intro_start: i64,
@@ -112,8 +117,24 @@ pub fn render_intro_loop(
     engine.process_planar(intro_l, intro_r);
     // The first time through the body, then the second, which is kept.
     engine.process_planar(body_l, body_r);
+    let fade = (sample_rate as usize / 50).min(intro).min(body);
+    let head = |ch: &[f32]| ch.iter().take(fade).copied().collect::<Vec<_>>();
+    let (entry_l, entry_r) = (head(body_l), head(body_r));
     engine.process_planar(body_l, body_r);
     let _ = engine.snapshot_mut();
+    let differs =
+        |entry: &[f32], kept: &[f32]| entry.iter().zip(kept).any(|(a, b)| (a - b).abs() > 1e-6);
+    if differs(&entry_l, body_l) || differs(&entry_r, body_r) {
+        for (intro, body) in [(&mut *intro_l, &*body_l), (&mut *intro_r, &*body_r)] {
+            let skip = intro.len() - fade;
+            let tail = intro.iter_mut().skip(skip);
+            let end = body.iter().skip(body.len() - fade);
+            for (k, (x, b)) in tail.zip(end).enumerate() {
+                let w = (k + 1) as f32 / fade as f32;
+                *x += (b - *x) * w;
+            }
+        }
+    }
     AudioData {
         sample_rate,
         channels: vec![left, right],

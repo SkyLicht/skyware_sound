@@ -131,6 +131,13 @@ impl GameCheck {
 /// `opts.seconds`. Fails only when the manifest cannot be read or names
 /// an asset that is not in it; everything else is a failed check.
 pub fn check_game(opts: &GameOptions) -> Result<GameCheck, String> {
+    const MAX_SECONDS: f64 = 24.0 * 3600.0;
+    if opts.seconds.is_nan() || opts.seconds > MAX_SECONDS {
+        return Err(format!(
+            "play for 0 to {MAX_SECONDS} seconds, not {}",
+            opts.seconds
+        ));
+    }
     let dir = &opts.dir;
     let manifest = sky_game::read_manifest(dir)
         .map_err(|e| e.to_string())?
@@ -817,6 +824,18 @@ mod tests {
         .unwrap();
         assert!(report.passed, "{}", report.lines().join("\n"));
         assert_eq!(report.loops, 1);
+    }
+
+    #[test]
+    fn endless_playing_times_are_refused() {
+        for seconds in [f64::INFINITY, f64::NAN, 1e20] {
+            let e = check_game(&GameOptions {
+                seconds,
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(e.contains("seconds"), "{e}");
+        }
     }
 
     #[test]

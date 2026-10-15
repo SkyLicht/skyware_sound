@@ -155,14 +155,17 @@ fn intro_loops_keep_the_intro_and_a_folded_body() {
     let (intro, start, end) = (0, bar, bar * 4);
     let out = render_intro_loop(compile(&p, &AudioCache::new(), SR, 1), intro, start, end);
     assert_eq!(out.frames(), end as usize);
-    // The intro is the arrangement played from its start.
+    // The intro is the arrangement played from its start, up to the short
+    // fade into the body.
     let plain = render(
         compile(&p, &AudioCache::new(), SR, 1),
         0,
         bar as usize,
         false,
     );
-    assert_eq!(&out.left()[..bar as usize], plain.left());
+    let fade = (SR / 50) as usize;
+    let before = bar as usize - fade;
+    assert_eq!(&out.left()[..before], &plain.left()[..before]);
     // The body is the second time through, so the pad's reverb from the end
     // of the loop already rings at its start.
     let from_silence = render(
@@ -174,6 +177,46 @@ fn intro_loops_keep_the_intro_and_a_folded_body() {
     let head = |a: &[f32]| a[..2_000].iter().fold(0.0f32, |m, s| m.max(s.abs()));
     assert!(head(&out.left()[bar as usize..]) > head(from_silence.left()));
     let seam = analysis::seam_check(&out, bar as usize, out.frames());
+    assert_eq!(seam.verdict, "seamless", "{seam:?}");
+}
+
+#[test]
+fn notes_held_into_the_body_do_not_cut_off_at_the_join() {
+    // A pad note from beat 3 of the intro bar to beat 2 of the body.
+    let mut p = Project::new("t");
+    p.loop_enabled = false;
+    let mut t = Track::new_instrument("Pad", InstrumentType::Synth);
+    t.clips.push(Clip {
+        id: ClipId::new(),
+        name: "c".into(),
+        start: 0,
+        length: PPQ * 16,
+        content: ClipContent::Midi {
+            notes: vec![Note::new(PPQ * 2, PPQ * 3, 57, 110)],
+        },
+    });
+    p.tracks.push(t);
+    let bar = p.tempo.tick_to_sample(p.ticks_per_bar(), SR);
+    let out = render_intro_loop(compile(&p, &AudioCache::new(), SR, 1), 0, bar, bar * 2);
+    let b = bar as usize;
+    let fade = (SR / 50) as usize;
+    let peak = |a: &[f32]| a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    for ch in [out.left(), out.right()] {
+        // The pad sounds up to the fade, and enters the body as smoothly
+        // as the body's own samples follow each other.
+        assert!(peak(&ch[b - fade - 480..b - fade]) > 0.01);
+        let typical = ch[b..b + 64]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        let jump = (ch[b] - ch[b - 1]).abs();
+        assert!(
+            jump <= typical * 2.0 + 1e-4,
+            "jump {jump}, typical {typical}"
+        );
+    }
+    // The body still repeats seamlessly.
+    let seam = analysis::seam_check(&out, b, out.frames());
     assert_eq!(seam.verdict, "seamless", "{seam:?}");
 }
 

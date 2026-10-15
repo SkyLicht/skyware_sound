@@ -11,8 +11,8 @@ use egui::{Align, ComboBox, Context, DragValue, Grid, Id, Layout, RichText, Text
 use sky_core::manifest::{Asset, Category, MAX_ASSET_NAME, RandomRange, Selection, asset_name};
 use sky_core::{AssetId, Ticks};
 use sky_model::{
-    Command, GameAsset, GameAssetKind, LicenseReport, MAX_SFX_TAIL_SECONDS, MAX_SFX_VARIATIONS,
-    Origin, Project, TimeRange, Transaction,
+    Command, GameAsset, GameAssetKind, LicenseReport, MAX_SFX_PITCH_SEMITONES,
+    MAX_SFX_TAIL_SECONDS, MAX_SFX_VARIATIONS, Origin, Project, SFX_GAIN_DB, TimeRange, Transaction,
 };
 use sky_session::{GameExportOptions, Session};
 
@@ -619,13 +619,7 @@ fn sfx_settings(ui: &mut Ui, project: &Project, asset: &GameAsset, w: &mut Wante
     else {
         return;
     };
-    let span = match (variations.first(), variations.last()) {
-        (Some(f), Some(l)) => TimeRange {
-            start: f.start,
-            end: l.end,
-        },
-        _ => project.loop_region,
-    };
+    let span = TimeRange::covering(variations).unwrap_or(project.loop_region);
     let with = |kind: GameAssetKind| {
         let mut a = asset.clone();
         a.kind = kind;
@@ -708,17 +702,25 @@ fn sfx_settings(ui: &mut Ui, project: &Project, asset: &GameAsset, w: &mut Wante
             w.update = Some((with(kind), None));
         }
         ui.label("Pitch ±");
-        let mut pitch = pitch_semitones.max.abs().max(pitch_semitones.min.abs());
+        // The model allows uneven ranges, which these show as their widest
+        // side; only a change made here writes the even range back.
+        let shown = pitch_semitones
+            .max
+            .abs()
+            .max(pitch_semitones.min.abs())
+            .min(MAX_SFX_PITCH_SEMITONES);
+        let mut pitch = shown;
         if ui
             .add(
                 DragValue::new(&mut pitch)
-                    .range(0.0..=12.0)
+                    .range(0.0..=MAX_SFX_PITCH_SEMITONES)
                     .speed(0.05)
                     .suffix(" st")
                     .max_decimals(2),
             )
             .on_hover_text("A random pitch offset per trigger, up to this many semitones")
             .changed()
+            && pitch != shown
         {
             let kind = rebuild(
                 variations.clone(),
@@ -731,17 +733,19 @@ fn sfx_settings(ui: &mut Ui, project: &Project, asset: &GameAsset, w: &mut Wante
             w.update = Some((with(kind), Some(key(asset.id, "pitch"))));
         }
         ui.label("Gain −");
-        let mut gain = -gain_db.min;
+        let shown = (-gain_db.min).clamp(0.0, -SFX_GAIN_DB.0);
+        let mut gain = shown;
         if ui
             .add(
                 DragValue::new(&mut gain)
-                    .range(0.0..=24.0)
+                    .range(0.0..=-SFX_GAIN_DB.0)
                     .speed(0.1)
                     .suffix(" dB")
                     .max_decimals(1),
             )
             .on_hover_text("A random cut per trigger, up to this many dB")
             .changed()
+            && gain != shown
         {
             let kind = rebuild(
                 variations.clone(),

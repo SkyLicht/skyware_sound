@@ -107,6 +107,10 @@ pub struct GameAsset {
 pub const MAX_SFX_TAIL_SECONDS: f32 = 10.0;
 /// The most variations one SFX set can have.
 pub const MAX_SFX_VARIATIONS: usize = 64;
+/// The widest random pitch offset of an SFX set, in semitones either way.
+pub const MAX_SFX_PITCH_SEMITONES: f32 = 24.0;
+/// The range a random gain offset of an SFX set may cover, in dB.
+pub const SFX_GAIN_DB: (f32, f32) = (-60.0, 12.0);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -189,6 +193,14 @@ impl TimeRange {
                 TimeRange { start, end }
             })
             .collect()
+    }
+
+    /// From the earliest start to the latest end of `ranges`, in any order;
+    /// `None` when there are none.
+    pub fn covering(ranges: &[TimeRange]) -> Option<TimeRange> {
+        let start = ranges.iter().map(|r| r.start).min()?;
+        let end = ranges.iter().map(|r| r.end).max()?;
+        Some(TimeRange { start, end })
     }
 }
 

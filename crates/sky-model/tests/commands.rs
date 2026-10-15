@@ -365,6 +365,11 @@ fn ranges_split_into_equal_variations() {
     // More parts than ticks: one tick each.
     assert_eq!(TimeRange::new(0, 2).unwrap().split(5).len(), 2);
     assert_eq!(r.split(0).len(), 1);
+    // The span of variations given in any order.
+    let mut shuffled = parts.clone();
+    shuffled.reverse();
+    assert_eq!(TimeRange::covering(&shuffled), Some(r));
+    assert_eq!(TimeRange::covering(&[]), None);
 }
 
 #[test]

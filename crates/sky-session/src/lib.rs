@@ -194,6 +194,20 @@ pub struct GameExported {
 /// variations are trimmed.
 const SILENCE: f32 = 1e-4;
 
+/// Where `project`, saved at `path` (if it is), exports its game assets.
+fn game_export_dir(project: &Project, path: Option<&Path>) -> Result<PathBuf, SessionError> {
+    match (project.game.export_dir.as_deref(), path) {
+        (Some(d), _) if Path::new(d).is_absolute() => Ok(PathBuf::from(d)),
+        (Some(d), Some(p)) => Ok(p.join(d)),
+        (Some(d), None) => Err(SessionError::Invalid(format!(
+            "the game export folder {d:?} is relative to the project folder; save the \
+             project first or set an absolute folder"
+        ))),
+        (None, Some(p)) => Ok(p.join(file::RENDERS_DIR).join("export")),
+        (None, None) => Err(SessionError::NoProjectPath),
+    }
+}
+
 /// Cuts trailing silence, keeping at least one frame.
 fn trim_silence(audio: &mut AudioData) {
     let last = audio
@@ -919,9 +933,15 @@ impl Session {
     // ----- rendering -----
 
     fn render_inputs(&self) -> (Arc<Project>, AudioCache) {
+        let (project, audio, _) = self.export_inputs();
+        (project, audio)
+    }
+
+    /// The project and its audio, with where it is saved, all at one moment.
+    fn export_inputs(&self) -> (Arc<Project>, AudioCache, Option<PathBuf>) {
         let st = lock(&self.inner.state);
         let audio: HashMap<_, _> = st.audio.clone();
-        (Arc::new(st.project.clone()), audio)
+        (Arc::new(st.project.clone()), audio, st.path.clone())
     }
 
     fn check_length(seconds: f64) -> Result<(), SessionError> {
@@ -1055,17 +1075,7 @@ impl Session {
     /// `renders/export` inside the project folder.
     pub fn game_export_dir(&self) -> Result<PathBuf, SessionError> {
         let view = self.view();
-        let base = view.path.as_deref();
-        match (view.project.game.export_dir.as_deref(), base) {
-            (Some(d), _) if Path::new(d).is_absolute() => Ok(PathBuf::from(d)),
-            (Some(d), Some(p)) => Ok(p.join(d)),
-            (Some(d), None) => Err(SessionError::Invalid(format!(
-                "the game export folder {d:?} is relative to the project folder; save the \
-                 project first or set an absolute folder"
-            ))),
-            (None, Some(p)) => Ok(p.join(file::RENDERS_DIR).join("export")),
-            (None, None) => Err(SessionError::NoProjectPath),
-        }
+        game_export_dir(&view.project, view.path.as_deref())
     }
 
     /// Renders the project's game assets and exports them for `sky-runtime`:
@@ -1078,7 +1088,9 @@ impl Session {
     /// a one-off export: unmarked entries, which it or the project once
     /// saved can replace later, and nothing removed.
     pub fn export_game(&self, opts: &GameExportOptions) -> Result<GameExported, SessionError> {
-        let (project, audio) = self.render_inputs();
+        // Taken together, so a save or a new project during the render does
+        // not change which project the export belongs to.
+        let (project, audio, path) = self.export_inputs();
         let game = &project.game;
         if game.assets.is_empty() {
             return Err(SessionError::Invalid(
@@ -1099,7 +1111,7 @@ impl Session {
         }
         let dir = match &opts.dir {
             Some(d) => d.clone(),
-            None => self.game_export_dir()?,
+            None => game_export_dir(&project, path.as_deref())?,
         };
         let format = WavFormat::from_bits(game.bits).unwrap_or(WavFormat::Pcm24);
         let selected: Vec<_> = game
@@ -1196,7 +1208,7 @@ impl Session {
                 },
             })
             .collect();
-        let project_id = self.view().path.is_some().then(|| project.id.to_string());
+        let project_id = path.is_some().then(|| project.id.to_string());
         let set = ExportSet {
             project: project.name.clone(),
             prune: project_id.is_some() && opts.only.is_empty(),

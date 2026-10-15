@@ -372,5 +372,19 @@ fn hostile_parameters_do_not_poison_the_mix() {
         ..PlayParams::default()
     };
     rt.play_by_name("drone", huge).unwrap();
-    assert!(render(&mut rt, 256).iter().all(|s| s.is_finite()));
+    let hostile = render(&mut rt, 256);
+    assert!(hostile.iter().all(|s| s.is_finite()));
+    // Values that are not numbers count as the default, 0 dB and no pitch.
+    let mut plain = runtime(dir.path(), 4);
+    plain
+        .play_by_name(
+            "pad",
+            PlayParams {
+                pitch_semitones: 0.0,
+                ..PlayParams::default()
+            },
+        )
+        .unwrap();
+    plain.play_by_name("drone", PlayParams::default()).unwrap();
+    assert_eq!(hostile, render(&mut plain, 256));
 }

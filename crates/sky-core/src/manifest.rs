@@ -125,8 +125,9 @@ impl Asset {
 }
 
 /// Turns a display name into an asset name: lowercase ASCII letters, digits
-/// and single underscores, such as `battle_loop_2` for `Battle Loop #2`.
-/// Asset names double as file names, so they are safe on every platform.
+/// and single underscores, such as `battle_loop_2` for `Battle Loop #2`, cut
+/// to [`MAX_ASSET_NAME`] bytes. Asset names double as file names, so they are
+/// safe on every platform.
 pub fn asset_name(name: &str) -> String {
     let mut out = String::new();
     for c in name.trim().chars() {
@@ -136,6 +137,7 @@ pub fn asset_name(name: &str) -> String {
             out.push('_');
         }
     }
+    out.truncate(MAX_ASSET_NAME);
     let out = out.trim_end_matches('_').to_string();
     if out.is_empty() {
         "untitled".into()
@@ -410,6 +412,9 @@ mod tests {
         assert!(!is_asset_name("foot__step"));
         assert!(!is_asset_name(""));
         assert!(!is_asset_name(&"a".repeat(MAX_ASSET_NAME + 1)));
+        let long = asset_name(&"Long name ".repeat(20));
+        assert!(is_asset_name(&long), "{long}");
+        assert!(long.len() <= MAX_ASSET_NAME && long.starts_with("long_name_"));
     }
 
     #[test]

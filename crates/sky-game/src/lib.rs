@@ -143,10 +143,15 @@ pub struct SetExported {
 /// the same [`ExportSet::project_id`] (both `None` for one-off exports),
 /// under the names an export gives them. Files added by hand stay.
 ///
+/// Without a project ID, an asset that replaces an entry of the same name
+/// without one keeps that entry's ID, so game code that refers to it keeps
+/// working.
+///
 /// Nothing is written unless every asset is valid, no two assets would write
 /// the same file, no asset would overwrite a file that another asset in the
-/// manifest uses, and no asset replaces one that another project manages. A
-/// failure while writing puts the old files and manifest back.
+/// manifest uses or that is in the folder without being in the manifest,
+/// and no asset replaces one that another project manages. A failure while
+/// writing puts the old files and manifest back.
 pub fn export_assets(
     dir: &Path,
     set: &ExportSet,
@@ -158,7 +163,6 @@ pub fn export_assets(
         ));
     }
     let mut names = BTreeSet::new();
-    let mut ids = BTreeSet::new();
     for a in assets {
         validate(a)?;
         if !names.insert(a.name.as_str()) {
@@ -167,26 +171,31 @@ pub fn export_assets(
                 a.name
             )));
         }
-        if !ids.insert(a.id) {
-            return Err(GameError::Invalid(format!(
-                "{:?} has the ID of another asset in the set",
-                a.name
-            )));
-        }
     }
 
+    // The folder's own project name stays; it may hold several projects.
     let mut manifest =
         read_manifest(dir)?.unwrap_or_else(|| Manifest::new(generator(), set.project.as_str()));
     manifest.generator = generator();
-    manifest.project = set.project.clone();
     let before: Vec<Asset> = manifest.assets.clone();
 
+    let mut ids = BTreeSet::new();
     let mut entries = Vec::with_capacity(assets.len());
     let mut writes: Files = Vec::new();
     // Each file to write, by its normalized path, and the asset writing it.
     let mut writers: BTreeMap<String, &str> = BTreeMap::new();
     for a in assets {
-        let (entry, files) = render_entry(a, set)?;
+        let id = match manifest.find(&a.name) {
+            Some(old) if set.project_id.is_none() && old.project_id().is_none() => old.id(),
+            _ => a.id,
+        };
+        if !ids.insert(id) {
+            return Err(GameError::Invalid(format!(
+                "{:?} has the ID of another asset in the set",
+                a.name
+            )));
+        }
+        let (entry, files) = render_entry(a, id, set)?;
         for (rel, _) in &files {
             if let Some(other) = writers.insert(normalize(rel), a.name.as_str()) {
                 return Err(GameError::Invalid(format!(
@@ -231,6 +240,19 @@ pub fn export_assets(
                     a.name()
                 )));
             }
+        }
+    }
+    // A file in the folder that no entry used is someone's own.
+    let known: BTreeSet<String> = before
+        .iter()
+        .flat_map(|a| a.files().map(|f| normalize(&f.path)))
+        .collect();
+    for (rel, _) in &writes {
+        if !known.contains(&normalize(rel)) && dir.join(rel).exists() {
+            return Err(GameError::Invalid(format!(
+                "{rel} is already in the export folder but not in its manifest, so it may be \
+                 someone's own file; move it away or rename the asset"
+            )));
         }
     }
     let unused = unused_files(dir, &before, &manifest, set);
@@ -389,10 +411,6 @@ fn validate(a: &AssetExport) -> Result<(), GameError> {
     Ok(())
 }
 
-fn category_dir(category: Category) -> &'static str {
-    category.name()
-}
-
 fn audio_file(path: String, audio: &AudioData) -> AudioFile {
     AudioFile {
         path,
@@ -407,8 +425,12 @@ fn audio_file(path: String, audio: &AudioData) -> AudioFile {
 type Files<'a> = Vec<(String, &'a AudioData)>;
 
 /// The manifest entry for an asset and the files it needs.
-fn render_entry<'a>(a: &'a AssetExport, set: &ExportSet) -> Result<(Asset, Files<'a>), GameError> {
-    let dir = category_dir(a.category);
+fn render_entry<'a>(
+    a: &'a AssetExport,
+    id: AssetId,
+    set: &ExportSet,
+) -> Result<(Asset, Files<'a>), GameError> {
+    let dir = a.category.name();
     Ok(match &a.audio {
         AssetAudio::Loop {
             audio,
@@ -421,7 +443,7 @@ fn render_entry<'a>(a: &'a AssetExport, set: &ExportSet) -> Result<(Asset, Files
             let rel = format!("{dir}/{}.wav", a.name);
             let stats = analysis::analyze(audio);
             let entry = Asset::Loop(LoopAsset {
-                id: a.id,
+                id,
                 name: a.name.clone(),
                 category: a.category,
                 file: audio_file(rel.clone(), audio),
@@ -455,7 +477,7 @@ fn render_entry<'a>(a: &'a AssetExport, set: &ExportSet) -> Result<(Asset, Files
             let joined = join(variations);
             let stats = analysis::analyze(&joined);
             let entry = Asset::Sfx(SfxAsset {
-                id: a.id,
+                id,
                 name: a.name.clone(),
                 category: a.category,
                 variations: files
@@ -513,7 +535,7 @@ fn normalize(rel: &str) -> String {
 /// The path an export gives an asset's file: `music/battle.wav` for a
 /// loop, `sfx/hit_02.wav` for an SFX set's second variation.
 fn generated_path(asset: &Asset, index: usize) -> String {
-    let dir = category_dir(asset.category());
+    let dir = asset.category().name();
     match asset {
         Asset::Loop(_) => format!("{dir}/{}.wav", asset.name()),
         Asset::Sfx(_) => format!("{dir}/{}_{:02}.wav", asset.name(), index + 1),
@@ -587,9 +609,7 @@ pub struct Exported {
 /// that name already in the manifest.
 pub fn export_loop(dir: &Path, export: &LoopExport) -> Result<Exported, GameError> {
     let name = asset_name(export.name);
-    let id = read_manifest(dir)?
-        .and_then(|m| m.find(&name).map(Asset::id))
-        .unwrap_or_default();
+    let id = AssetId::new();
     let set = ExportSet {
         project: export.project.to_string(),
         project_id: None,
@@ -939,6 +959,7 @@ mod tests {
         edit_manifest(dir.path(), |m| {
             sfx_entry(m, "steps").variations[0].path = "foley/steps.wav".into();
         });
+        fs::remove_file(dir.path().join("sfx/steps_01.wav")).unwrap();
         export_assets(
             dir.path(),
             &project_set(true),
@@ -961,6 +982,76 @@ mod tests {
         assert!(out.deleted.is_empty(), "{:?}", out.deleted);
         assert!(dir.path().join("foley/hit.wav").is_file());
         assert!(dir.path().join("sfx/door_01.wav").is_file());
+    }
+
+    #[test]
+    fn files_in_the_folder_but_not_the_manifest_are_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, music) = (tone(4_000), tone(20_000));
+        export_assets(dir.path(), &project_set(true), &[sfx("hit", 2, vec![&a])]).unwrap();
+        fs::create_dir_all(dir.path().join("music")).unwrap();
+        fs::write(dir.path().join("music/battle.wav"), b"mine").unwrap();
+        let err = export_assets(
+            dir.path(),
+            &project_set(true),
+            &[intro_loop("battle", 1, &music), sfx("hit", 2, vec![&a])],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("music/battle.wav"), "{err}");
+        assert_eq!(
+            fs::read(dir.path().join("music/battle.wav")).unwrap(),
+            b"mine"
+        );
+        // Files the manifest knows are overwritten as before.
+        export_assets(
+            dir.path(),
+            &project_set(true),
+            &[sfx("hit", 2, vec![&music])],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn exports_without_a_project_keep_ids_and_the_folder_keeps_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = tone(4_000);
+        let one_off = ExportSet {
+            project: "First".into(),
+            project_id: None,
+            ..project_set(false)
+        };
+        export_assets(dir.path(), &one_off, &[sfx("door", 1, vec![&a])]).unwrap();
+        // Run again, as an unsaved project with new IDs would.
+        let again = ExportSet {
+            project: "Second".into(),
+            ..one_off.clone()
+        };
+        let out = export_assets(dir.path(), &again, &[sfx("door", 2, vec![&a, &a])]).unwrap();
+        assert_eq!(out.assets[0].id(), AssetId::from_u128(1));
+        let m = read_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(m.find("door").unwrap().id(), AssetId::from_u128(1));
+        assert_eq!(m.project, "First");
+        // A long name is cut to fit instead of failing.
+        let long = "A very long loop name that goes on and on ".repeat(3);
+        let out = export_loop(
+            dir.path(),
+            &LoopExport {
+                name: &long,
+                project: "First",
+                audio: &a,
+                loop_start: 0,
+                loop_end: 4_000,
+                tempo_bpm: None,
+                time_signature: None,
+                bars: None,
+                category: Category::Music,
+                tags: vec![],
+                credits: vec![],
+                format: WavFormat::Pcm16,
+            },
+        )
+        .unwrap();
+        assert!(is_asset_name(out.asset.name()), "{}", out.asset.name());
     }
 
     #[test]

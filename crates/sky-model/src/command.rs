@@ -464,8 +464,9 @@ fn validate_game_asset(project: &Project, asset: &GameAsset) -> Result<(), Model
             for v in variations {
                 TimeRange::new(v.start, v.end)?;
             }
-            check_range("random pitch", *pitch_semitones, -24.0, 24.0, "semitones")?;
-            check_range("random gain", *gain_db, -60.0, 12.0, "dB")?;
+            let pitch = MAX_SFX_PITCH_SEMITONES;
+            check_range("random pitch", *pitch_semitones, -pitch, pitch, "semitones")?;
+            check_range("random gain", *gain_db, SFX_GAIN_DB.0, SFX_GAIN_DB.1, "dB")?;
             if !(tail_seconds.is_finite() && (0.0..=MAX_SFX_TAIL_SECONDS).contains(tail_seconds)) {
                 return Err(ModelError::InvalidValue(format!(
                     "an SFX tail must be 0 to {MAX_SFX_TAIL_SECONDS} seconds, got {tail_seconds}"
