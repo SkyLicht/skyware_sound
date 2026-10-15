@@ -6,6 +6,8 @@
 //! command is built, never while applying, so replaying a command log always
 //! produces the same project.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sky_core::time::validate_bpm;
 use sky_core::{
@@ -120,6 +122,13 @@ pub enum Command {
         effect: EffectId,
         enabled: bool,
     },
+    /// Sets the track whose notes drive an effect such as a duck; `None`
+    /// disconnects it.
+    SetEffectSidechain {
+        channel: ChannelRef,
+        effect: EffectId,
+        source: Option<TrackId>,
+    },
     AddClip {
         track: TrackId,
         clip: Box<Clip>,
@@ -171,6 +180,10 @@ pub enum Command {
         source: String,
         seed: u64,
         cycle: Ticks,
+        #[serde(default)]
+        controls: BTreeMap<String, String>,
+        #[serde(default)]
+        swing: Swing,
     },
     AddPoolAudio {
         entry: PoolEntry,
@@ -254,13 +267,21 @@ fn validate_clip(project: &Project, track: &Track, clip: &Clip) -> Result<(), Mo
                 n.validate()?;
             }
         }
-        ClipContent::Pattern { source, cycle, .. } => {
+        ClipContent::Pattern {
+            source,
+            cycle,
+            controls,
+            swing,
+            ..
+        } => {
             if track.kind != TrackKind::Instrument {
                 return Err(ModelError::InvalidValue(
                     "pattern clips go on instrument tracks".into(),
                 ));
             }
             validate_pattern(source, *cycle)?;
+            validate_controls(controls)?;
+            validate_swing(*swing)?;
         }
     }
     Ok(())
@@ -273,6 +294,57 @@ pub fn validate_pattern(source: &str, cycle: Ticks) -> Result<(), ModelError> {
         )));
     }
     sky_pattern::parse(source).map_err(|e| ModelError::Pattern(e.to_string()))?;
+    Ok(())
+}
+
+/// The most control patterns one clip can have.
+pub const MAX_CONTROLS: usize = 8;
+
+/// The control a pattern can set besides instrument parameters.
+pub const VELOCITY: &str = "velocity";
+
+/// Checks a pattern's controls. A name must be `velocity` or a parameter
+/// of some instrument, though not necessarily the track's current one, so
+/// changing instruments never makes a clip invalid; the engine skips names
+/// the instrument lacks.
+pub fn validate_controls(controls: &BTreeMap<String, String>) -> Result<(), ModelError> {
+    if controls.len() > MAX_CONTROLS {
+        return Err(ModelError::InvalidValue(format!(
+            "a pattern can have at most {MAX_CONTROLS} controls, got {}",
+            controls.len()
+        )));
+    }
+    for (name, source) in controls {
+        let known = name == VELOCITY
+            || sky_dsp::InstrumentType::ALL
+                .iter()
+                .any(|t| sky_dsp::params::find(t.params(), name).is_some());
+        if !known {
+            return Err(ModelError::InvalidParam(format!(
+                "a pattern control is \"velocity\" or an instrument parameter, got {name:?}"
+            )));
+        }
+        sky_pattern::parse_numbers(source)
+            .map_err(|e| ModelError::Pattern(format!("{name}: {e}")))?;
+    }
+    Ok(())
+}
+
+pub fn validate_swing(swing: Swing) -> Result<(), ModelError> {
+    if !(Swing::STRAIGHT..=Swing::MAX).contains(&swing.amount) {
+        return Err(ModelError::InvalidValue(format!(
+            "swing goes from {} (straight) to {}, got {}",
+            Swing::STRAIGHT,
+            Swing::MAX,
+            swing.amount
+        )));
+    }
+    if !Swing::GRIDS.contains(&swing.grid) {
+        return Err(ModelError::InvalidValue(format!(
+            "swing works on 4ths, 8ths, 16ths or 32nds (grid 4, 8, 16 or 32), got {}",
+            swing.grid
+        )));
+    }
     Ok(())
 }
 
@@ -335,9 +407,39 @@ fn validate_bank(project: &Project, bank: &SampleBank) -> Result<(), ModelError>
     Ok(())
 }
 
+/// Checks an effect's settings. A sidechain may name a track that is gone,
+/// as one does after its source is deleted, so that undoing the deletions
+/// in any order works; only [`Command::SetEffectSidechain`] insists the
+/// track exists.
 fn validate_effect(slot: &EffectSlot) -> Result<(), ModelError> {
     for (name, value) in &slot.params {
         validate_param(slot.kind.params(), slot.kind.name(), name, *value)?;
+    }
+    if slot.sidechain.is_some() && !slot.kind.takes_sidechain() {
+        return Err(no_sidechain(slot.kind));
+    }
+    Ok(())
+}
+
+fn no_sidechain(kind: sky_dsp::EffectType) -> ModelError {
+    ModelError::InvalidValue(format!(
+        "a {} has no sidechain; only a duck does",
+        kind.name()
+    ))
+}
+
+fn validate_sidechain(
+    project: &Project,
+    kind: sky_dsp::EffectType,
+    source: TrackId,
+) -> Result<(), ModelError> {
+    if !kind.takes_sidechain() {
+        return Err(no_sidechain(kind));
+    }
+    if project.track(source)?.kind != TrackKind::Instrument {
+        return Err(ModelError::InvalidValue(
+            "a sidechain follows notes, so its source must be an instrument track".into(),
+        ));
     }
     Ok(())
 }
@@ -408,6 +510,7 @@ impl Command {
             Command::MoveEffect { .. } => "Move effect",
             Command::SetEffectParam { .. } => "Change effect parameter",
             Command::SetEffectEnabled { .. } => "Toggle effect",
+            Command::SetEffectSidechain { .. } => "Change sidechain",
             Command::AddClip { .. } => "Add clip",
             Command::RemoveClip { .. } => "Delete clip",
             Command::MoveClip { .. } => "Move clip",
@@ -711,6 +814,30 @@ impl Command {
                     enabled: old,
                 }
             }
+            Command::SetEffectSidechain {
+                channel,
+                effect,
+                source,
+            } => {
+                let kind = channel_mut(project, channel)?
+                    .effect(effect)
+                    .ok_or(ModelError::EffectNotFound(effect))?
+                    .kind;
+                if let Some(source) = source {
+                    validate_sidechain(project, kind, source)?;
+                }
+                let slot = channel_mut(project, channel)?
+                    .effects
+                    .iter_mut()
+                    .find(|e| e.id == effect)
+                    .ok_or(ModelError::EffectNotFound(effect))?;
+                let old = std::mem::replace(&mut slot.sidechain, source);
+                Command::SetEffectSidechain {
+                    channel,
+                    effect,
+                    source: old,
+                }
+            }
             Command::AddClip { track, clip } => {
                 ensure_unique(project, clip.id.0)?;
                 validate_clip(project, project.track(track)?, &clip)?;
@@ -879,14 +1006,20 @@ impl Command {
                 source,
                 seed,
                 cycle,
+                controls,
+                swing,
             } => {
                 validate_pattern(&source, cycle)?;
+                validate_controls(&controls)?;
+                validate_swing(swing)?;
                 let c = project.clip_mut(clip)?;
                 let actual = c.kind_name();
                 let ClipContent::Pattern {
                     source: s,
                     seed: sd,
                     cycle: cy,
+                    controls: ct,
+                    swing: sw,
                 } = &mut c.content
                 else {
                     return Err(ModelError::WrongClipType {
@@ -900,6 +1033,8 @@ impl Command {
                     source: std::mem::replace(s, source),
                     seed: std::mem::replace(sd, seed),
                     cycle: std::mem::replace(cy, cycle),
+                    controls: std::mem::replace(ct, controls),
+                    swing: std::mem::replace(sw, swing),
                 }
             }
             Command::AddPoolAudio { entry, index } => {

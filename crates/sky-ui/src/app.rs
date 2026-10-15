@@ -10,7 +10,7 @@ use egui::{
 };
 use sky_core::{ClipId, NoteId, ProjectId, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
-use sky_model::templates::{demo_project, empty_project};
+use sky_model::templates::{demo_project, empty_project, techno_project};
 use sky_model::{ChannelRef, ClipContent, Origin, Project, TrackKind};
 use sky_session::{ProjectView, Session, TransportState};
 
@@ -40,6 +40,7 @@ pub enum Action {
     },
     NewEmpty,
     NewDemo,
+    NewTechno,
     Open,
     Save,
     SaveAs,
@@ -442,7 +443,11 @@ impl App {
                     self.mixer.open_effect = Some((channel, id));
                 }
             }
-            Action::NewEmpty | Action::NewDemo | Action::Open | Action::Quit => {
+            Action::NewEmpty
+            | Action::NewDemo
+            | Action::NewTechno
+            | Action::Open
+            | Action::Quit => {
                 if self.view.dirty && !(action == Action::Quit && self.allow_close) {
                     self.dialogs.confirm = Some(Confirm { then: action });
                 } else {
@@ -501,6 +506,7 @@ impl App {
         match action {
             Action::NewEmpty => self.session.new_project(empty_project("Untitled")),
             Action::NewDemo => self.session.new_project(demo_project()),
+            Action::NewTechno => self.session.new_project(techno_project()),
             Action::Open => self.request_path(ctx, PathPurpose::OpenProject),
             Action::Quit => {
                 self.allow_close = true;

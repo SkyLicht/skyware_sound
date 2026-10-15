@@ -299,6 +299,143 @@ async fn notes_and_patterns_round_trip() {
     client.cancel().await.unwrap();
 }
 
+/// The phase 1 gate: an assistant builds a techno loop with ducked bass
+/// and accented, swung hats from the built-in instruments, and it loops
+/// cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assistant_builds_a_ducked_techno_loop() {
+    let (session, _) = Session::new(empty_project("Techno"), None);
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Edit, vec![]),
+    ))
+    .await;
+    ok(&client, "set_tempo", json!({ "bpm": 128 })).await;
+    for (name, instrument, params) in [
+        (
+            "Kick",
+            "drums",
+            json!({ "style": "909", "kick_drive": 9, "kick_tune": -3 }),
+        ),
+        ("Hats", "drums", json!({ "style": "909" })),
+        (
+            "Bass",
+            "synth",
+            json!({ "cutoff": 600, "resonance": 0.4, "gain": -10 }),
+        ),
+    ] {
+        ok(
+            &client,
+            "track_create",
+            json!({ "name": name, "instrument": instrument, "params": params }),
+        )
+        .await;
+    }
+    ok(
+        &client,
+        "clip_create",
+        json!({ "track": "Kick", "start_bar": 1, "length_bars": 4, "pattern": "bd*4" }),
+    )
+    .await;
+    let hats = ok(
+        &client,
+        "clip_create",
+        json!({
+            "track": "Hats", "start_bar": 1, "length_bars": 4, "pattern": "hh*16",
+            "name": "Hats", "controls": { "velocity": "[70 45 127 45]*4" }, "swing": 56,
+        }),
+    )
+    .await;
+    assert_eq!(hats["swing"]["amount"], 56, "{hats}");
+    ok(
+        &client,
+        "clip_create",
+        json!({
+            "track": "Bass", "start_bar": 1, "length_bars": 4, "name": "Bassline",
+            "pattern": "[~ a1 a1 a1]*4", "controls": { "cutoff": "[500 900]*8" },
+        }),
+    )
+    .await;
+    // A control the instrument does not have is caught.
+    let (text, is_error) = call(
+        &client,
+        "clip_create",
+        json!({
+            "track": "Kick", "start_bar": 1, "length_bars": 1, "pattern": "bd",
+            "controls": { "cutoff": "400" },
+        }),
+    )
+    .await;
+    assert!(
+        is_error && text.contains("drums") && text.contains("kick_tune"),
+        "{text}"
+    );
+
+    // A duck on the bass follows the first drum track by itself.
+    let duck = ok(
+        &client,
+        "effect_insert",
+        json!({ "channel": "Bass", "type": "duck", "params": { "depth": 0.85 } }),
+    )
+    .await;
+    assert_eq!(duck["sidechain"], "Kick", "{duck}");
+    let duck = ok(
+        &client,
+        "effect_set",
+        json!({
+            "channel": "Bass", "effect": "duck",
+            "params": { "trigger": "kick only" }, "sidechain": "Hats",
+        }),
+    )
+    .await;
+    assert_eq!(duck["sidechain"], "Hats");
+    ok(
+        &client,
+        "effect_set",
+        json!({ "channel": "Bass", "effect": "duck", "sidechain": "Kick" }),
+    )
+    .await;
+
+    // pattern_set changes some controls and keeps the rest.
+    let hats = ok(
+        &client,
+        "pattern_set",
+        json!({ "clip": "Hats", "controls": { "hat_decay": "0.6 0.6 2 0.6" }, "swing": 58 }),
+    )
+    .await;
+    assert_eq!(hats["controls"]["velocity"], "[70 45 127 45]*4", "{hats}");
+    assert_eq!(hats["controls"]["hat_decay"], "0.6 0.6 2 0.6");
+    assert_eq!(hats["pattern"], "hh*16");
+    assert_eq!(hats["swing"]["amount"], 58);
+
+    let query = ok(
+        &client,
+        "pattern_query",
+        json!({ "pattern": "100 -12 0.5", "numbers": true }),
+    )
+    .await;
+    let values: Vec<f64> = query["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["value"].as_f64().unwrap())
+        .collect();
+    assert_eq!(values, [100.0, -12.0, 0.5]);
+
+    ok(&client, "set_loop", json!({ "start_bar": 1, "end_bar": 5 })).await;
+    let seam = ok(&client, "loop_check_seam", json!({})).await;
+    assert_eq!(seam["seam"]["verdict"], "seamless", "{seam}");
+
+    let techno = ok(
+        &client,
+        "project_new",
+        json!({ "template": "techno", "name": "Club", "discard_unsaved": true }),
+    )
+    .await;
+    assert_eq!(techno["tracks"].as_array().unwrap().len(), 4);
+    client.cancel().await.unwrap();
+}
+
 async fn http_status(addr: std::net::SocketAddr, token: Option<&str>) -> String {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
     let auth = token

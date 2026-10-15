@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::params::ParamSpec;
 
+mod duck;
 mod dynamics;
 mod space;
 mod tone;
 
+pub use duck::Duck;
 pub use dynamics::{Compressor, Limiter};
 pub use space::{Delay, Reverb};
 pub use tone::{Distortion, Eq, Filter, Gain};
@@ -20,6 +22,15 @@ pub trait Effect: Send + 'static {
     /// Sets a parameter by its spec name. Returns false for unknown names.
     /// Called on the control thread before the effect goes live.
     fn set_param(&mut self, name: &str, value: f32) -> bool;
+    /// Tells a tempo-synced effect the project tempo, in quarter notes per
+    /// minute. Called on the control thread before the effect goes live;
+    /// effects that ignore tempo keep the default, which does nothing.
+    fn set_tempo(&mut self, _bpm: f64) {}
+    /// A note starts on the track this effect follows, `offset` frames into
+    /// the next block passed to `process`. Only effects whose type
+    /// [takes a sidechain](EffectType::takes_sidechain) listen. Must not
+    /// allocate.
+    fn sidechain_note(&mut self, _offset: usize, _pitch: u8) {}
     /// Processes a block in place. `left` and `right` have the same length,
     /// at most [`crate::MAX_BLOCK`] frames. Must not allocate.
     fn process(&mut self, left: &mut [f32], right: &mut [f32]);
@@ -63,10 +74,11 @@ pub enum EffectType {
     Delay,
     Reverb,
     Distortion,
+    Duck,
 }
 
 impl EffectType {
-    pub const ALL: [EffectType; 8] = [
+    pub const ALL: [EffectType; 9] = [
         EffectType::Gain,
         EffectType::Filter,
         EffectType::Eq,
@@ -75,6 +87,7 @@ impl EffectType {
         EffectType::Delay,
         EffectType::Reverb,
         EffectType::Distortion,
+        EffectType::Duck,
     ];
 
     /// The stable name used in files and MCP calls.
@@ -88,6 +101,7 @@ impl EffectType {
             EffectType::Delay => "delay",
             EffectType::Reverb => "reverb",
             EffectType::Distortion => "distortion",
+            EffectType::Duck => "duck",
         }
     }
 
@@ -101,6 +115,7 @@ impl EffectType {
             EffectType::Delay => "Delay",
             EffectType::Reverb => "Reverb",
             EffectType::Distortion => "Distortion",
+            EffectType::Duck => "Duck",
         }
     }
 
@@ -111,9 +126,15 @@ impl EffectType {
             EffectType::Eq => "Low shelf, mid peak and high shelf",
             EffectType::Compressor => "Feed-forward compressor with soft knee",
             EffectType::Limiter => "Peak limiter that keeps output under the ceiling",
-            EffectType::Delay => "Stereo or ping-pong echo with damped feedback",
-            EffectType::Reverb => "Algorithmic room reverb",
+            EffectType::Delay => {
+                "Stereo or ping-pong echo with damped feedback, free or synced to the tempo"
+            }
+            EffectType::Reverb => "Algorithmic room reverb with pre-delay and an optional gate",
             EffectType::Distortion => "Soft, hard or wavefolding saturation",
+            EffectType::Duck => {
+                "Sidechain ducking: dips the volume on each note of another track, \
+                 such as the kick, in a tempo-synced curve"
+            }
         }
     }
 
@@ -133,7 +154,14 @@ impl EffectType {
             EffectType::Delay => space::DELAY_PARAMS,
             EffectType::Reverb => space::REVERB_PARAMS,
             EffectType::Distortion => tone::DISTORTION_PARAMS,
+            EffectType::Duck => duck::DUCK_PARAMS,
         }
+    }
+
+    /// Whether the effect follows another track's notes, which the
+    /// project names in the effect slot's sidechain.
+    pub fn takes_sidechain(self) -> bool {
+        self == EffectType::Duck
     }
 
     /// A new instance with default parameters.
@@ -148,6 +176,17 @@ impl EffectType {
         sample_rate: f32,
         values: impl IntoIterator<Item = (&'a str, f32)>,
     ) -> Box<dyn Effect> {
+        self.create_at(sample_rate, 120.0, values)
+    }
+
+    /// Like [`create_with`](Self::create_with), for a project at `bpm`, so
+    /// tempo-synced effects start at the right time.
+    pub fn create_at<'a>(
+        self,
+        sample_rate: f32,
+        bpm: f64,
+        values: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> Box<dyn Effect> {
         let mut effect: Box<dyn Effect> = match self {
             EffectType::Gain => Box::new(Gain::new(sample_rate)),
             EffectType::Filter => Box::new(Filter::new(sample_rate)),
@@ -157,6 +196,7 @@ impl EffectType {
             EffectType::Delay => Box::new(Delay::new(sample_rate)),
             EffectType::Reverb => Box::new(Reverb::new(sample_rate)),
             EffectType::Distortion => Box::new(Distortion::new(sample_rate)),
+            EffectType::Duck => Box::new(Duck::new(sample_rate)),
         };
         for spec in self.params() {
             effect.set_param(spec.name, spec.default);
@@ -164,6 +204,7 @@ impl EffectType {
         for (name, value) in values {
             effect.set_param(name, value);
         }
+        effect.set_tempo(bpm);
         effect.reset();
         effect
     }
@@ -216,6 +257,82 @@ mod tests {
         let mut c = EffectType::Reverb.create(48_000.0);
         assert!(b.adopt(a.as_mut()));
         assert!(!c.adopt(b.as_mut()));
+    }
+
+    /// The frame of the first sample louder than `level` at or after `from`.
+    fn first_above(buf: &[f32], from: usize, level: f32) -> Option<usize> {
+        buf.iter()
+            .skip(from)
+            .position(|s| s.abs() > level)
+            .map(|i| i + from)
+    }
+
+    fn impulse_response(fx: &mut dyn Effect, frames: usize) -> Vec<f32> {
+        let mut l = vec![0.0; frames];
+        let mut r = vec![0.0; frames];
+        l[0] = 1.0;
+        r[0] = 1.0;
+        for (lc, rc) in l.chunks_mut(512).zip(r.chunks_mut(512)) {
+            fx.process(lc, rc);
+        }
+        l
+    }
+
+    #[test]
+    fn synced_delay_follows_the_tempo() {
+        let params = [("sync", 9.0), ("mix", 1.0), ("feedback", 0.0)];
+        // A quarter note: 500 ms at 120 BPM, 24000 frames.
+        let mut at_120 = EffectType::Delay.create_at(48_000.0, 120.0, params);
+        let out = impulse_response(at_120.as_mut(), 30_000);
+        assert_eq!(first_above(&out, 1, 0.1), Some(24_000));
+        // The same setting at 150 BPM is 400 ms; changing the tempo moves it.
+        at_120.set_tempo(150.0);
+        at_120.reset();
+        let out = impulse_response(at_120.as_mut(), 30_000);
+        assert_eq!(first_above(&out, 1, 0.1), Some(19_200));
+        // Off goes back to the time in milliseconds.
+        let mut free = EffectType::Delay.create_at(
+            48_000.0,
+            150.0,
+            [
+                ("sync", 0.0),
+                ("time", 100.0),
+                ("mix", 1.0),
+                ("feedback", 0.0),
+            ],
+        );
+        let out = impulse_response(free.as_mut(), 10_000);
+        assert_eq!(first_above(&out, 1, 0.1), Some(4_800));
+    }
+
+    #[test]
+    fn reverb_predelay_holds_back_the_tail() {
+        let mut fx = EffectType::Reverb.create_with(48_000.0, [("mix", 1.0), ("predelay", 100.0)]);
+        let out = impulse_response(fx.as_mut(), 20_000);
+        let onset = first_above(&out, 0, 1e-4).expect("a tail");
+        // The shortest comb adds about 25 ms on top of the 100 ms pre-delay.
+        assert!((4_800..7_000).contains(&onset), "tail starts at {onset}");
+    }
+
+    #[test]
+    fn gated_reverb_cuts_the_tail() {
+        let rms = |buf: &[f32]| (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt();
+        let mut open = EffectType::Reverb.create_with(48_000.0, [("mix", 0.5), ("size", 1.0)]);
+        let mut gated = EffectType::Reverb
+            .create_with(48_000.0, [("mix", 0.5), ("size", 1.0), ("gate", 150.0)]);
+        let open_out = impulse_response(open.as_mut(), 48_000);
+        let gated_out = impulse_response(gated.as_mut(), 48_000);
+        // Inside the hold the two are alike; after it the gated one is
+        // silent while the open one still rings.
+        let early = 2_000..6_000;
+        assert!(rms(&gated_out[early.clone()]) > 0.5 * rms(&open_out[early]));
+        let late = 12_000..20_000;
+        assert!(rms(&open_out[late.clone()]) > 1e-3);
+        assert!(
+            rms(&gated_out[late]) < 1e-5,
+            "{}",
+            rms(&gated_out[12_000..20_000])
+        );
     }
 
     #[test]

@@ -105,6 +105,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Set tempo…", "", Action::PromptTempo),
         entry("New empty project", "", Action::NewEmpty),
         entry("New demo project", "", Action::NewDemo),
+        entry("New techno loop", "", Action::NewTechno),
         entry("Open project…", "Ctrl+O", Action::Open),
         entry("Save", "Ctrl+S", Action::Save),
         entry("Save as…", "Ctrl+Shift+S", Action::SaveAs),

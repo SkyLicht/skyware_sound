@@ -260,6 +260,59 @@ mod tests {
     }
 
     #[test]
+    fn every_drum_note_sounds_in_every_style() {
+        for style in 0..3 {
+            for note in [36, 38, 39, 42, 46, 49] {
+                let mut kit = InstrumentType::Drums.create(48_000.0, InstrumentAudio::None);
+                assert!(kit.set_param("style", style as f32));
+                kit.note_on(note, 127);
+                let (l, _) = render_seconds(kit.as_mut(), 0.05);
+                assert!(peak(&l) > 0.01, "style {style} note {note} silent");
+                assert!(l.iter().all(|s| s.is_finite() && s.abs() < 4.0));
+            }
+        }
+    }
+
+    /// Crossings of zero going up in the first `seconds`, a rough pitch.
+    fn rising_crossings(inst: &mut dyn Instrument, seconds: f32) -> usize {
+        let (l, _) = render_seconds(inst, seconds);
+        l.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count()
+    }
+
+    #[test]
+    fn each_drum_piece_has_its_own_controls() {
+        let kick = |params: &[(&str, f32)]| {
+            let mut kit = InstrumentType::Drums.create(48_000.0, InstrumentAudio::None);
+            for (name, value) in params {
+                assert!(kit.set_param(name, *value), "{name}");
+            }
+            kit.note_on(36, 127);
+            kit
+        };
+        // Tuning the kick up raises its pitch.
+        let low = rising_crossings(kick(&[("kick_click", 0.0)]).as_mut(), 0.1);
+        let high = rising_crossings(
+            kick(&[("kick_click", 0.0), ("kick_tune", 12.0)]).as_mut(),
+            0.1,
+        );
+        assert!(high > low + low / 2, "{low} -> {high}");
+        // A longer decay rings for longer.
+        let tail = |kit: &mut Box<dyn Instrument>| {
+            let _ = render_seconds(kit.as_mut(), 0.4);
+            peak(&render_seconds(kit.as_mut(), 0.1).0)
+        };
+        assert!(tail(&mut kick(&[("kick_decay", 3.0)])) > 4.0 * tail(&mut kick(&[])));
+        // A piece's level reaches zero without touching the others.
+        let mut kit = kick(&[("kick_level", -60.0)]);
+        assert!(peak(&render_seconds(kit.as_mut(), 0.05).0) < 1e-6);
+        kit.note_on(38, 127);
+        assert!(peak(&render_seconds(kit.as_mut(), 0.05).0) > 0.01);
+        // Pieces without a pitch refuse a tune.
+        assert!(!kit.set_param("clap_tune", 0.0));
+        assert!(!kit.set_param("rim_decay", 1.0));
+    }
+
+    #[test]
     fn voices_survive_adopt() {
         let mut a = InstrumentType::Synth.create(48_000.0, InstrumentAudio::None);
         a.note_on(60, 100);

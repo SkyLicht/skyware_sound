@@ -80,6 +80,14 @@
 //!   as `[[[bd*1.333]*1.333]*1.333]*1.333` (one or two levels of such
 //!   decimals are fine);
 //! * queries are clamped to ±2^31 cycles.
+//!
+//! # Number patterns
+//!
+//! [`parse_numbers`] reads the same notation with numbers as its terms, for
+//! values that change over time, such as velocities or a filter cutoff:
+//! `100 60 80 60`, `<400 800 1600>`, `-12 [0 7]`. Numbers may be negative
+//! and have up to six decimal places (`0.25`); each becomes a
+//! [`Value::Number`], kept exact. Names and note names are errors there.
 
 mod ast;
 mod bounds;
@@ -106,6 +114,27 @@ pub enum Value {
     /// A MIDI note number, from a note name (`c4`, `f#3`, `eb5`, `c` = octave 3
     /// default, so `c` = 48, `c4` = 60) or a bare integer 0-127 (`60`).
     Note(u8),
+    /// A number from a number pattern ([`parse_numbers`]), exact: `1.5` is 3/2.
+    Number(#[serde(with = "exact")] Time),
+}
+
+/// Serializes an exact number as `[numerator, denominator]`.
+mod exact {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::Time;
+
+    pub fn serialize<S: Serializer>(value: &Time, s: S) -> Result<S::Ok, S::Error> {
+        [*value.numer(), *value.denom()].serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Time, D::Error> {
+        let [numer, denom] = <[i64; 2]>::deserialize(d)?;
+        if denom == 0 {
+            return Err(serde::de::Error::custom("a number's denominator is 0"));
+        }
+        Ok(Time::new(numer, denom))
+    }
 }
 
 impl Value {
@@ -116,6 +145,15 @@ impl Value {
         match self {
             Value::Note(note) => Some(*note),
             Value::Sound { name, .. } => drum_note(name),
+            Value::Number(_) => None,
+        }
+    }
+
+    /// The value of a [`Value::Number`]; `None` for notes and sounds.
+    pub fn number(&self) -> Option<f64> {
+        match self {
+            Value::Number(n) => Some(*n.numer() as f64 / *n.denom() as f64),
+            _ => None,
         }
     }
 }
@@ -177,6 +215,25 @@ pub fn parse(src: &str) -> Result<Pattern, ParseError> {
     Ok(Pattern {
         source: src.to_string(),
         root: parser::parse(src)?,
+    })
+}
+
+/// Parses a number pattern: the same notation, with numbers as its terms
+/// (see [Number patterns](crate#number-patterns)). Every event's value is a
+/// [`Value::Number`].
+///
+/// ```
+/// use sky_pattern::{Time, parse_numbers};
+///
+/// let pattern = parse_numbers("100 <60 -2.5>").unwrap();
+/// let second = pattern.query(Time::from_integer(1), Time::from_integer(2), 0);
+/// assert_eq!(second[1].value.number(), Some(-2.5));
+/// assert!(parse_numbers("bd").is_err());
+/// ```
+pub fn parse_numbers(src: &str) -> Result<Pattern, ParseError> {
+    Ok(Pattern {
+        source: src.to_string(),
+        root: parser::parse_numbers(src)?,
     })
 }
 

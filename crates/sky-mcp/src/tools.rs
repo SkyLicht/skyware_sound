@@ -24,12 +24,13 @@ use sky_dsp::params::{self, ParamKind, ParamSpec};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_io::WavFormat;
 use sky_library::{PACKS, PackSource};
+use sky_model::command::VELOCITY;
 use sky_model::notes::{format_note_list, parse_note_list};
 use sky_model::summary::{clip_json, project_summary, track_json};
-use sky_model::templates::{demo_project, empty_project};
+use sky_model::templates::{demo_project, empty_project, techno_project};
 use sky_model::{
     ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, License, Origin, Project,
-    Track, TrackKind, Transaction,
+    Swing, Track, TrackKind, Transaction,
 };
 use sky_session::{BankRequest, LoopExportOptions, Session};
 
@@ -60,6 +61,20 @@ into one, < > alternates per cycle, *n repeats, /n slows, ~ is a rest, a comma \
 stacks layers, bd(3,8) is a Euclidean rhythm, ? drops events at random, and \
 note names or numbers (c3 e3 g3) play pitches. Drum names: bd sd hh oh cp rim \
 lt mt ht cr rd cb. Use pattern_query to check a pattern before writing it.\n\
+\n\
+A pattern clip can also have controls: number patterns in the same notation, \
+read at the start of each note. {\"velocity\": \"127 60 90 60\"} accents \
+steps (0 skips a note); an instrument parameter's name sets it per note, as in \
+{\"cutoff\": \"<400 800 1600>\"} or, on drums, {\"hat_decay\": \"0.5 2\"}. A \
+rest (~) keeps the usual value. Controls apply to every note of the clip, so \
+put a part that needs its own accents on its own track. swing (50 straight to \
+75) delays every second step of swing_grid (8 or 16).\n\
+\n\
+For techno: a duck effect on a bass or pad, with sidechain set to the kick's \
+track, dips it on every kick (trigger \"kick only\" ignores the other drums on \
+that track; it works while that track is muted). The delay's sync and the \
+duck's length follow the tempo. The drums have per-piece tune, decay and level \
+(kick_tune, hat_decay, ...), kick drive, and an industrial style.\n\
 \n\
 Strudel's sample packs: a track with the \"bank\" instrument plays named sounds \
 from a pack, as Strudel's s(\"bd sd:2\").bank(\"RolandTR808\") does: sd:2 is the \
@@ -312,6 +327,73 @@ fn spec_json(spec: &ParamSpec) -> Value {
     v
 }
 
+/// Checks control names against the track's instrument, which the project
+/// itself does not insist on, so a typo is caught here.
+fn check_controls<'a>(
+    project: &Project,
+    track: TrackId,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let slot = project
+        .track(track)
+        .map_err(|e| e.to_string())?
+        .instrument
+        .as_ref();
+    for name in names {
+        if name == VELOCITY {
+            continue;
+        }
+        if let Some(slot) = slot
+            && params::find(slot.kind.params(), name).is_none()
+        {
+            return Err(format!(
+                "a control is velocity or a parameter of the track's {}, which has no {name:?}; \
+                 it has: {}",
+                slot.kind.name(),
+                names_of(slot.kind.params())
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn names_of(specs: &[ParamSpec]) -> String {
+    names(specs.iter().map(|s| s.name))
+}
+
+/// A swing from the tool arguments, on top of `current`.
+fn swing_of(current: Swing, amount: Option<u8>, grid: Option<u8>) -> Swing {
+    Swing::new(
+        amount.unwrap_or(current.amount),
+        grid.unwrap_or(current.grid),
+    )
+}
+
+/// The track a duck follows, from a tool argument; an empty string is none.
+fn find_sidechain(project: &Project, r: &str) -> Result<Option<TrackId>, String> {
+    if r.trim().is_empty() {
+        return Ok(None);
+    }
+    find_track(project, r).map(Some)
+}
+
+fn effect_json(project: &Project, s: &EffectSlot) -> Value {
+    let mut v = json!({
+        "effect": s.id.to_string(),
+        "type": s.kind.name(),
+        "enabled": s.enabled,
+        "params": s.params,
+    });
+    if let Some(t) = s.sidechain {
+        v["sidechain"] = json!(
+            project
+                .track(t)
+                .map_or("(deleted track)".into(), |t| t.name.clone())
+        );
+    }
+    v
+}
+
 fn parse_color(text: &str) -> Result<[u8; 3], String> {
     let hex = text.trim().trim_start_matches('#');
     let bad = || format!("colors look like #3a7bd5, got {text:?}");
@@ -389,6 +471,9 @@ pub struct ClipArg {
 pub struct PatternQueryArgs {
     /// Mini-notation pattern text.
     pub pattern: String,
+    /// Read the pattern as numbers, the way a control pattern is. Default
+    /// false.
+    pub numbers: Option<bool>,
     /// How many cycles to list, 1 to 16. Default 1.
     pub cycles: Option<u32>,
     /// Random seed for ? and other random choices. Default 0.
@@ -536,6 +621,9 @@ pub struct EffectInsertArgs {
     pub params: Option<BTreeMap<String, Value>>,
     /// Position in the chain, 0 is first. Default: last.
     pub index: Option<usize>,
+    /// For a duck: the track whose notes drive it (ID or name). Default:
+    /// the first other drum track.
+    pub sidechain: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -547,6 +635,9 @@ pub struct EffectSetArgs {
     /// Parameters to set; null restores a default.
     pub params: Option<BTreeMap<String, Value>>,
     pub enabled: Option<bool>,
+    /// For a duck: the track whose notes drive it (ID or name); an empty
+    /// string disconnects it.
+    pub sidechain: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -570,6 +661,13 @@ pub struct ClipCreateArgs {
     pub cycle_bars: Option<f64>,
     /// Pattern random seed. Default 0.
     pub seed: Option<u64>,
+    /// For a pattern clip: number patterns read at each note, by parameter:
+    /// velocity or one of the instrument's parameters.
+    pub controls: Option<BTreeMap<String, String>>,
+    /// For a pattern clip: swing from 50 (straight) to 75. Default 50.
+    pub swing: Option<u8>,
+    /// The step that swings: 4, 8, 16 (default) or 32.
+    pub swing_grid: Option<u8>,
     /// For an audio clip on an audio track: the imported audio (ID or name).
     pub audio: Option<String>,
     /// Audio clip gain in dB.
@@ -601,10 +699,18 @@ pub struct NotesWriteArgs {
 pub struct PatternSetArgs {
     /// Pattern clip ID or name.
     pub clip: String,
-    pub pattern: String,
+    /// New mini-notation. Default: unchanged.
+    pub pattern: Option<String>,
     /// Cycle length in bars. Default: unchanged.
     pub cycle_bars: Option<f64>,
     pub seed: Option<u64>,
+    /// Controls to set, by parameter (velocity or an instrument
+    /// parameter); null removes one. Controls not named stay.
+    pub controls: Option<BTreeMap<String, Option<String>>>,
+    /// Swing from 50 (straight) to 75. Default: unchanged.
+    pub swing: Option<u8>,
+    /// The step that swings: 4, 8, 16 or 32. Default: unchanged.
+    pub swing_grid: Option<u8>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -616,7 +722,8 @@ pub struct UndoArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProjectNewArgs {
     pub name: Option<String>,
-    /// empty (default) or demo.
+    /// empty (default), demo, or techno (a four-bar techno loop that uses
+    /// controls, swing and a duck).
     pub template: Option<String>,
     /// Required when the open project has unsaved changes.
     pub discard_unsaved: Option<bool>,
@@ -872,7 +979,13 @@ impl SkywareMcp {
         annotations(read_only_hint = true)
     )]
     async fn pattern_query(&self, Parameters(a): Parameters<PatternQueryArgs>) -> ToolResult {
-        let pattern = sky_pattern::parse(&a.pattern).map_err(|e| format!("pattern error: {e}"))?;
+        let numbers = a.numbers.unwrap_or(false);
+        let pattern = if numbers {
+            sky_pattern::parse_numbers(&a.pattern)
+        } else {
+            sky_pattern::parse(&a.pattern)
+        }
+        .map_err(|e| format!("pattern error: {e}"))?;
         let cycles = a.cycles.unwrap_or(1).clamp(1, 16);
         let events = pattern.query(
             sky_pattern::Time::from_integer(0),
@@ -883,9 +996,16 @@ impl SkywareMcp {
             .iter()
             .take(512)
             .map(|e| {
+                if let Some(value) = e.value.number() {
+                    return json!({
+                        "begin": e.begin.to_string(),
+                        "end": e.end.to_string(),
+                        "value": value,
+                    });
+                }
                 let (sound, index) = match &e.value {
                     sky_pattern::Value::Sound { name, index } => (Some(name.clone()), *index),
-                    sky_pattern::Value::Note(_) => (None, 0),
+                    _ => (None, 0),
                 };
                 json!({
                     "begin": e.begin.to_string(),
@@ -898,7 +1018,7 @@ impl SkywareMcp {
             .collect();
         let silent = events
             .iter()
-            .filter(|e| e.value.midi_note().is_none())
+            .filter(|e| e.value.midi_note().is_none() && e.value.number().is_none())
             .count();
         let mut v = json!({ "cycles": cycles, "eventCount": events.len(), "events": list });
         if silent > 0 {
@@ -1281,6 +1401,15 @@ impl SkywareMcp {
                 slot.params.insert(k.clone(), x);
             }
         }
+        let own = match channel {
+            ChannelRef::Track(t) => Some(t),
+            ChannelRef::Master => None,
+        };
+        slot.sidechain = match &a.sidechain {
+            Some(r) => find_sidechain(&project, r)?,
+            None if kind.takes_sidechain() => project.default_sidechain(own),
+            None => None,
+        };
         let id = slot.id;
         self.apply(
             &ctx,
@@ -1292,7 +1421,18 @@ impl SkywareMcp {
                 index: a.index,
             }],
         )?;
-        Ok(json!({ "effect": id.to_string(), "type": kind.name() }).to_string())
+        let project = self.session.project();
+        let slot = channel_effects(&project, channel)
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or("effect not found")?;
+        let mut v = effect_json(&project, slot);
+        if kind.takes_sidechain() && slot.sidechain.is_none() {
+            v["warning"] = json!(
+                "no instrument track to follow yet; set sidechain with effect_set to make it duck"
+            );
+        }
+        Ok(v.to_string())
     }
 
     #[tool(
@@ -1328,8 +1468,15 @@ impl SkywareMcp {
                 enabled,
             });
         }
+        if let Some(r) = &a.sidechain {
+            cmds.push(Command::SetEffectSidechain {
+                channel,
+                effect,
+                source: find_sidechain(&project, r)?,
+            });
+        }
         if cmds.is_empty() {
-            return Err("nothing to change: give params or enabled".into());
+            return Err("nothing to change: give params, enabled or sidechain".into());
         }
         self.apply(
             &ctx,
@@ -1342,7 +1489,7 @@ impl SkywareMcp {
             .iter()
             .find(|e| e.id == effect)
             .cloned();
-        Ok(json!(slot.map(|s| json!({ "effect": s.id.to_string(), "type": s.kind.name(), "enabled": s.enabled, "params": s.params }))).to_string())
+        Ok(json!(slot.map(|s| effect_json(&project, &s))).to_string())
     }
 
     #[tool(description = "Removes an effect from a track or the master.")]
@@ -1382,6 +1529,11 @@ impl SkywareMcp {
         if given > 1 {
             return Err("give notes, pattern or audio, not more than one".into());
         }
+        if a.pattern.is_none()
+            && (a.controls.is_some() || a.swing.is_some() || a.swing_grid.is_some())
+        {
+            return Err("controls and swing are for pattern clips; give a pattern too".into());
+        }
         let (content, default_name) = if let Some(audio) = &a.audio {
             let source = find_audio(&project, audio)?;
             let name = project
@@ -1400,11 +1552,15 @@ impl SkywareMcp {
             )
         } else if let Some(p) = &a.pattern {
             let cycle = bars_len(&project, a.cycle_bars.unwrap_or(1.0))?;
+            let controls = a.controls.clone().unwrap_or_default();
+            check_controls(&project, track, controls.keys().map(String::as_str))?;
             (
                 ClipContent::Pattern {
                     source: p.clone(),
                     seed: a.seed.unwrap_or(0),
                     cycle,
+                    controls,
+                    swing: swing_of(Swing::default(), a.swing, a.swing_grid),
                 },
                 "Pattern".to_string(),
             )
@@ -1563,7 +1719,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Replaces a pattern clip's mini-notation, and optionally its cycle length or seed."
+        description = "Changes a pattern clip: its mini-notation, cycle length, seed, control patterns (velocity or instrument parameters per note) or swing. Returns the clip."
     )]
     async fn pattern_set(
         &self,
@@ -1572,8 +1728,15 @@ impl SkywareMcp {
     ) -> ToolResult {
         let project = self.session.project();
         let id = find_clip(&project, &a.clip)?;
-        let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
-        let ClipContent::Pattern { seed, cycle, .. } = &clip.content else {
+        let (track, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
+        let ClipContent::Pattern {
+            source,
+            seed,
+            cycle,
+            controls,
+            swing,
+        } = &clip.content
+        else {
             return Err(format!(
                 "{} is a {} clip, not a pattern clip",
                 clip.name,
@@ -1584,18 +1747,43 @@ impl SkywareMcp {
             Some(b) => bars_len(&project, b)?,
             None => *cycle,
         };
+        let mut controls = controls.clone();
+        for (name, value) in a.controls.iter().flatten() {
+            match value {
+                Some(v) => {
+                    controls.insert(name.clone(), v.clone());
+                }
+                None => {
+                    controls.remove(name);
+                }
+            }
+        }
+        if let Some(changed) = &a.controls {
+            check_controls(
+                &project,
+                track.id,
+                changed
+                    .iter()
+                    .filter(|(_, v)| v.is_some())
+                    .map(|(k, _)| k.as_str()),
+            )?;
+        }
         self.apply(
             &ctx,
             "pattern_set",
             format!("Change pattern {}", clip.name),
             vec![Command::SetPattern {
                 clip: id,
-                source: a.pattern.clone(),
+                source: a.pattern.clone().unwrap_or_else(|| source.clone()),
                 seed: a.seed.unwrap_or(*seed),
                 cycle,
+                controls,
+                swing: swing_of(*swing, a.swing, a.swing_grid),
             }],
         )?;
-        Ok(format!("Pattern is now {:?}.", a.pattern))
+        let project = self.session.project();
+        let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
+        Ok(clip_json(&project, clip, true).to_string())
     }
 
     #[tool(description = "Undoes the latest change or changes, whoever made them.")]
@@ -1619,7 +1807,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Starts a new project, empty or from the demo template. The open project must be saved first unless discard_unsaved is true.",
+        description = "Starts a new project: empty, the demo, or the techno loop template. The open project must be saved first unless discard_unsaved is true.",
         annotations(destructive_hint = true)
     )]
     async fn project_new(&self, Parameters(a): Parameters<ProjectNewArgs>) -> ToolResult {
@@ -1628,7 +1816,8 @@ impl SkywareMcp {
         let mut project = match a.template.as_deref().unwrap_or("empty") {
             "empty" => empty_project(&name),
             "demo" => demo_project(),
-            other => return Err(format!("template {other:?} is not empty or demo")),
+            "techno" => techno_project(),
+            other => return Err(format!("template {other:?} is not empty, demo or techno")),
         };
         project.name = name;
         self.session.new_project(project);

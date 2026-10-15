@@ -124,6 +124,19 @@ impl ParamSpec {
         })
     }
 
+    /// Brings any value into range, rounded for choices and toggles; a value
+    /// that is not a number becomes the default.
+    pub fn clamp(&self, value: f32) -> f32 {
+        if !value.is_finite() {
+            return self.default;
+        }
+        let value = value.clamp(self.min, self.max);
+        match self.kind {
+            ParamKind::Continuous { .. } => value,
+            _ => value.round(),
+        }
+    }
+
     /// For choice parameters, the index of an option given by name.
     pub fn option_index(&self, option: &str) -> Option<f32> {
         match self.kind {

@@ -298,11 +298,7 @@ fn empty_and_odd_projects_do_not_panic() {
         name: "Broken".into(),
         start: 3840,
         length: 3840,
-        content: ClipContent::Pattern {
-            source: "c4 [e4".into(),
-            seed: 0,
-            cycle: 0,
-        },
+        content: ClipContent::pattern("c4 [e4", 0, 0),
     });
     let mut audio = Track::new_audio("Odd audio");
     audio.clips.push(Clip {
@@ -790,6 +786,131 @@ fn pattern_edits_apply_on_enter() {
         other => panic!("{other:?}"),
     }
     assert_eq!(h.app.pattern.text, original, "the box follows the undo");
+}
+
+#[test]
+fn pattern_controls_apply_on_enter_and_follow_undo() {
+    let mut h = Harness::demo();
+    let drums = h.track_named("Drums");
+    let clip = drums.clips[0].id;
+    let controls = |h: &Harness| match &h.clip(clip).content {
+        ClipContent::Pattern { controls, .. } => controls.clone(),
+        other => panic!("{other:?}"),
+    };
+    h.app.sel.select_clip(drums.id, clip);
+    h.app.tab = Tab::Editor;
+    h.frames(3);
+    h.app
+        .report(actions::set_pattern_control(
+            &h.app.session,
+            clip,
+            "velocity",
+            Some("100"),
+        ))
+        .unwrap();
+    h.frames(2);
+    assert_eq!(h.app.pattern.controls.get("velocity").unwrap(), "100");
+    let text_id = Id::new(("control_text", clip, "velocity"));
+    // A name where numbers go is not applied.
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+    h.key(Key::A, COMMAND);
+    h.type_text("127 bd");
+    h.key(Key::Enter, Modifiers::NONE);
+    let notice = h
+        .app
+        .notice
+        .as_ref()
+        .map(|n| n.text.clone())
+        .unwrap_or_default();
+    assert!(notice.starts_with("velocity not applied"), "{notice}");
+    assert_eq!(controls(&h)["velocity"], "100");
+    // Numbers are.
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+    h.key(Key::A, COMMAND);
+    h.type_text("127 0 90 60");
+    h.key(Key::Enter, Modifiers::NONE);
+    assert_eq!(controls(&h)["velocity"], "127 0 90 60");
+    h.run(Action::Undo);
+    assert_eq!(controls(&h)["velocity"], "100");
+    assert_eq!(
+        h.app.pattern.controls["velocity"], "100",
+        "the box follows the undo"
+    );
+    // Swing and removal go through the same command.
+    h.app
+        .report(actions::set_swing(
+            &h.app.session,
+            clip,
+            sky_model::Swing::new(62, 16),
+            None,
+        ))
+        .unwrap();
+    h.app
+        .report(actions::set_pattern_control(
+            &h.app.session,
+            clip,
+            "velocity",
+            None,
+        ))
+        .unwrap();
+    h.frames(2);
+    match &h.clip(clip).content {
+        ClipContent::Pattern {
+            controls, swing, ..
+        } => {
+            assert!(controls.is_empty());
+            assert_eq!(swing.amount, 62);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_new_duck_follows_the_drums() {
+    let mut h = Harness::demo();
+    let drums = h.track_named("Drums");
+    let bass = h.track_named("Bass");
+    let id = h
+        .app
+        .report(actions::add_effect(
+            &h.app.session,
+            sky_model::ChannelRef::Track(bass.id),
+            sky_dsp::EffectType::Duck,
+        ))
+        .unwrap();
+    let bass = h.track_named("Bass");
+    assert_eq!(bass.channel.effect(id).unwrap().sidechain, Some(drums.id));
+    // The window shows who it follows and survives the drums being deleted.
+    h.app.mixer.open_effect = Some((sky_model::ChannelRef::Track(bass.id), id));
+    h.app.tab = Tab::Mixer;
+    h.frames(3);
+    h.app
+        .report(actions::apply(
+            &h.app.session,
+            Transaction::single(Command::RemoveTrack { id: drums.id }),
+            None,
+        ))
+        .unwrap();
+    h.frames(3);
+    assert!(h.app.mixer.open_effect.is_some());
+}
+
+#[test]
+fn the_techno_template_renders_everywhere() {
+    let mut h = Harness::with_project(sky_model::templates::techno_project());
+    h.every_tab();
+    for t in h.project().tracks.clone() {
+        for c in &t.clips {
+            h.app.sel.select_clip(t.id, c.id);
+            h.every_tab();
+        }
+        for e in &t.channel.effects {
+            h.app.mixer.open_effect = Some((sky_model::ChannelRef::Track(t.id), e.id));
+            h.frames(2);
+        }
+    }
 }
 
 #[test]

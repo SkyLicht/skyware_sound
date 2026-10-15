@@ -32,15 +32,19 @@ fn processors_do_not_allocate() {
                 InstrumentType::Bank => InstrumentAudio::Bank(bank.clone()),
                 _ => InstrumentAudio::Sample(sample.clone()),
             };
-            t.create(48_000.0, audio)
+            (t.params(), t.create(48_000.0, audio))
         })
         .collect();
     let mut left = vec![0.0f32; sky_dsp::MAX_BLOCK];
     let mut right = vec![0.0f32; sky_dsp::MAX_BLOCK];
     assert_no_alloc(|| {
         for block in 0..50 {
-            for inst in instruments.iter_mut() {
+            for (params, inst) in instruments.iter_mut() {
                 if block % 10 == 0 {
+                    // Parameter locks set values right before notes.
+                    for spec in params.iter() {
+                        inst.set_param(spec.name, spec.max);
+                    }
                     for note in [36, 38, 42, 60, 64, 67] {
                         inst.note_on(note, 100);
                     }
@@ -54,6 +58,11 @@ fn processors_do_not_allocate() {
                 inst.render(&mut left, &mut right);
             }
             for fx in effects.iter_mut() {
+                if block % 10 == 0 {
+                    fx.set_tempo(90.0 + block as f64);
+                    fx.sidechain_note(17, 36);
+                    fx.sidechain_note(300, 42);
+                }
                 fx.process(&mut left, &mut right);
             }
         }

@@ -5,12 +5,12 @@
 use std::collections::HashMap;
 
 use egui::{
-    Align, Color32, Context, CornerRadius, Frame, Id, Layout, Margin, RichText, ScrollArea, Sense,
-    Ui, Window, vec2,
+    Align, Color32, ComboBox, Context, CornerRadius, Frame, Id, Layout, Margin, RichText,
+    ScrollArea, Sense, Ui, Window, vec2,
 };
 use sky_core::{EffectId, TrackId};
 use sky_dsp::EffectType;
-use sky_model::{Channel, ChannelRef, Project};
+use sky_model::{Channel, ChannelRef, EffectSlot, Project};
 
 use crate::actions::{self, ChannelChange};
 use crate::app::{Action, App};
@@ -316,6 +316,46 @@ fn effects_section(
 }
 
 /// The floating parameter editor of the open effect.
+/// Picks the track whose notes drive an effect such as a duck.
+fn sidechain_row(
+    app: &mut App,
+    ui: &mut Ui,
+    project: &Project,
+    channel_ref: ChannelRef,
+    effect: &EffectSlot,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Follows");
+        let name_of = |id: TrackId| {
+            project
+                .track(id)
+                .map_or_else(|_| "(deleted track)".to_string(), |t| t.name.clone())
+        };
+        let mut chosen = effect.sidechain;
+        ComboBox::from_id_salt(("sidechain", effect.id))
+            .selected_text(chosen.map_or_else(|| "(nothing)".to_string(), name_of))
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut chosen, None, "(nothing)");
+                for t in project
+                    .tracks
+                    .iter()
+                    .filter(|t| t.kind == sky_model::TrackKind::Instrument)
+                {
+                    ui.selectable_value(&mut chosen, Some(t.id), &t.name);
+                }
+            })
+            .response
+            .on_hover_text(
+                "The track whose notes start each dip. It works even when that track is muted.",
+            );
+        if chosen != effect.sidechain {
+            let r = actions::set_effect_sidechain(&app.session, channel_ref, effect.id, chosen);
+            app.report(r);
+        }
+    });
+}
+
 pub fn effect_window(app: &mut App, ctx: &Context) {
     let Some((channel_ref, effect_id)) = app.mixer.open_effect else {
         return;
@@ -384,6 +424,9 @@ pub fn effect_window(app: &mut App, ctx: &Context) {
                 app.report(r);
             }
         });
+        if effect.kind.takes_sidechain() {
+            sidechain_row(app, ui, project, channel_ref, effect);
+        }
         ui.separator();
         changes = param_grid(
             ui,

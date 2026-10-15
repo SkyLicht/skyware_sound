@@ -5,11 +5,13 @@
 //! message a person can read on failure. Drags pass a coalescing key so that
 //! every change of one gesture merges into a single undo step.
 
+use std::collections::BTreeMap;
+
 use sky_core::{ClipId, EffectId, NoteId, PPQ, Ticks, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::{
-    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project, Track,
-    Transaction,
+    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project, Swing,
+    Track, Transaction,
 };
 use sky_session::Session;
 
@@ -244,7 +246,14 @@ pub fn add_effect(
     channel: ChannelRef,
     kind: EffectType,
 ) -> ActionResult<EffectId> {
-    let effect = EffectSlot::new(kind);
+    let mut effect = EffectSlot::new(kind);
+    if kind.takes_sidechain() {
+        let own = match channel {
+            ChannelRef::Track(t) => Some(t),
+            ChannelRef::Master => None,
+        };
+        effect.sidechain = session.project().default_sidechain(own);
+    }
     let id = effect.id;
     apply(
         session,
@@ -286,6 +295,23 @@ pub fn set_effect_enabled(
             channel,
             effect,
             enabled,
+        },
+        None,
+    )
+}
+
+pub fn set_effect_sidechain(
+    session: &Session,
+    channel: ChannelRef,
+    effect: EffectId,
+    source: Option<TrackId>,
+) -> ActionResult<u64> {
+    single(
+        session,
+        Command::SetEffectSidechain {
+            channel,
+            effect,
+            source,
         },
         None,
     )
@@ -354,11 +380,7 @@ pub fn add_pattern_clip(
         name: "Pattern".into(),
         start: start.max(0),
         length: length.max(1),
-        content: ClipContent::Pattern {
-            source: source.to_string(),
-            seed: 0,
-            cycle: project.ticks_per_bar(),
-        },
+        content: ClipContent::pattern(source, 0, project.ticks_per_bar()),
     };
     let id = clip.id;
     apply(
@@ -530,6 +552,58 @@ pub fn remove_notes(session: &Session, clip: ClipId, ids: Vec<NoteId>) -> Action
     )
 }
 
+/// A pattern clip's settings, for changing some and keeping the rest.
+#[derive(Clone, Debug)]
+pub struct PatternFields {
+    pub source: String,
+    pub seed: u64,
+    pub cycle: Ticks,
+    pub controls: BTreeMap<String, String>,
+    pub swing: Swing,
+}
+
+/// Changes a pattern clip through `edit`, keeping whatever it leaves alone.
+pub fn edit_pattern(
+    session: &Session,
+    clip: ClipId,
+    key: Option<u64>,
+    edit: impl FnOnce(&mut PatternFields),
+) -> ActionResult<u64> {
+    let project = session.project();
+    let (_, c) = project.find_clip(clip).map_err(|e| e.to_string())?;
+    let ClipContent::Pattern {
+        source,
+        seed,
+        cycle,
+        controls,
+        swing,
+    } = &c.content
+    else {
+        return Err(format!("{} is not a pattern clip", c.name));
+    };
+    let mut fields = PatternFields {
+        source: source.clone(),
+        seed: *seed,
+        cycle: *cycle,
+        controls: controls.clone(),
+        swing: *swing,
+    };
+    drop(project);
+    edit(&mut fields);
+    single(
+        session,
+        Command::SetPattern {
+            clip,
+            source: fields.source,
+            seed: fields.seed,
+            cycle: fields.cycle.max(1),
+            controls: fields.controls,
+            swing: fields.swing,
+        },
+        key,
+    )
+}
+
 pub fn set_pattern(
     session: &Session,
     clip: ClipId,
@@ -538,16 +612,37 @@ pub fn set_pattern(
     cycle: Ticks,
     key: Option<u64>,
 ) -> ActionResult<u64> {
-    single(
-        session,
-        Command::SetPattern {
-            clip,
-            source: source.to_string(),
-            seed,
-            cycle: cycle.max(1),
-        },
-        key,
-    )
+    edit_pattern(session, clip, key, |f| {
+        f.source = source.to_string();
+        f.seed = seed;
+        f.cycle = cycle;
+    })
+}
+
+/// Sets one control pattern of a clip; `None` removes it.
+pub fn set_pattern_control(
+    session: &Session,
+    clip: ClipId,
+    param: &str,
+    source: Option<&str>,
+) -> ActionResult<u64> {
+    edit_pattern(session, clip, None, |f| match source {
+        Some(s) => {
+            f.controls.insert(param.to_string(), s.to_string());
+        }
+        None => {
+            f.controls.remove(param);
+        }
+    })
+}
+
+pub fn set_swing(
+    session: &Session,
+    clip: ClipId,
+    swing: Swing,
+    key: Option<u64>,
+) -> ActionResult<u64> {
+    edit_pattern(session, clip, key, |f| f.swing = swing)
 }
 
 /// A project with `tracks` synth tracks, each with a pattern or MIDI clip,
@@ -574,11 +669,7 @@ pub fn stress_project(tracks: usize) -> Project {
                 name: format!("Pattern {}", i + 1),
                 start: 0,
                 length: bar * 8,
-                content: ClipContent::Pattern {
-                    source: patterns[i % patterns.len()].to_string(),
-                    seed: i as u64,
-                    cycle: bar,
-                },
+                content: ClipContent::pattern(patterns[i % patterns.len()], i as u64, bar),
             }
         } else {
             let notes = (0..32)

@@ -14,6 +14,10 @@
 //!
 //! The numbers after `!` and `?` are optional, so they only count when they
 //! touch the operator: `bd? 1` is `bd?` followed by the note 1.
+//!
+//! A number pattern ([`parse_numbers`]) has the same grammar, but its terms
+//! are numbers, which may be negative (`"-"? NUMBER`), instead of names and
+//! notes.
 
 use std::sync::Arc;
 
@@ -21,7 +25,7 @@ use crate::ast::{Node, Q, euclid_hits};
 use crate::bounds::{MAX_EVENTS_PER_CYCLE, Problem};
 use crate::lexer::{Tok, Token, lex};
 use crate::value::{NoteName, drum_note, note_name};
-use crate::{ParseError, Span, Value};
+use crate::{ParseError, Span, Time, Value};
 
 /// Most copies `!` can make of one step.
 const MAX_REPEAT: u64 = 1024;
@@ -31,13 +35,27 @@ const MAX_EUCLID_STEPS: u64 = 1024;
 const MAX_FACTOR: i128 = 10_000;
 /// Most decimal places in a speed factor or weight.
 const MAX_DECIMALS: usize = 4;
+/// Most decimal places in a number pattern's value.
+const MAX_VALUE_DECIMALS: usize = 6;
+/// Largest magnitude of a number pattern's value.
+const MAX_VALUE: i64 = 1_000_000_000;
 
 pub(crate) fn parse(src: &str) -> Result<Arc<Node>, ParseError> {
+    parse_terms(src, false)
+}
+
+/// Parses a pattern whose terms are numbers, such as `100 60 <80 -12.5>`.
+pub(crate) fn parse_numbers(src: &str) -> Result<Arc<Node>, ParseError> {
+    parse_terms(src, true)
+}
+
+fn parse_terms(src: &str, numbers: bool) -> Result<Arc<Node>, ParseError> {
     let mut parser = Parser {
         src,
         tokens: lex(src)?,
         pos: 0,
         last_end: 0,
+        numbers,
     };
     let group = parser.group(false)?;
     let tok = parser.peek();
@@ -57,6 +75,8 @@ struct Parser<'a> {
     pos: usize,
     /// End of the last consumed token.
     last_end: usize,
+    /// Terms are numbers rather than names and notes.
+    numbers: bool,
 }
 
 /// A parsed group, stack or sequence.
@@ -227,6 +247,15 @@ impl Parser<'_> {
                         "':' must directly follow a sound name, as in sd:3",
                     ));
                 }
+                Tok::Minus if self.numbers => {
+                    let next = self.tokens[self.pos + 1];
+                    if next.kind != Tok::Number || next.spaced {
+                        return Err(
+                            self.error(tok.span, "'-' must come right before a number, as in -12")
+                        );
+                    }
+                    self.step(&mut steps)?;
+                }
                 Tok::Minus => {
                     return Err(self.error(
                         tok.span,
@@ -253,7 +282,21 @@ impl Parser<'_> {
     fn step(&mut self, steps: &mut Vec<(Arc<Node>, Q)>) -> Result<(), ParseError> {
         let tok = self.bump();
         let mut node = match tok.kind {
+            Tok::Word if self.numbers => {
+                let message = format!(
+                    "expected a number, found '{}'; this pattern takes numbers",
+                    self.text(tok.span)
+                );
+                return Err(self.error(tok.span, message));
+            }
             Tok::Word => self.word(tok)?,
+            Tok::Number if self.numbers => self.number(tok, false)?,
+            Tok::Minus => {
+                // `sequence` only gets here in a number pattern, with a
+                // number touching the sign.
+                let number = self.bump();
+                self.number(number, true)?
+            }
             Tok::Number => self.note_number(tok)?,
             Tok::Tilde => Node::silence(),
             Tok::LBracket => {
@@ -310,7 +353,9 @@ impl Parser<'_> {
                     self.check_bounds(&node, self.span_from(op.span.start))?;
                 }
                 Tok::Colon => {
-                    let message = if tok.kind == Tok::Number {
+                    let message = if self.numbers {
+                        "a number can't have a sample index"
+                    } else if tok.kind == Tok::Number {
                         "a note number can't have a sample index"
                     } else {
                         "':' must directly follow a sound name, as in sd:3"
@@ -421,6 +466,45 @@ impl Parser<'_> {
                 format!("note number {text} is outside the MIDI range 0-127"),
             )),
         }
+    }
+
+    /// A number pattern's value, exactly: `1.5` is 3/2.
+    fn number(&self, tok: Token, negative: bool) -> Result<Arc<Node>, ParseError> {
+        let text = self.text(tok.span);
+        let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+        if fraction.len() > MAX_VALUE_DECIMALS {
+            return Err(self.error(
+                tok.span,
+                format!("a number can have at most {MAX_VALUE_DECIMALS} decimal places"),
+            ));
+        }
+        let too_large = || {
+            self.error(
+                tok.span,
+                format!("a number can be at most {MAX_VALUE} either side of zero"),
+            )
+        };
+        let whole: i64 = whole.parse().map_err(|_| too_large())?;
+        if whole > MAX_VALUE {
+            return Err(too_large());
+        }
+        let denom = 10i64.pow(fraction.len() as u32);
+        let fraction: i64 = if fraction.is_empty() {
+            0
+        } else {
+            fraction.parse().map_err(|_| too_large())?
+        };
+        let numer = whole * denom + fraction;
+        let value = Time::new(if negative { -numer } else { numer }, denom);
+        let span = Span {
+            start: if negative {
+                tok.span.start - 1
+            } else {
+                tok.span.start
+            },
+            end: tok.span.end,
+        };
+        Ok(Node::atom(Value::Number(value), span))
     }
 
     /// The positive decimal after `op`, such as the `1.5` in `*1.5`.

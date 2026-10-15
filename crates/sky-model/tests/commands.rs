@@ -23,6 +23,7 @@ fn every_command_undoes_exactly() {
     let bass_clip = project.tracks[1].clips[0].id;
     let pattern_clip = project.tracks[0].clips[0].id;
     let reverb = project.tracks[2].channel.effects[0].id;
+    let duck = EffectSlot::new(EffectType::Duck);
     let new_track = Track::new_instrument("Lead", InstrumentType::Synth);
     let lead = new_track.id;
     let note_ids: Vec<NoteId>;
@@ -88,6 +89,16 @@ fn every_command_undoes_exactly() {
             effect: EffectSlot::new(EffectType::Delay),
             index: None,
         },
+        Command::AddEffect {
+            channel: ChannelRef::Track(bass),
+            effect: duck.clone(),
+            index: Some(0),
+        },
+        Command::SetEffectSidechain {
+            channel: ChannelRef::Track(bass),
+            effect: duck.id,
+            source: Some(drums),
+        },
         Command::SetEffectParam {
             channel: ChannelRef::Track(project.tracks[2].id),
             effect: reverb,
@@ -139,6 +150,8 @@ fn every_command_undoes_exactly() {
             source: "bd sd".into(),
             seed: 9,
             cycle: PPQ * 2,
+            controls: [("velocity".to_string(), "127 60".to_string())].into(),
+            swing: Swing::new(62, 16),
         },
         Command::RemoveClip { id: pattern_clip },
         Command::RemoveTrack { id: drums },
@@ -220,6 +233,165 @@ fn validation_messages_are_specific() {
 }
 
 #[test]
+fn pattern_controls_and_swing_are_checked() {
+    let mut project = demo_project();
+    let clip = project.tracks[0].clips[0].id;
+    let set = |controls: &[(&str, &str)], swing: Swing| Command::SetPattern {
+        clip,
+        source: "bd*4".into(),
+        seed: 1,
+        cycle: PPQ * 4,
+        controls: controls
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        swing,
+    };
+    let straight = Swing::default();
+    // Any instrument's parameter is accepted, not only the current one's,
+    // so changing the instrument never breaks a clip.
+    set(
+        &[("velocity", "127 80"), ("cutoff", "<400 4000>")],
+        straight,
+    )
+    .apply(&mut project)
+    .unwrap();
+    let error = |c: Command, project: &mut Project| c.apply(project).unwrap_err().to_string();
+    let e = error(set(&[("cutof", "1")], straight), &mut project);
+    assert!(e.contains("velocity") && e.contains("cutof"), "{e}");
+    let e = error(set(&[("velocity", "100 bd")], straight), &mut project);
+    assert!(e.contains("velocity") && e.contains("takes numbers"), "{e}");
+    let many: Vec<(String, String)> = ["velocity", "cutoff", "resonance", "attack", "decay"]
+        .iter()
+        .chain(&["sustain", "release", "detune", "gain"])
+        .map(|n| (n.to_string(), "1".to_string()))
+        .collect();
+    let many: Vec<(&str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let e = error(set(&many, straight), &mut project);
+    assert!(e.contains("at most 8"), "{e}");
+    let e = error(set(&[], Swing::new(80, 16)), &mut project);
+    assert!(e.contains("75"), "{e}");
+    let e = error(set(&[], Swing::new(60, 12)), &mut project);
+    assert!(e.contains("16"), "{e}");
+}
+
+#[test]
+fn sidechains_need_a_duck_and_an_instrument_track() {
+    let mut project = demo_project();
+    let drums = project.tracks[0].id;
+    let bass = ChannelRef::Track(project.tracks[1].id);
+    let reverb = project.tracks[2].channel.effects[0].id;
+    let pad = ChannelRef::Track(project.tracks[2].id);
+    let e = Command::SetEffectSidechain {
+        channel: pad,
+        effect: reverb,
+        source: Some(drums),
+    }
+    .apply(&mut project)
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("only a duck"), "{e}");
+    let duck = EffectSlot::new(EffectType::Duck);
+    let id = duck.id;
+    Command::AddEffect {
+        channel: bass,
+        effect: duck,
+        index: None,
+    }
+    .apply(&mut project)
+    .unwrap();
+    let audio = Track::new_audio("Loop");
+    let audio_id = audio.id;
+    Command::AddTrack {
+        track: Box::new(audio),
+        index: None,
+    }
+    .apply(&mut project)
+    .unwrap();
+    let e = Command::SetEffectSidechain {
+        channel: bass,
+        effect: id,
+        source: Some(audio_id),
+    }
+    .apply(&mut project)
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("instrument track"), "{e}");
+    assert!(
+        Command::SetEffectSidechain {
+            channel: bass,
+            effect: id,
+            source: Some(TrackId::new()),
+        }
+        .apply(&mut project)
+        .is_err()
+    );
+    let undo = Command::SetEffectSidechain {
+        channel: bass,
+        effect: id,
+        source: Some(drums),
+    }
+    .apply(&mut project)
+    .unwrap();
+    assert_eq!(
+        undo,
+        Command::SetEffectSidechain {
+            channel: bass,
+            effect: id,
+            source: None,
+        }
+    );
+    // Deleting the source leaves the duck pointing at nothing, and undoing
+    // the deletions in reverse order still works.
+    let mut history = History::new();
+    history
+        .apply(&mut project, tx(vec![Command::RemoveTrack { id: drums }]))
+        .unwrap();
+    let bass_id = project.tracks[0].id;
+    history
+        .apply(&mut project, tx(vec![Command::RemoveTrack { id: bass_id }]))
+        .unwrap();
+    history.undo(&mut project).unwrap();
+    history.undo(&mut project).unwrap();
+    assert_eq!(project.tracks[1].channel.effects[0].sidechain, Some(drums));
+}
+
+#[test]
+fn old_files_load_without_controls_swing_or_sidechain() {
+    let clip: ClipContent =
+        serde_json::from_str(r#"{"type":"pattern","source":"bd sd","seed":2,"cycle":3840}"#)
+            .unwrap();
+    assert_eq!(clip, ClipContent::pattern("bd sd", 2, 3840));
+    // And they save the same way when nothing new is used.
+    assert_eq!(
+        serde_json::to_string(&clip).unwrap(),
+        r#"{"type":"pattern","source":"bd sd","seed":2,"cycle":3840}"#
+    );
+    let slot = EffectSlot::new(EffectType::Duck);
+    let json = serde_json::to_string(&slot).unwrap();
+    assert!(!json.contains("sidechain"), "{json}");
+}
+
+#[test]
+fn swing_moves_every_second_step() {
+    let sixteenth = PPQ / 4;
+    let swing = Swing::new(75, 16);
+    // The on-beat step stays; the off-beat one moves 3/4 of the way
+    // through the pair; the next pair starts on time.
+    assert_eq!(swing.apply(0), 0);
+    assert_eq!(swing.apply(sixteenth), sixteenth * 3 / 2);
+    assert_eq!(swing.apply(2 * sixteenth), 2 * sixteenth);
+    assert_eq!(Swing::default().apply(sixteenth), sixteenth);
+    // Times keep their order.
+    let mut last = -1;
+    for t in 0..PPQ * 2 {
+        let s = Swing::new(66, 8).apply(t);
+        assert!(s >= last);
+        last = s;
+    }
+}
+
+#[test]
 fn coalesced_steps_merge_into_one_undo() {
     let mut project = demo_project();
     let start = project.clone();
@@ -285,11 +457,15 @@ fn arb_command(track_ids: Vec<TrackId>, clip_ids: Vec<ClipId>) -> impl Strategy<
             clip,
             notes: vec![sky_model::Note::new(s * 120, 240, p, 100)]
         }),
-        (clips, "[a-z ~*]{0,12}").prop_map(|(clip, source)| Command::SetPattern {
-            clip,
-            source,
-            seed: 3,
-            cycle: PPQ * 4
+        (clips, "[a-z ~*]{0,12}", 50u8..80).prop_map(|(clip, source, swing)| {
+            Command::SetPattern {
+                clip,
+                source,
+                seed: 3,
+                cycle: PPQ * 4,
+                controls: [("velocity".to_string(), "100 [60 127]".to_string())].into(),
+                swing: Swing::new(swing, 16),
+            }
         }),
         Just(Command::AddTrack {
             track: Box::new(Track::new_audio("Audio")),
