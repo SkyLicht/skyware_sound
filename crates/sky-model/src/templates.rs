@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Starter projects.
 
-use sky_core::{ClipId, TempoMap};
+use sky_core::manifest::{Category, RandomRange, Selection};
+use sky_core::{AssetId, ClipId, TempoMap};
 use sky_dsp::{EffectType, InstrumentType};
 
 use crate::notes::parse_note_list;
@@ -91,6 +92,38 @@ pub fn demo_project() -> Project {
         .effects
         .push(EffectSlot::new(EffectType::Limiter).with_params(&[("ceiling", -1.0)]));
     p.tracks = vec![drums, bass, pad];
+
+    // What the game export writes: the whole loop as music, and the four
+    // beats of the first bar as a set of hits.
+    p.game.assets = vec![
+        GameAsset {
+            id: AssetId::new(),
+            name: "demo_music".into(),
+            category: Category::Music,
+            tags: Vec::new(),
+            kind: GameAssetKind::Loop {
+                range: TimeRange {
+                    start: 0,
+                    end: bar * bars,
+                },
+                intro_start: None,
+            },
+        },
+        GameAsset {
+            id: AssetId::new(),
+            name: "demo_hits".into(),
+            category: Category::Sfx,
+            tags: Vec::new(),
+            kind: GameAssetKind::Sfx {
+                variations: TimeRange { start: 0, end: bar }.split(4),
+                selection: Selection::RandomNoRepeat,
+                pitch_semitones: RandomRange::new(-1.0, 1.0),
+                gain_db: RandomRange::new(-2.0, 0.0),
+                tail_seconds: 0.5,
+                mono: false,
+            },
+        },
+    ];
     p
 }
 

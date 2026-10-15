@@ -64,6 +64,21 @@ impl Ramp {
     pub(crate) fn is_settled(&self) -> bool {
         self.remaining == 0
     }
+
+    /// Advances `frames` frames, exactly as that many calls to `next` would.
+    pub(crate) fn advance(&mut self, frames: usize) {
+        if self.remaining == 0 {
+            return;
+        }
+        if frames >= self.remaining as usize {
+            self.value = self.target;
+            self.remaining = 0;
+            return;
+        }
+        for _ in 0..frames {
+            self.next();
+        }
+    }
 }
 
 /// The repeating region of a loop voice, in source frames.
@@ -103,12 +118,11 @@ impl Region {
 pub(crate) struct Voice {
     pub generation: u32,
     pub state: VoiceState,
-    pub is_loop: bool,
-    /// Start order, used to steal the oldest SFX voice.
-    pub started: u64,
-    /// Kept after the voice ends so the audio thread never frees memory; it
-    /// is replaced (and possibly freed) by the next `play` on this slot.
+    /// Kept after the voice ends so the audio thread never frees memory: it
+    /// goes back to the game thread, or is replaced (and possibly freed) by
+    /// the next `play` on this slot.
     pub audio: Option<Arc<AudioData>>,
+    /// Set for loops: the region that repeats.
     pub region: Option<LoopRegion>,
     pub pos: f64,
     pub rate: f64,
@@ -116,10 +130,12 @@ pub(crate) struct Voice {
     pub wrapped: bool,
     pub gain: Ramp,
     pub fade: Ramp,
-    /// Random gain offset picked at trigger time, kept across `set_voice_gain`.
-    pub random_gain_db: f32,
-    pub pan_left: f32,
-    pub pan_right: f32,
+    pub pan_left: Ramp,
+    pub pan_right: Ramp,
+    /// Index of the asset's category, for category gains.
+    pub category: usize,
+    /// The voice ended but the game thread has not been told yet.
+    pub unreported: bool,
 }
 
 impl Voice {
@@ -127,8 +143,6 @@ impl Voice {
         Self {
             generation: 0,
             state: VoiceState::Free,
-            is_loop: false,
-            started: 0,
             audio: None,
             region: None,
             pos: 0.0,
@@ -136,9 +150,10 @@ impl Voice {
             wrapped: false,
             gain: Ramp::at(1.0),
             fade: Ramp::at(1.0),
-            random_gain_db: 0.0,
-            pan_left: 1.0,
-            pan_right: 1.0,
+            pan_left: Ramp::at(1.0),
+            pan_right: Ramp::at(1.0),
+            category: 0,
+            unreported: false,
         }
     }
 
@@ -146,49 +161,49 @@ impl Voice {
         self.state != VoiceState::Free
     }
 
-    /// Mixes this voice into `out` (interleaved stereo, even length).
-    pub(crate) fn render_add(&mut self, out: &mut [f32]) {
+    /// Mixes this voice into `out` (interleaved stereo, even length), with
+    /// `category` as the gain of its category at the first frame.
+    pub(crate) fn render_add(&mut self, out: &mut [f32], category: Ramp) {
         let Some(audio) = self.audio.as_deref() else {
             self.state = VoiceState::Free;
             return;
         };
-        let region = if self.is_loop {
-            match self.region.and_then(Region::new) {
+        let region = match self.region {
+            Some(r) => match Region::new(r) {
                 Some(r) => Some(r),
                 None => {
                     self.state = VoiceState::Free;
                     return;
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
         let left: &[f32] = &audio.left;
         let right: Option<&[f32]> = audio.right.as_deref();
         let frames = audio.frames as f64;
         let rate = self.rate;
-        let (pan_left, pan_right) = (self.pan_left, self.pan_right);
         let stopping = self.state == VoiceState::Stopping;
 
         let mut pos = self.pos;
         let mut wrapped = self.wrapped;
         let mut gain = self.gain;
         let mut fade = self.fade;
+        let mut category = category;
+        let mut pan_left = self.pan_left;
+        let mut pan_right = self.pan_right;
         let mut finished = region.is_none() && pos >= frames;
 
         if !finished {
             for frame in out.as_chunks_mut::<2>().0 {
-                let g = gain.next() * fade.next();
+                let g = gain.next() * fade.next() * category.next();
+                let (pl, pr) = (pan_left.next(), pan_right.next());
                 let ip = pos.floor();
                 let t = (pos - ip) as f32;
                 let i = ip as i64;
                 let l = sample(left, i, t, region, wrapped);
                 let (l, r) = match right {
-                    Some(right) => (
-                        l * pan_left,
-                        sample(right, i, t, region, wrapped) * pan_right,
-                    ),
-                    None => (l * pan_left, l * pan_right),
+                    Some(right) => (l * pl, sample(right, i, t, region, wrapped) * pr),
+                    None => (l * pl, l * pr),
                 };
                 frame[0] += l * g;
                 frame[1] += r * g;
@@ -224,6 +239,8 @@ impl Voice {
         self.wrapped = wrapped;
         self.gain = gain;
         self.fade = fade;
+        self.pan_left = pan_left;
+        self.pan_right = pan_right;
         if finished {
             self.state = VoiceState::Free;
         }
@@ -307,6 +324,20 @@ mod tests {
         assert!(r.is_settled());
         r.ramp_to(0.5, 0);
         assert_eq!(r.next(), 0.5);
+    }
+
+    #[test]
+    fn ramp_advance_matches_stepping() {
+        for frames in [0, 1, 3, 7, 10, 50] {
+            let mut a = Ramp::at(0.3);
+            a.ramp_to(0.9, 10);
+            let mut b = a;
+            a.advance(frames);
+            for _ in 0..frames {
+                b.next();
+            }
+            assert_eq!(a, b, "{frames} frames");
+        }
     }
 
     #[test]

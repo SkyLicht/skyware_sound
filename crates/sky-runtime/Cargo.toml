@@ -16,6 +16,7 @@ categories = ["multimedia::audio", "game-development"]
 [dependencies]
 sky-core.workspace = true
 hound.workspace = true
+rtrb.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

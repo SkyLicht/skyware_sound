@@ -611,3 +611,138 @@ async fn an_assistant_loads_a_strudel_bank_and_exports_with_its_credits() {
     assert!(summary["tracks"][0]["instrument"]["bank"].is_object());
     assert_eq!(summary["audioPool"].as_array().unwrap().len(), 3);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assistant_sets_up_game_assets_and_exports_them_for_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (session, _) = Session::new(sky_model::templates::demo_project(), None);
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Files, vec![tmp.path().to_path_buf()]),
+    ))
+    .await;
+    ok(&client, "project_save", json!({ "path": "Game" })).await;
+
+    // A loop with a one-bar intro, and a set of hits, one per beat.
+    let battle = ok(
+        &client,
+        "game_asset_set",
+        json!({
+            "name": "battle", "kind": "loop", "start_bar": 2, "end_bar": 4,
+            "intro_start_bar": 1, "tags": ["combat"]
+        }),
+    )
+    .await;
+    assert_eq!(battle["asset"]["introStartBar"], 1.0, "{battle}");
+    assert_eq!(battle["asset"]["category"], "music");
+    let hit = ok(
+        &client,
+        "game_asset_set",
+        json!({
+            "name": "hit", "kind": "sfx", "start_bar": 1, "end_bar": 2, "count": 4,
+            "selection": "round_robin", "pitch_semitones": { "min": 2, "max": -2 },
+            "tail_seconds": 0.25
+        }),
+    )
+    .await;
+    assert_eq!(hit["asset"]["variations"].as_array().unwrap().len(), 4);
+    assert_eq!(hit["asset"]["selection"], "roundRobin");
+    assert_eq!(hit["asset"]["pitchSemitones"], json!([-2.0, 2.0]));
+    // Only what changes: split the same bar in two.
+    let hit = ok(
+        &client,
+        "game_asset_set",
+        json!({ "name": "hit", "count": 2 }),
+    )
+    .await;
+    let variations = hit["asset"]["variations"].as_array().unwrap();
+    assert_eq!(variations.len(), 2);
+    assert_eq!(variations[1]["endBar"], 2.0);
+    assert_eq!(hit["asset"]["selection"], "roundRobin");
+
+    for (args, says) in [
+        (json!({ "name": "hit", "intro_start_bar": 1 }), "for loops"),
+        (json!({ "name": "battle", "count": 2 }), "for SFX sets"),
+        (json!({ "name": "nope" }), "battle"),
+        (
+            json!({ "name": "Bad Name", "kind": "loop", "start_bar": 1, "end_bar": 2 }),
+            "Bad Name",
+        ),
+        (
+            json!({ "name": "hit", "variations": [{ "start_bar": 1, "end_bar": 1.5 }],
+                    "start_bar": 1, "end_bar": 2 }),
+            "not both",
+        ),
+    ] {
+        let (text, is_error) = call(&client, "game_asset_set", args).await;
+        assert!(is_error, "{text}");
+        assert!(text.contains(says), "{text}");
+    }
+
+    // The game's folder sits next to the project folder.
+    let settings = ok(
+        &client,
+        "game_export_settings",
+        json!({ "dir": "../GameAudio", "bits": 16 }),
+    )
+    .await;
+    assert_eq!(settings["exportDir"], "../GameAudio");
+    assert_eq!(settings["bits"], 16);
+    let (text, is_error) = call(
+        &client,
+        "game_export_settings",
+        json!({ "dir": "../../outside" }),
+    )
+    .await;
+    assert!(
+        is_error && text.contains("outside the allowed folders"),
+        "{text}"
+    );
+
+    let out = ok(&client, "game_export", json!({})).await;
+    assert_eq!(out["verified"]["passed"], true, "{out}");
+    assert_eq!(out["assets"].as_array().unwrap().len(), 4);
+    let audio = tmp.path().join("GameAudio");
+    for file in [
+        "music/battle.wav",
+        "sfx/hit_01.wav",
+        "sfx/hit_02.wav",
+        "sfx/demo_hits_04.wav",
+    ] {
+        assert!(audio.join(file).exists(), "{file}");
+    }
+    let wav = sky_io::read_audio(&audio.join("sfx/hit_01.wav")).unwrap();
+    assert_eq!(wav.sample_rate, 48_000);
+
+    // The engine side: sky-runtime plays what was exported, no edits.
+    let mut rt = sky_runtime::Runtime::new(48_000);
+    assert_eq!(rt.load_manifest(&audio).unwrap().len(), 4);
+    let Some(sky_core::manifest::Asset::Loop(battle)) =
+        rt.asset("battle").and_then(|h| rt.asset_info(h)).cloned()
+    else {
+        panic!("battle is a loop");
+    };
+    // One bar of intro at 120 BPM, then two bars of body.
+    assert_eq!(battle.loop_start, 96_000);
+    assert_eq!(battle.loop_end, 96_000 * 3);
+    let music = rt
+        .play_by_name("battle", sky_runtime::PlayParams::default())
+        .unwrap();
+    rt.play_by_name("hit", sky_runtime::PlayParams::default())
+        .unwrap();
+    let mut buf = vec![0.0f32; 2 * 48_000];
+    rt.render(&mut buf);
+    assert!(rt.is_playing(music));
+    assert!(buf.iter().any(|s| s.abs() > 0.01));
+
+    // Dropping an asset removes it and its files on the next export.
+    ok(&client, "game_asset_remove", json!({ "name": "demo_hits" })).await;
+    let out = ok(&client, "game_export", json!({ "verify": false })).await;
+    assert_eq!(out["removed"], json!(["demo_hits"]));
+    assert!(out.get("verified").is_none());
+    assert!(!audio.join("sfx/demo_hits_01.wav").exists());
+    assert!(audio.join("sfx/hit_01.wav").exists());
+    let summary = ok(&client, "project_summary", json!({})).await;
+    assert_eq!(summary["game"]["assets"].as_array().unwrap().len(), 3);
+    client.cancel().await.unwrap();
+}

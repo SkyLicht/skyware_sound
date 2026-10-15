@@ -112,6 +112,11 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Import audio…", "", Action::ImportAudio),
         entry("Load sounds from a sample pack…", "", Action::LoadSounds),
         entry("Export loop for a game…", "", Action::ExportLoop),
+        entry(
+            "Game assets: loops and SFX sets for a game…",
+            "",
+            Action::GameAssets,
+        ),
         entry("Export WAV…", "", Action::ExportWav),
         entry("Audio settings…", "", Action::OpenSettings),
     ]);

@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use sky_core::{AudioId, ClipId, PPQ};
 use sky_dsp::{AudioData, InstrumentType, analysis};
-use sky_engine::{AudioCache, EngineMsg, compile, create_engine, render, render_loop};
+use sky_engine::{
+    AudioCache, EngineMsg, compile, create_engine, render, render_intro_loop, render_loop,
+    render_one_shot,
+};
 use sky_model::templates::demo_project;
 use sky_model::*;
 
@@ -142,6 +145,99 @@ fn loop_render_folds_tails_into_the_start() {
     assert!(head(&folded) > head(&plain));
     let seam = analysis::seam_check(&folded, 0, folded.frames());
     assert_eq!(seam.verdict, "seamless", "{seam:?}");
+}
+
+#[test]
+fn intro_loops_keep_the_intro_and_a_folded_body() {
+    let p = demo_project();
+    let bar = p.tempo.tick_to_sample(p.ticks_per_bar(), SR);
+    // Bar 1 is the intro; bars 2 to 4 repeat.
+    let (intro, start, end) = (0, bar, bar * 4);
+    let out = render_intro_loop(compile(&p, &AudioCache::new(), SR, 1), intro, start, end);
+    assert_eq!(out.frames(), end as usize);
+    // The intro is the arrangement played from its start, up to the short
+    // fade into the body.
+    let plain = render(
+        compile(&p, &AudioCache::new(), SR, 1),
+        0,
+        bar as usize,
+        false,
+    );
+    let fade = (SR / 50) as usize;
+    let before = bar as usize - fade;
+    assert_eq!(&out.left()[..before], &plain.left()[..before]);
+    // The body is the second time through, so the pad's reverb from the end
+    // of the loop already rings at its start.
+    let from_silence = render(
+        compile(&p, &AudioCache::new(), SR, 1),
+        start,
+        (end - start) as usize,
+        false,
+    );
+    let head = |a: &[f32]| a[..2_000].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(head(&out.left()[bar as usize..]) > head(from_silence.left()));
+    let seam = analysis::seam_check(&out, bar as usize, out.frames());
+    assert_eq!(seam.verdict, "seamless", "{seam:?}");
+}
+
+#[test]
+fn notes_held_into_the_body_do_not_cut_off_at_the_join() {
+    // A pad note from beat 3 of the intro bar to beat 2 of the body.
+    let mut p = Project::new("t");
+    p.loop_enabled = false;
+    let mut t = Track::new_instrument("Pad", InstrumentType::Synth);
+    t.clips.push(Clip {
+        id: ClipId::new(),
+        name: "c".into(),
+        start: 0,
+        length: PPQ * 16,
+        content: ClipContent::Midi {
+            notes: vec![Note::new(PPQ * 2, PPQ * 3, 57, 110)],
+        },
+    });
+    p.tracks.push(t);
+    let bar = p.tempo.tick_to_sample(p.ticks_per_bar(), SR);
+    let out = render_intro_loop(compile(&p, &AudioCache::new(), SR, 1), 0, bar, bar * 2);
+    let b = bar as usize;
+    let fade = (SR / 50) as usize;
+    let peak = |a: &[f32]| a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    for ch in [out.left(), out.right()] {
+        // The pad sounds up to the fade, and enters the body as smoothly
+        // as the body's own samples follow each other.
+        assert!(peak(&ch[b - fade - 480..b - fade]) > 0.01);
+        let typical = ch[b..b + 64]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        let jump = (ch[b] - ch[b - 1]).abs();
+        assert!(
+            jump <= typical * 2.0 + 1e-4,
+            "jump {jump}, typical {typical}"
+        );
+    }
+    // The body still repeats seamlessly.
+    let seam = analysis::seam_check(&out, b, out.frames());
+    assert_eq!(seam.verdict, "seamless", "{seam:?}");
+}
+
+#[test]
+fn one_shots_leave_out_what_starts_after_them() {
+    // A kick on beat 1 and a snare on beat 2.
+    let p = drum_project(vec![
+        Note::new(0, PPQ / 4, 36, 110),
+        Note::new(PPQ, PPQ / 4, 38, 110),
+    ]);
+    let beat = p.tempo.tick_to_sample(PPQ, SR);
+    let frames = (beat + i64::from(SR)) as usize;
+    let plain = render(compile(&p, &AudioCache::new(), SR, 1), 0, frames, false);
+    let shot = render_one_shot(compile(&p, &AudioCache::new(), SR, 1), 0, beat, frames);
+    let b = beat as usize;
+    // The same up to the end of the range; then only the kick's decay.
+    assert_eq!(&shot.left()[..b], &plain.left()[..b]);
+    let peak = |a: &[f32]| a.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let kick = peak(&shot.left()[..4_800]);
+    assert!(peak(&plain.left()[b..b + 4_800]) > 0.5 * kick);
+    assert!(peak(&shot.left()[b..]) < 0.1 * kick);
 }
 
 #[test]

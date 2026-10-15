@@ -29,7 +29,7 @@ pub struct Manifest {
 }
 
 /// What kind of sound an asset is, used for loudness targets and grouping.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Category {
     #[default]
@@ -38,6 +38,40 @@ pub enum Category {
     Ui,
     Voice,
     Ambience,
+}
+
+impl Category {
+    /// Every category, in the order of [`index`](Self::index).
+    pub const ALL: [Category; 5] = [
+        Category::Music,
+        Category::Sfx,
+        Category::Ui,
+        Category::Voice,
+        Category::Ambience,
+    ];
+
+    /// The name used in manifests and folder names, such as `music`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Category::Music => "music",
+            Category::Sfx => "sfx",
+            Category::Ui => "ui",
+            Category::Voice => "voice",
+            Category::Ambience => "ambience",
+        }
+    }
+
+    /// Reads a name such as `music` or `SFX`.
+    pub fn parse(name: &str) -> Option<Category> {
+        Category::ALL
+            .into_iter()
+            .find(|c| c.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// The position in [`ALL`](Self::ALL), from 0 to 4.
+    pub fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// One exported asset.
@@ -64,6 +98,61 @@ impl Asset {
             Asset::Sfx(a) => &a.name,
         }
     }
+
+    pub fn category(&self) -> Category {
+        match self {
+            Asset::Loop(a) => a.category,
+            Asset::Sfx(a) => a.category,
+        }
+    }
+
+    /// The project that manages this asset; see [`LoopAsset::project_id`].
+    pub fn project_id(&self) -> Option<&str> {
+        match self {
+            Asset::Loop(a) => a.project_id.as_deref(),
+            Asset::Sfx(a) => a.project_id.as_deref(),
+        }
+    }
+
+    /// Every audio file the asset uses.
+    pub fn files(&self) -> impl Iterator<Item = &AudioFile> {
+        let (single, many): (Option<&AudioFile>, &[AudioFile]) = match self {
+            Asset::Loop(a) => (Some(&a.file), &[]),
+            Asset::Sfx(a) => (None, &a.variations),
+        };
+        single.into_iter().chain(many)
+    }
+}
+
+/// Turns a display name into an asset name: lowercase ASCII letters, digits
+/// and single underscores, such as `battle_loop_2` for `Battle Loop #2`, cut
+/// to [`MAX_ASSET_NAME`] bytes. Asset names double as file names, so they are
+/// safe on every platform.
+pub fn asset_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+    }
+    out.truncate(MAX_ASSET_NAME);
+    let out = out.trim_end_matches('_').to_string();
+    if out.is_empty() {
+        "untitled".into()
+    } else {
+        out
+    }
+}
+
+/// The longest asset name, in bytes.
+pub const MAX_ASSET_NAME: usize = 64;
+
+/// Whether `name` is already in the form [`asset_name`] produces and at most
+/// [`MAX_ASSET_NAME`] long.
+pub fn is_asset_name(name: &str) -> bool {
+    name.len() <= MAX_ASSET_NAME && asset_name(name) == name
 }
 
 /// An audio file referenced by the manifest.
@@ -109,6 +198,11 @@ pub struct LoopAsset {
     /// them in its credits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credits: Vec<String>,
+    /// The project whose game assets list this asset, when it was exported
+    /// as part of one. Exporting that project's assets again removes the
+    /// ones it no longer lists. One-off exports have none and stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// How an SFX container picks the next variation.
@@ -172,6 +266,12 @@ pub struct SfxAsset {
     pub peak_dbfs: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Credit lines the licenses of the sounds in it ask for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credits: Vec<String>,
+    /// The project that manages this asset; see [`LoopAsset::project_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 fn sfx_category() -> Category {
@@ -223,6 +323,12 @@ impl Manifest {
     pub fn find(&self, name: &str) -> Option<&Asset> {
         self.assets.iter().find(|a| a.name() == name)
     }
+
+    /// Removes and returns the asset with this ID.
+    pub fn remove(&mut self, id: AssetId) -> Option<Asset> {
+        let i = self.assets.iter().position(|a| a.id() == id)?;
+        Some(self.assets.remove(i))
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +357,7 @@ mod tests {
             peak_dbfs: Some(-1.0),
             tags: vec!["battle".into()],
             credits: vec!["Salamander Grand Piano by Alexander Holm (CC BY 3.0)".into()],
+            project_id: None,
         }));
         m.upsert(Asset::Sfx(SfxAsset {
             id: AssetId::from_u128(2),
@@ -268,6 +375,8 @@ mod tests {
             loudness_lufs: None,
             peak_dbfs: None,
             tags: vec![],
+            credits: vec![],
+            project_id: Some("project-1".into()),
         }));
         m
     }
@@ -294,6 +403,47 @@ mod tests {
     }
 
     #[test]
+    fn asset_names_are_safe_file_names() {
+        assert_eq!(asset_name("Battle Loop #2"), "battle_loop_2");
+        assert_eq!(asset_name("  ...  "), "untitled");
+        assert_eq!(asset_name("Ünïcode/../path"), "n_code_path");
+        assert!(is_asset_name("footstep_grass"));
+        assert!(!is_asset_name("Footstep"));
+        assert!(!is_asset_name("foot__step"));
+        assert!(!is_asset_name(""));
+        assert!(!is_asset_name(&"a".repeat(MAX_ASSET_NAME + 1)));
+        let long = asset_name(&"Long name ".repeat(20));
+        assert!(is_asset_name(&long), "{long}");
+        assert!(long.len() <= MAX_ASSET_NAME && long.starts_with("long_name_"));
+    }
+
+    #[test]
+    fn categories_have_names_and_indexes() {
+        for (i, c) in Category::ALL.into_iter().enumerate() {
+            assert_eq!(c.index(), i);
+            assert_eq!(Category::parse(c.name()), Some(c));
+        }
+        assert_eq!(Category::parse(" SFX "), Some(Category::Sfx));
+        assert_eq!(Category::parse("drums"), None);
+    }
+
+    #[test]
+    fn older_manifests_without_new_fields_load() {
+        let json = r#"{"schemaVersion": 1, "generator": "x", "project": "y", "assets": [
+            {"kind": "sfx", "id": "00000000-0000-0000-0000-000000000002", "name": "hit",
+             "variations": [{"path": "sfx/hit_01.wav", "channels": 1, "sampleRate": 48000, "lengthSamples": 10}]}
+        ]}"#;
+        let m = Manifest::from_json(json).unwrap();
+        let Asset::Sfx(s) = &m.assets[0] else {
+            panic!()
+        };
+        assert_eq!(s.category, Category::Sfx);
+        assert!(s.credits.is_empty());
+        assert_eq!(m.assets[0].project_id(), None);
+        assert_eq!(m.assets[0].files().count(), 1);
+    }
+
+    #[test]
     fn upsert_replaces_by_name() {
         let mut m = sample_manifest();
         let mut replacement = m.find("battle_loop").unwrap().clone();
@@ -304,5 +454,8 @@ mod tests {
         m.upsert(replacement);
         assert_eq!(m.assets.len(), 2);
         assert_eq!(m.find("battle_loop").unwrap().id(), AssetId::from_u128(3));
+        assert!(m.remove(AssetId::from_u128(3)).is_some());
+        assert!(m.find("battle_loop").is_none());
+        assert_eq!(m.find("footstep").unwrap().project_id(), Some("project-1"));
     }
 }

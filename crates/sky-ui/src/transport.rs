@@ -277,6 +277,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
                 ("Open project…", Action::Open),
                 ("Save as…", Action::SaveAs),
                 ("Import audio…", Action::ImportAudio),
+                ("Game assets…", Action::GameAssets),
             ];
             for (label, action) in items {
                 if ui.button(label).clicked() {
@@ -311,10 +312,10 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
         if ui.button(save_text).on_hover_text(save_tip).clicked() {
             wanted.push(Action::Save);
         }
-        let (loop_text, wav_text) = if narrow {
-            ("Loop…", "WAV…")
+        let (loop_text, wav_text, game_text) = if narrow {
+            ("Loop…", "WAV…", "Game…")
         } else {
-            ("Export loop…", "Export WAV…")
+            ("Export loop…", "Export WAV…", "Game assets…")
         };
         if ui
             .button(loop_text)
@@ -329,6 +330,15 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
             .clicked()
         {
             wanted.push(Action::ExportWav);
+        }
+        if ui
+            .button(game_text)
+            .on_hover_text(
+                "The loops and SFX sets this project exports for a game, and their export",
+            )
+            .clicked()
+        {
+            wanted.push(Action::GameAssets);
         }
 
         // The right side: AI indicator, engine health and the palette.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Dialogs: choosing paths (native dialogs with a typed fallback), unsaved
 //! changes, loop and WAV export, and audio settings. The Load sounds dialog
-//! is in [`crate::sounds`].
+//! is in [`crate::sounds`], the Game assets window in [`crate::game`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ use sky_session::LoopExportOptions;
 
 use crate::app::{Action, App};
 use crate::audio::{self, BUFFER_SIZES, SAMPLE_RATES};
+use crate::game::GameDialog;
 use crate::jobs::JobOutput;
 use crate::sounds::{LoadSoundsDialog, license_report_ui};
 use crate::theme;
@@ -30,6 +31,7 @@ pub enum PathPurpose {
     ExportLoopFolder,
     ExportWavFile,
     SoundPack,
+    GameFolder,
 }
 
 impl PathPurpose {
@@ -41,6 +43,7 @@ impl PathPurpose {
             PathPurpose::ExportLoopFolder => "Export folder",
             PathPurpose::ExportWavFile => "Export WAV to",
             PathPurpose::SoundPack => "Sound pack folder",
+            PathPurpose::GameFolder => "Game export folder",
         }
     }
 
@@ -54,6 +57,7 @@ impl PathPurpose {
             }
             PathPurpose::ExportWavFile => "A .wav file",
             PathPurpose::SoundPack => "A folder with a strudel.json sample map in it",
+            PathPurpose::GameFolder => "Your game's audio folder, such as assets/audio",
         }
     }
 }
@@ -133,6 +137,7 @@ pub struct Dialogs {
     pub native: Option<NativeWait>,
     pub export_loop: Option<ExportLoopDialog>,
     pub export_wav: Option<ExportWavDialog>,
+    pub game: Option<GameDialog>,
     pub load_sounds: Option<LoadSoundsDialog>,
     pub settings: Option<SettingsDialog>,
     /// An action to run once a "Save as" from the unsaved-changes dialog succeeds.
@@ -238,9 +243,10 @@ fn native_pick(purpose: PathPurpose, default: &Path) -> Option<PathBuf> {
         d = d.set_file_name(n);
     }
     match purpose {
-        PathPurpose::OpenProject | PathPurpose::ExportLoopFolder | PathPurpose::SoundPack => {
-            d.pick_folder()
-        }
+        PathPurpose::OpenProject
+        | PathPurpose::ExportLoopFolder
+        | PathPurpose::SoundPack
+        | PathPurpose::GameFolder => d.pick_folder(),
         PathPurpose::SaveAs => d.save_file(),
         PathPurpose::ImportAudio => d
             .add_filter("Audio", &["wav", "flac", "ogg", "mp3"])
@@ -276,6 +282,10 @@ impl App {
                 .map(|d| PathBuf::from(d.address.trim()))
                 .filter(|p| p.is_dir())
                 .unwrap_or_else(default_dir),
+            PathPurpose::GameFolder => self
+                .session
+                .game_export_dir()
+                .unwrap_or_else(|_| default_dir().join("export")),
         }
     }
 
@@ -424,6 +434,11 @@ impl App {
             PathPurpose::ExportWavFile => {
                 if let Some(d) = self.dialogs.export_wav.as_mut() {
                     d.path = with_extension(path, "wav").display().to_string();
+                }
+            }
+            PathPurpose::GameFolder => {
+                if let Some(d) = self.dialogs.game.as_mut() {
+                    d.folder = path.display().to_string();
                 }
             }
             PathPurpose::SoundPack => {
@@ -578,6 +593,7 @@ pub fn show(app: &mut App, ctx: &Context) {
     settings_window(app, ctx);
     export_loop_dialog(app, ctx);
     export_wav_dialog(app, ctx);
+    crate::game::window(app, ctx);
     crate::sounds::load_sounds_dialog(app, ctx);
     confirm_dialog(app, ctx);
     path_prompt(app, ctx);
@@ -745,7 +761,7 @@ fn confirm_dialog(app: &mut App, ctx: &Context) {
     }
 }
 
-fn bits_choice(ui: &mut Ui, bits: &mut u16) {
+pub(crate) fn bits_choice(ui: &mut Ui, bits: &mut u16) {
     ui.horizontal(|ui| {
         ui.radio_value(bits, 16, "16-bit");
         ui.radio_value(bits, 24, "24-bit");

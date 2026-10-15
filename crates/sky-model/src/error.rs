@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use sky_core::{AudioId, ClipId, CoreError, EffectId, MarkerId, NoteId, TrackId};
+use sky_core::{AssetId, AudioId, ClipId, CoreError, EffectId, MarkerId, NoteId, TrackId};
 use thiserror::Error;
 
 /// Why a command or file operation failed. Messages are written for people
@@ -18,6 +18,8 @@ pub enum ModelError {
     AudioNotFound(AudioId),
     #[error("no marker with id {0}")]
     MarkerNotFound(MarkerId),
+    #[error("no game asset with id {0}")]
+    GameAssetNotFound(AssetId),
     #[error("an object with id {0} already exists")]
     DuplicateId(String),
     #[error("track {0} is an audio track and has no instrument")]

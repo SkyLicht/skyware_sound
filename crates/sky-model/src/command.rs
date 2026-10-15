@@ -9,9 +9,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sky_core::manifest::{MAX_ASSET_NAME, RandomRange, is_asset_name};
 use sky_core::time::validate_bpm;
 use sky_core::{
-    AudioId, ClipId, EffectId, MarkerId, NoteId, TempoMap, Ticks, TimeSignature, TrackId,
+    AssetId, AudioId, ClipId, EffectId, MarkerId, NoteId, TempoMap, Ticks, TimeSignature, TrackId,
 };
 
 use crate::error::ModelError;
@@ -191,6 +192,24 @@ pub enum Command {
     },
     RemovePoolAudio {
         id: AudioId,
+    },
+    /// Sets where game exports go and their bit depth.
+    #[serde(rename_all = "camelCase")]
+    SetGameExport {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        export_dir: Option<String>,
+        bits: u16,
+    },
+    AddGameAsset {
+        asset: Box<GameAsset>,
+        index: Option<usize>,
+    },
+    RemoveGameAsset {
+        id: AssetId,
+    },
+    /// Replaces a game asset that already exists (matched by ID).
+    UpdateGameAsset {
+        asset: Box<GameAsset>,
     },
 }
 
@@ -486,6 +505,107 @@ fn sort_notes(notes: &mut [Note]) {
     notes.sort_by_key(|n| (n.start, n.pitch, n.id));
 }
 
+/// The most tags a game asset can have, and the longest tag.
+const MAX_TAGS: usize = 16;
+const MAX_TAG: usize = 64;
+
+fn validate_game_asset(project: &Project, asset: &GameAsset) -> Result<(), ModelError> {
+    if !is_asset_name(&asset.name) {
+        return Err(ModelError::InvalidValue(format!(
+            "game asset names use lowercase letters, digits and single underscores, at most \
+             {MAX_ASSET_NAME} long, such as footstep_grass; got {:?}",
+            asset.name
+        )));
+    }
+    if let Some(other) = project
+        .game
+        .assets
+        .iter()
+        .find(|a| a.name == asset.name && a.id != asset.id)
+    {
+        return Err(ModelError::InvalidValue(format!(
+            "another game asset ({}) is already called {:?}",
+            other.id, asset.name
+        )));
+    }
+    if asset.tags.len() > MAX_TAGS
+        || asset
+            .tags
+            .iter()
+            .any(|t| t.trim().is_empty() || t.len() > MAX_TAG)
+    {
+        return Err(ModelError::InvalidValue(format!(
+            "a game asset has at most {MAX_TAGS} tags, each 1 to {MAX_TAG} characters"
+        )));
+    }
+    match &asset.kind {
+        GameAssetKind::Loop { range, intro_start } => {
+            TimeRange::new(range.start, range.end)?;
+            if let Some(intro) = intro_start
+                && (*intro < 0 || *intro >= range.start)
+            {
+                return Err(ModelError::InvalidValue(format!(
+                    "the intro must start at or after 0 and before the loop starts at tick {}, got {intro}",
+                    range.start
+                )));
+            }
+        }
+        GameAssetKind::Sfx {
+            variations,
+            pitch_semitones,
+            gain_db,
+            tail_seconds,
+            ..
+        } => {
+            if variations.is_empty() || variations.len() > MAX_SFX_VARIATIONS {
+                return Err(ModelError::InvalidValue(format!(
+                    "an SFX set needs 1 to {MAX_SFX_VARIATIONS} variations, got {}",
+                    variations.len()
+                )));
+            }
+            for v in variations {
+                TimeRange::new(v.start, v.end)?;
+            }
+            let pitch = MAX_SFX_PITCH_SEMITONES;
+            check_range("random pitch", *pitch_semitones, -pitch, pitch, "semitones")?;
+            check_range("random gain", *gain_db, SFX_GAIN_DB.0, SFX_GAIN_DB.1, "dB")?;
+            if !(tail_seconds.is_finite() && (0.0..=MAX_SFX_TAIL_SECONDS).contains(tail_seconds)) {
+                return Err(ModelError::InvalidValue(format!(
+                    "an SFX tail must be 0 to {MAX_SFX_TAIL_SECONDS} seconds, got {tail_seconds}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_range(
+    what: &str,
+    range: RandomRange,
+    lo: f32,
+    hi: f32,
+    unit: &str,
+) -> Result<(), ModelError> {
+    let ok = |v: f32| v.is_finite() && (lo..=hi).contains(&v);
+    if ok(range.min) && ok(range.max) && range.min <= range.max {
+        Ok(())
+    } else {
+        Err(ModelError::InvalidValue(format!(
+            "{what} must be a range from min to max within {lo} to {hi} {unit}, got {} to {}",
+            range.min, range.max
+        )))
+    }
+}
+
+fn game_asset_index(project: &Project, id: AssetId) -> Result<usize, ModelError> {
+    project
+        .game
+        .assets
+        .iter()
+        .position(|a| a.id == id)
+        .ok_or(ModelError::GameAssetNotFound(id))
+}
+
 impl Command {
     /// A short description for history lists.
     pub fn describe(&self) -> &'static str {
@@ -523,6 +643,10 @@ impl Command {
             Command::SetPattern { .. } => "Edit pattern",
             Command::AddPoolAudio { .. } => "Import audio",
             Command::RemovePoolAudio { .. } => "Remove audio",
+            Command::SetGameExport { .. } => "Change game export",
+            Command::AddGameAsset { .. } => "Add game asset",
+            Command::RemoveGameAsset { .. } => "Remove game asset",
+            Command::UpdateGameAsset { .. } => "Edit game asset",
         }
     }
 
@@ -1073,6 +1197,50 @@ impl Command {
                 Command::AddPoolAudio {
                     entry,
                     index: Some(i),
+                }
+            }
+            Command::SetGameExport { export_dir, bits } => {
+                if !matches!(bits, 16 | 24 | 32) {
+                    return Err(ModelError::InvalidValue(format!(
+                        "game exports use 16, 24 or 32-bit (float) WAV files, got {bits}"
+                    )));
+                }
+                let export_dir = export_dir
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty());
+                let game = &mut project.game;
+                let old_dir = std::mem::replace(&mut game.export_dir, export_dir);
+                let old_bits = std::mem::replace(&mut game.bits, bits);
+                Command::SetGameExport {
+                    export_dir: old_dir,
+                    bits: old_bits,
+                }
+            }
+            Command::AddGameAsset { asset, index } => {
+                if project.game.asset(asset.id).is_some() {
+                    return Err(ModelError::DuplicateId(asset.id.to_string()));
+                }
+                validate_game_asset(project, &asset)?;
+                let id = asset.id;
+                let assets = &mut project.game.assets;
+                let at = index.unwrap_or(assets.len()).min(assets.len());
+                assets.insert(at, *asset);
+                Command::RemoveGameAsset { id }
+            }
+            Command::RemoveGameAsset { id } => {
+                let i = game_asset_index(project, id)?;
+                let asset = project.game.assets.remove(i);
+                Command::AddGameAsset {
+                    asset: Box::new(asset),
+                    index: Some(i),
+                }
+            }
+            Command::UpdateGameAsset { asset } => {
+                let i = game_asset_index(project, asset.id)?;
+                validate_game_asset(project, &asset)?;
+                let old = std::mem::replace(&mut project.game.assets[i], *asset);
+                Command::UpdateGameAsset {
+                    asset: Box::new(old),
                 }
             }
         })

@@ -15,11 +15,12 @@ Status: **alpha** (0.1.0-alpha.1). The core works end to end: you can build a lo
 - **Templates:** an empty project, a demo loop, and a four-bar techno loop at 128 BPM made only from the built-in instruments (ducked bass, accented swung hats, a dotted-delay stab).
 - **Rendering and analysis:** offline render with the same engine, WAV export (16/24-bit with dither, or 32-bit float), loudness (LUFS), true peak, clipping and a loop seam check.
 - **Game loop export:** renders the loop region twice and keeps the second pass, so reverb and release tails wrap into the start, then writes the WAV and records it in `skyware-manifest.json`.
-- **MCP server:** 35 tools over Streamable HTTP on localhost (while the app runs) or stdio. See [Connecting an AI assistant](#connecting-an-ai-assistant).
+- **Game assets:** a project keeps the list of what it exports for a game (Game assets window, `game_asset_set` tool): loops, with an optional intro that plays once, and SFX sets, whose variations are parts of the arrangement (such as one per beat) with a selection rule and random pitch and gain. One export writes them all to the game's folder (`assets/audio`, say) with one manifest, removes assets the project dropped, and checks the result in `sky-runtime`.
+- **MCP server:** 39 tools over Streamable HTTP on localhost (while the app runs) or stdio. See [Connecting an AI assistant](#connecting-an-ai-assistant).
 - **UI** in egui: transport, arrangement, track headers, piano roll, pattern editor, mixer with meters, instrument and effect editors, an AI activity panel where you can undo what an assistant did, and a command palette (Ctrl+K).
-- **`sky-runtime`:** the MIT/Apache-2.0 library a game links to play exported loops and randomized SFX containers. See [crates/sky-runtime/README.md](crates/sky-runtime/README.md).
+- **`sky-runtime`:** the MIT/Apache-2.0 library a game links to play exported loops and randomized SFX containers, split between the game thread and the audio callback with lock-free queues, with volume categories and live pan and pitch. See [crates/sky-runtime/README.md](crates/sky-runtime/README.md).
 
-Not in the alpha yet: plugins (VST3/CLAP), audio recording, automation lanes, tempo changes inside a project, WASAPI exclusive mode, the C API for `sky-runtime`, minidump crash reports (panics write a text report), and the SFX container editor.
+Not in the alpha yet: plugins (VST3/CLAP), audio recording, automation lanes, tempo changes inside a project, the C API for `sky-runtime`, compressed game exports (Ogg Vorbis, Opus), and minidump crash reports (panics write a text report).
 
 ## Building
 
@@ -42,6 +43,8 @@ Useful commands:
 | `skyware mcp [PROJECT]` | MCP over stdio with its own headless project |
 | `skyware render PROJECT -o out.wav` | Render to WAV (`--start-bar`, `--end-bar`, `--tail`, `--bits`) |
 | `skyware export-loop PROJECT --name "Battle Loop"` | Export the loop region for the game |
+| `skyware export-game PROJECT` | Export every game asset of a project to its game folder (`--dir`, `--only NAME`) |
+| `skyware play-game EXPORT_FOLDER` | Load a game export into `sky-runtime`, check every asset, then play it through the device the way a game does (`--seconds`, `--every MS`, `--asset NAME`) |
 | `skyware analyze file.wav` | Loudness and peak measurements as JSON |
 | `skyware check` | The system check: play through the device at 128 frames and count dropouts, then export a 16-bar loop and verify it (see [Testing on Windows](#testing-on-windows)) |
 | `skyware latency-test --buffer 128 --minutes 10` | The device half of the check on its own (`--mode auto\|shared\|low-latency\|exclusive`, see [Output modes](#output-modes)) |
@@ -51,6 +54,8 @@ Useful commands:
 ## Testing on Windows
 
 `skyware check` is the release check on real hardware. It plays a test loop through the audio device at a 128-frame buffer (`--buffer`) for `--minutes` and fails on any dropout, on any callback that took longer than its buffer, or if the device did not really run at the buffer size asked for (or at its shortest possible period, when the request is below that; see [Output modes](#output-modes)). Then it exports a 16-bar loop (`--bars`) and verifies the export as a game would use it: exact length, the manifest entry, a clean seam after quantizing to 24-bit, no clipping, and sample-exact playback in `sky-runtime` across the loop point. `--silent` runs the engine as usual but sends silence to the device, `--json` prints the report as JSON, and `--project` checks one of your projects instead of the test loop. MCP clients can run the same check with the `system_check` tool; it uses a project of its own and leaves the open one alone.
+
+`skyware play-game FOLDER` is the same kind of check for a game export, from the engine's side. It loads the folder's manifest into `sky-runtime`, checks offline that every loop plays its intro and then repeats its body sample for sample and that every SFX set sounds and ends, then plays everything through the device for `--seconds` (default 10): the runtime split into a game-thread controller and a renderer in the device callback, loops throughout and SFX fired in turn every `--every` milliseconds. It fails on any dropout, on a render that took longer than its buffer, or on a loop that stopped. `--seconds 0` runs only the offline part, and `skyware export-game --dir FOLDER` without a project exports the demo project's two game assets to try it on.
 
 A dropout is a hand-off of audio to the device that comes later than the device's buffer lasts. On WASAPI the device buffer is measured from the first callback, which fills it while it is empty.
 
@@ -106,7 +111,7 @@ Every tool call is one undo step and is listed in the app's AI activity panel. `
 | `sky-game` | GPL-3.0-or-later | Game exports and manifests |
 | `sky-library` | GPL-3.0-or-later | Strudel sample maps, sound packs and their download cache |
 | `sky-session` | GPL-3.0-or-later | The live session shared by the UI and MCP |
-| `sky-check` | GPL-3.0-or-later | The system check behind `skyware check` and the `system_check` tool |
+| `sky-check` | GPL-3.0-or-later | The system check behind `skyware check`, `skyware play-game` and the `system_check` tool |
 | `sky-mcp` | GPL-3.0-or-later | MCP tools and transports |
 | `sky-ui` | GPL-3.0-or-later | The egui app |
 | `skyware` | GPL-3.0-or-later | The executable |
