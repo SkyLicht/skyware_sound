@@ -16,6 +16,7 @@ mod app;
 mod arrange;
 mod audio;
 mod dialogs;
+mod game;
 mod jobs;
 mod mixer;
 mod palette;

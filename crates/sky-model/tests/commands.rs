@@ -3,7 +3,8 @@
 //! command sequences always undo back to where they started.
 
 use proptest::prelude::*;
-use sky_core::{ClipId, EffectId, NoteId, PPQ, TrackId};
+use sky_core::manifest::{Category, RandomRange, Selection};
+use sky_core::{AssetId, ClipId, EffectId, NoteId, PPQ, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::notes::parse_note_list;
 use sky_model::templates::demo_project;
@@ -25,6 +26,14 @@ fn every_command_undoes_exactly() {
     let reverb = project.tracks[2].channel.effects[0].id;
     let new_track = Track::new_instrument("Lead", InstrumentType::Synth);
     let lead = new_track.id;
+    let music = loop_asset("battle", 0, PPQ * 16);
+    let mut music_edit = music.clone();
+    music_edit.name = "battle_intro".into();
+    music_edit.kind = GameAssetKind::Loop {
+        range: TimeRange::new(PPQ * 4, PPQ * 20).unwrap(),
+        intro_start: Some(0),
+    };
+    let steps_sfx = sfx_asset("hit", 3);
     let note_ids: Vec<NoteId>;
     {
         let ClipContent::Midi { notes } = &project.tracks[1].clips[0].content else {
@@ -140,6 +149,22 @@ fn every_command_undoes_exactly() {
             seed: 9,
             cycle: PPQ * 2,
         },
+        Command::SetGameExport {
+            export_dir: Some("../game/assets/audio".into()),
+            bits: 16,
+        },
+        Command::AddGameAsset {
+            asset: Box::new(music.clone()),
+            index: None,
+        },
+        Command::AddGameAsset {
+            asset: Box::new(steps_sfx.clone()),
+            index: Some(0),
+        },
+        Command::UpdateGameAsset {
+            asset: Box::new(music_edit),
+        },
+        Command::RemoveGameAsset { id: steps_sfx.id },
         Command::RemoveClip { id: pattern_clip },
         Command::RemoveTrack { id: drums },
     ];
@@ -162,6 +187,189 @@ fn every_command_undoes_exactly() {
         history.redo(&mut project).unwrap();
     }
     assert_eq!(&project, snapshots.last().unwrap());
+}
+
+fn loop_asset(name: &str, start: i64, end: i64) -> GameAsset {
+    GameAsset {
+        id: AssetId::new(),
+        name: name.into(),
+        category: Category::Music,
+        tags: vec![],
+        kind: GameAssetKind::Loop {
+            range: TimeRange::new(start, end).unwrap(),
+            intro_start: None,
+        },
+    }
+}
+
+fn sfx_asset(name: &str, count: usize) -> GameAsset {
+    GameAsset {
+        id: AssetId::new(),
+        name: name.into(),
+        category: Category::Sfx,
+        tags: vec!["impact".into()],
+        kind: GameAssetKind::sfx(TimeRange::new(0, PPQ * 4).unwrap().split(count)),
+    }
+}
+
+fn try_apply(history: &mut History, project: &mut Project, c: Command) -> Result<(), String> {
+    history
+        .apply(project, tx(vec![c]))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn try_add(history: &mut History, project: &mut Project, asset: GameAsset) -> String {
+    try_apply(
+        history,
+        project,
+        Command::AddGameAsset {
+            asset: Box::new(asset),
+            index: None,
+        },
+    )
+    .unwrap_err()
+}
+
+#[test]
+fn game_assets_are_validated() {
+    let mut project = demo_project();
+    let mut h = History::new();
+    let hit = sfx_asset("hit", 4);
+    try_apply(
+        &mut h,
+        &mut project,
+        Command::AddGameAsset {
+            asset: Box::new(hit.clone()),
+            index: None,
+        },
+    )
+    .unwrap();
+    let before = project.clone();
+
+    let e = try_add(&mut h, &mut project, sfx_asset("Hit Sound", 2));
+    assert!(e.contains("lowercase letters"), "{e}");
+    let e = try_add(&mut h, &mut project, sfx_asset("hit", 2));
+    assert!(e.contains("already called"), "{e}");
+    let mut dup = sfx_asset("other", 2);
+    dup.id = hit.id;
+    let e = try_add(&mut h, &mut project, dup);
+    assert!(e.contains("already exists"), "{e}");
+    let mut none = sfx_asset("empty", 1);
+    none.kind = GameAssetKind::sfx(vec![]);
+    let e = try_add(&mut h, &mut project, none);
+    assert!(e.contains("1 to 64 variations"), "{e}");
+    let mut wild = sfx_asset("wild", 2);
+    if let GameAssetKind::Sfx {
+        pitch_semitones, ..
+    } = &mut wild.kind
+    {
+        *pitch_semitones = RandomRange {
+            min: 2.0,
+            max: -2.0,
+        };
+    }
+    let e = try_add(&mut h, &mut project, wild);
+    assert!(e.contains("random pitch"), "{e}");
+    let mut long_tail = sfx_asset("tail", 2);
+    if let GameAssetKind::Sfx {
+        tail_seconds,
+        selection,
+        ..
+    } = &mut long_tail.kind
+    {
+        *tail_seconds = 30.0;
+        *selection = Selection::Shuffle;
+    }
+    let e = try_add(&mut h, &mut project, long_tail);
+    assert!(e.contains("tail"), "{e}");
+    let mut late_intro = loop_asset("music", PPQ * 4, PPQ * 8);
+    late_intro.kind = GameAssetKind::Loop {
+        range: TimeRange::new(PPQ * 4, PPQ * 8).unwrap(),
+        intro_start: Some(PPQ * 4),
+    };
+    let e = try_add(&mut h, &mut project, late_intro);
+    assert!(e.contains("intro"), "{e}");
+    let e = try_apply(
+        &mut h,
+        &mut project,
+        Command::SetGameExport {
+            export_dir: None,
+            bits: 20,
+        },
+    )
+    .unwrap_err();
+    assert!(e.contains("16, 24 or 32"), "{e}");
+    let e = try_apply(
+        &mut h,
+        &mut project,
+        Command::RemoveGameAsset { id: AssetId::new() },
+    )
+    .unwrap_err();
+    assert!(e.contains("no game asset"), "{e}");
+    assert_eq!(project, before);
+
+    // Renaming to a name nobody else has works, and an empty export folder
+    // means "none".
+    let mut renamed = hit.clone();
+    renamed.name = "hit_metal".into();
+    try_apply(
+        &mut h,
+        &mut project,
+        Command::UpdateGameAsset {
+            asset: Box::new(renamed),
+        },
+    )
+    .unwrap();
+    try_apply(
+        &mut h,
+        &mut project,
+        Command::SetGameExport {
+            export_dir: Some("  ".into()),
+            bits: 32,
+        },
+    )
+    .unwrap();
+    assert_eq!(project.game.export_dir, None);
+    assert_eq!(project.game.bits, 32);
+    assert!(project.game.find("hit_metal").is_some());
+}
+
+#[test]
+fn game_settings_round_trip_and_stay_out_of_plain_projects() {
+    let mut project = sky_model::templates::empty_project("Plain");
+    let plain = sky_model::file::project_to_json(&project);
+    assert!(!plain.contains("\"game\""), "{plain}");
+    project.game.export_dir = Some("C:/game/audio".into());
+    project.game.assets.push(loop_asset("battle", 0, PPQ * 16));
+    project.game.assets.push(sfx_asset("hit", 4));
+    let json = sky_model::file::project_to_json(&project);
+    assert!(json.contains("\"kind\": \"sfx\""), "{json}");
+    assert!(json.contains("\"tailSeconds\""), "{json}");
+    let back = sky_model::file::project_from_json(&json).unwrap();
+    assert_eq!(back, project);
+}
+
+#[test]
+fn ranges_split_into_equal_variations() {
+    let r = TimeRange::new(PPQ, PPQ * 5).unwrap();
+    let parts = r.split(4);
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0], TimeRange::new(PPQ, PPQ * 2).unwrap());
+    assert_eq!(parts[3].end, PPQ * 5);
+    let odd = TimeRange::new(0, 10).unwrap().split(3);
+    assert_eq!(
+        odd.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>(),
+        vec![(0, 3), (3, 6), (6, 10)]
+    );
+    // More parts than ticks: one tick each.
+    assert_eq!(TimeRange::new(0, 2).unwrap().split(5).len(), 2);
+    assert_eq!(r.split(0).len(), 1);
+    // The span of variations given in any order.
+    let mut shuffled = parts.clone();
+    shuffled.reverse();
+    assert_eq!(TimeRange::covering(&shuffled), Some(r));
+    assert_eq!(TimeRange::covering(&[]), None);
 }
 
 #[test]
@@ -295,6 +503,15 @@ fn arb_command(track_ids: Vec<TrackId>, clip_ids: Vec<ClipId>) -> impl Strategy<
             track: Box::new(Track::new_audio("Audio")),
             index: None
         }),
+        ("[a-z]{1,6}", 0i64..8, 1i64..8).prop_map(|(name, s, l)| Command::AddGameAsset {
+            asset: Box::new(loop_asset(&name, s * PPQ, (s + l) * PPQ)),
+            index: None
+        }),
+        (
+            prop::option::of("[a-z/]{1,12}"),
+            prop::sample::select(vec![16u16, 24, 32])
+        )
+            .prop_map(|(export_dir, bits)| Command::SetGameExport { export_dir, bits }),
     ]
 }
 

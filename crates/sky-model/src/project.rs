@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sky_core::manifest::{Category, RandomRange, Selection};
 use sky_core::{
-    AudioId, ClipId, EffectId, MarkerId, NoteId, ProjectId, SampleTime, TempoMap, Ticks,
+    AssetId, AudioId, ClipId, EffectId, MarkerId, NoteId, ProjectId, SampleTime, TempoMap, Ticks,
     TimeSignature, TrackId,
 };
 use sky_dsp::{EffectType, InstrumentType};
@@ -35,6 +36,172 @@ pub struct Project {
     pub master: Channel,
     #[serde(default)]
     pub audio_pool: Vec<PoolEntry>,
+    /// The loops and SFX sets this project exports for a game, and where to.
+    #[serde(default, skip_serializing_if = "GameSettings::is_empty")]
+    pub game: GameSettings,
+}
+
+/// What a project exports for a game, and where to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameSettings {
+    /// The folder game exports go to, such as the game's `assets/audio`.
+    /// A relative path is relative to the project folder. Without one,
+    /// exports go to `renders/export` inside the project folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_dir: Option<String>,
+    /// Bits per sample of exported WAV files: 16, 24 or 32 (float).
+    #[serde(default = "default_game_bits")]
+    pub bits: u16,
+    #[serde(default)]
+    pub assets: Vec<GameAsset>,
+}
+
+fn default_game_bits() -> u16 {
+    24
+}
+
+impl Default for GameSettings {
+    fn default() -> Self {
+        Self {
+            export_dir: None,
+            bits: default_game_bits(),
+            assets: Vec::new(),
+        }
+    }
+}
+
+impl GameSettings {
+    /// True when nothing differs from a new project's settings.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn asset(&self, id: AssetId) -> Option<&GameAsset> {
+        self.assets.iter().find(|a| a.id == id)
+    }
+
+    pub fn find(&self, name: &str) -> Option<&GameAsset> {
+        self.assets.iter().find(|a| a.name == name)
+    }
+}
+
+/// One asset the game plays: a loop or a set of SFX variations, rendered
+/// from the arrangement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameAsset {
+    pub id: AssetId,
+    /// The name the game plays it by, such as `footstep_grass`: lowercase
+    /// letters, digits and underscores. File names come from it too.
+    pub name: String,
+    #[serde(default)]
+    pub category: Category,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(flatten)]
+    pub kind: GameAssetKind,
+}
+
+/// The longest tail an SFX variation can ring out for, in seconds.
+pub const MAX_SFX_TAIL_SECONDS: f32 = 10.0;
+/// The most variations one SFX set can have.
+pub const MAX_SFX_VARIATIONS: usize = 64;
+/// The widest random pitch offset of an SFX set, in semitones either way.
+pub const MAX_SFX_PITCH_SEMITONES: f32 = 24.0;
+/// The range a random gain offset of an SFX set may cover, in dB.
+pub const SFX_GAIN_DB: (f32, f32) = (-60.0, 12.0);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum GameAssetKind {
+    /// A seamless loop. The body repeats forever; tails from its end are
+    /// folded into its start. An intro, if there is one, plays once first.
+    #[serde(rename_all = "camelCase")]
+    Loop {
+        /// The repeating body.
+        range: TimeRange,
+        /// Where an intro that plays once starts; before `range.start`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intro_start: Option<Ticks>,
+    },
+    /// A set of variations of one sound. The game picks one per trigger and
+    /// adds a random pitch and gain offset.
+    #[serde(rename_all = "camelCase")]
+    Sfx {
+        /// One time range per variation, each rendered to its own file.
+        variations: Vec<TimeRange>,
+        #[serde(default)]
+        selection: Selection,
+        /// Random pitch offset per trigger, in semitones.
+        #[serde(default)]
+        pitch_semitones: RandomRange,
+        /// Random gain offset per trigger, in decibels.
+        #[serde(default)]
+        gain_db: RandomRange,
+        /// Seconds rendered after each variation so releases and reverb
+        /// ring out. Trailing silence is trimmed.
+        #[serde(default = "default_sfx_tail")]
+        tail_seconds: f32,
+        /// Mix the variations down to mono, for sounds the game positions
+        /// itself.
+        #[serde(default)]
+        mono: bool,
+    },
+}
+
+fn default_sfx_tail() -> f32 {
+    1.0
+}
+
+impl GameAssetKind {
+    /// An SFX set with the default selection, no randomization and a
+    /// one-second tail.
+    pub fn sfx(variations: Vec<TimeRange>) -> Self {
+        GameAssetKind::Sfx {
+            variations,
+            selection: Selection::default(),
+            pitch_semitones: RandomRange::ZERO,
+            gain_db: RandomRange::ZERO,
+            tail_seconds: default_sfx_tail(),
+            mono: false,
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            GameAssetKind::Loop { .. } => "loop",
+            GameAssetKind::Sfx { .. } => "sfx",
+        }
+    }
+}
+
+impl TimeRange {
+    /// Splits the range into `count` equal parts, such as one variation per
+    /// beat. The last part takes any remainder.
+    pub fn split(&self, count: usize) -> Vec<TimeRange> {
+        let count = (count as Ticks).clamp(1, self.length().max(1));
+        let step = self.length() / count;
+        (0..count)
+            .map(|i| {
+                let start = self.start + i * step;
+                let end = if i + 1 == count {
+                    self.end
+                } else {
+                    start + step
+                };
+                TimeRange { start, end }
+            })
+            .collect()
+    }
+
+    /// From the earliest start to the latest end of `ranges`, in any order;
+    /// `None` when there are none.
+    pub fn covering(ranges: &[TimeRange]) -> Option<TimeRange> {
+        let start = ranges.iter().map(|r| r.start).min()?;
+        let end = ranges.iter().map(|r| r.end).max()?;
+        Some(TimeRange { start, end })
+    }
 }
 
 /// A span of musical time, `[start, end)`.
@@ -524,6 +691,7 @@ impl Project {
             tracks: Vec::new(),
             master: Channel::default(),
             audio_pool: Vec::new(),
+            game: GameSettings::default(),
         }
     }
 

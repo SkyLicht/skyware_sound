@@ -137,6 +137,69 @@ pub fn bank_json(project: &Project, bank: &SampleBank, detail: bool) -> Value {
     v
 }
 
+fn bar_span(project: &Project, range: &TimeRange) -> Value {
+    json!({
+        "startBar": round(project.ticks_to_bar(range.start), 4),
+        "endBar": round(project.ticks_to_bar(range.end), 4),
+    })
+}
+
+/// One game asset, with positions in bars.
+pub fn game_asset_json(project: &Project, asset: &GameAsset) -> Value {
+    let mut v = json!({
+        "id": asset.id.to_string(),
+        "name": asset.name,
+        "kind": asset.kind.kind_name(),
+        "category": asset.category.name(),
+    });
+    if !asset.tags.is_empty() {
+        v["tags"] = json!(asset.tags);
+    }
+    match &asset.kind {
+        GameAssetKind::Loop { range, intro_start } => {
+            v["loop"] = bar_span(project, range);
+            if let Some(intro) = intro_start {
+                v["introStartBar"] = json!(round(project.ticks_to_bar(*intro), 4));
+            }
+        }
+        GameAssetKind::Sfx {
+            variations,
+            selection,
+            pitch_semitones,
+            gain_db,
+            tail_seconds,
+            mono,
+        } => {
+            v["variations"] = json!(
+                variations
+                    .iter()
+                    .map(|r| bar_span(project, r))
+                    .collect::<Vec<_>>()
+            );
+            v["selection"] = json!(selection);
+            v["pitchSemitones"] = json!([pitch_semitones.min, pitch_semitones.max]);
+            v["gainDb"] = json!([gain_db.min, gain_db.max]);
+            v["tailSeconds"] = json!(tail_seconds);
+            v["mono"] = json!(mono);
+        }
+    }
+    v
+}
+
+/// The project's game export settings and assets.
+pub fn game_json(project: &Project) -> Value {
+    json!({
+        "exportDir": project.game.export_dir,
+        "bits": project.game.bits,
+        "assets": project
+            .game
+            .assets
+            .iter()
+            .map(|a| game_asset_json(project, a))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// The whole project in compact form.
 pub fn project_summary(project: &Project) -> Value {
     let ts = project.time_signature;
@@ -161,5 +224,6 @@ pub fn project_summary(project: &Project) -> Value {
             "pack": e.source.as_ref().map(|s| s.pack.clone()),
             "license": e.source.as_ref().map(|s| s.license.id()),
         })).collect::<Vec<_>>(),
+        "game": game_json(project),
     })
 }

@@ -2,7 +2,7 @@
 //! WAV decoding into planar `f32` buffers.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use hound::{SampleFormat, WavReader};
@@ -30,7 +30,12 @@ pub(crate) fn decode_wav(path: &Path) -> Result<AudioData, RuntimeError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut reader = WavReader::new(BufReader::new(file)).map_err(|e| map_hound(path, e))?;
+    decode_wav_from(BufReader::new(file), path)
+}
+
+/// Like [`decode_wav`], from any reader; `path` only names it in errors.
+pub(crate) fn decode_wav_from(source: impl Read, path: &Path) -> Result<AudioData, RuntimeError> {
+    let mut reader = WavReader::new(source).map_err(|e| map_hound(path, e))?;
     let spec = reader.spec();
     if spec.channels == 0 {
         return Err(wav_error(path, "the file declares zero channels"));

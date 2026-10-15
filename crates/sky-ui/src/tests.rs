@@ -242,8 +242,10 @@ fn demo_project_renders_everywhere() {
     h.app.palette.show_palette();
     h.app.open_export_loop();
     h.app.open_export_wav();
+    h.app.open_game_assets();
     h.frames(3);
     assert!(h.app.palette.open);
+    assert!(h.app.dialogs.game.is_some());
     assert!(h.app.dialogs.export_loop.is_some());
     // Escape closes the palette.
     h.key(Key::Escape, Modifiers::NONE);
@@ -1305,4 +1307,123 @@ fn unique_names_and_new_tracks() {
         let t = actions::new_track(&empty, kind);
         assert!(!t.name.is_empty());
     }
+}
+
+#[test]
+fn opening_game_assets_changes_nothing() {
+    use crate::game;
+    use sky_core::manifest::RandomRange;
+    use sky_model::GameAssetKind;
+
+    let mut h = Harness::demo();
+    // Ranges the model takes but the window shows only roughly.
+    let mut hits = h.project().game.find("demo_hits").expect("hits").clone();
+    if let GameAssetKind::Sfx {
+        pitch_semitones,
+        gain_db,
+        ..
+    } = &mut hits.kind
+    {
+        *pitch_semitones = RandomRange::new(-24.0, 24.0);
+        *gain_db = RandomRange::new(1.0, 3.0);
+    }
+    assert!(game::update(&h.app.session, hits.clone(), None).is_ok());
+    let revision = h.app.session.view().revision;
+    let ctx = h.ctx();
+    h.app.run_action(&ctx, Action::GameAssets);
+    h.frames(3);
+    assert!(h.app.dialogs.game.is_some());
+    assert_eq!(h.app.session.view().revision, revision);
+    assert_eq!(h.project().game.find("demo_hits"), Some(&hits));
+}
+
+#[test]
+fn game_assets_are_added_edited_and_exported() {
+    use crate::game;
+    use sky_model::GameAssetKind;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut h = Harness::demo();
+    let ctx = h.ctx();
+    h.app.run_action(&ctx, Action::GameAssets);
+    h.frames(2);
+    assert!(h.app.dialogs.game.is_some());
+
+    // The demo has a loop and a set of hits; add one more of each from
+    // a one-bar loop region: the SFX set gets one variation per beat.
+    let r = actions::set_loop_region(&h.app.session, 0, 4 * PPQ);
+    assert!(r.is_ok(), "{r:?}");
+    let sfx = game::add_sfx(&h.app.session).expect("add sfx");
+    let music = game::add_loop(&h.app.session).expect("add loop");
+    h.frames(2);
+    let p = h.project();
+    assert_eq!(p.game.assets.len(), 4);
+    let added = p.game.asset(sfx).expect("sfx");
+    assert_eq!(added.name, "demo_loop_sfx");
+    match &added.kind {
+        GameAssetKind::Sfx { variations, .. } => assert_eq!(variations.len(), 4),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(p.game.asset(music).expect("loop").name, "demo_loop_music");
+    // A second one gets a free name.
+    assert_eq!(
+        game::unique_asset_name(&p, "Demo loop SFX"),
+        "demo_loop_sfx_2"
+    );
+    // Long project names are cut to fit, suffix and all.
+    let long = "A very long project name ".repeat(4);
+    let name = game::unique_asset_name(&p, &long);
+    assert!(sky_core::manifest::is_asset_name(&name), "{name}");
+    let mut taken = (*p).clone();
+    let mut asset = added.clone();
+    asset.id = sky_core::AssetId::new();
+    asset.name = name.clone();
+    taken.game.assets.push(asset);
+    let second = game::unique_asset_name(&taken, &long);
+    assert!(sky_core::manifest::is_asset_name(&second), "{second}");
+    assert!(second.ends_with("_2") && second != name, "{second}");
+
+    // A bad name is refused and the asset keeps its own.
+    let mut bad = p.game.asset(sfx).expect("sfx").clone();
+    bad.name = "Has spaces".into();
+    assert!(game::update(&h.app.session, bad, None).is_err());
+    assert!(game::remove(&h.app.session, music).is_ok());
+    h.frames(2);
+    assert_eq!(h.project().game.assets.len(), 3);
+
+    // Export into a folder of our own; the setting is saved in the project.
+    if let Some(d) = h.app.dialogs.game.as_mut() {
+        d.folder = dir.path().join("game").display().to_string();
+        d.bits = 16;
+    }
+    h.app.start_game_export(&ctx);
+    assert!(h.app.dialogs.game.as_ref().is_some_and(|d| d.running));
+    h.frames(2);
+    h.wait_jobs();
+    let d = h.app.dialogs.game.as_ref().expect("window stays open");
+    assert!(!d.running);
+    match &d.result {
+        Some(Ok(s)) => {
+            wait_for_file(&s.manifest);
+            assert!(s.passed, "{:?}", s.checks);
+            assert_eq!(s.assets.len(), 3);
+        }
+        Some(Err(e)) => panic!("game export failed: {e}"),
+        None => panic!("no result"),
+    }
+    assert!(dir.path().join("game/sfx/demo_loop_sfx_04.wav").exists());
+    let p = h.project();
+    assert_eq!(p.game.bits, 16);
+    assert!(
+        p.game
+            .export_dir
+            .as_deref()
+            .is_some_and(|d| d.ends_with("game"))
+    );
+    h.frames(2);
+
+    // Closing the window keeps the project's settings.
+    h.app.dialogs.game = None;
+    h.frames(1);
+    assert_eq!(h.project().game.assets.len(), 3);
 }

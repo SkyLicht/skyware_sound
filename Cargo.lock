@@ -3351,6 +3351,8 @@ dependencies = [
 name = "sky-check"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "assert_no_alloc",
+ "cpal",
  "serde",
  "sky-core",
  "sky-dsp",
@@ -3497,6 +3499,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "assert_no_alloc",
  "hound",
+ "rtrb",
  "sky-core",
  "tempfile",
  "thiserror 2.0.21",
@@ -3530,6 +3533,7 @@ dependencies = [
  "eframe",
  "egui",
  "rfd",
+ "sky-check",
  "sky-core",
  "sky-dsp",
  "sky-engine",

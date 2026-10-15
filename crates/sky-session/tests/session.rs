@@ -4,12 +4,16 @@
 
 use std::path::Path;
 
-use sky_core::{ClipId, PPQ};
+use sky_core::manifest::{Asset, Category, RandomRange, Selection};
+use sky_core::{AssetId, ClipId, PPQ};
 use sky_dsp::AudioData;
 use sky_io::{WavFormat, write_wav};
 use sky_model::templates::{demo_project, empty_project};
-use sky_model::{Clip, ClipContent, Command, Origin, Project, Track, Transaction};
-use sky_session::{LoopExportOptions, Session, SessionError};
+use sky_model::{
+    Clip, ClipContent, Command, GameAsset, GameAssetKind, Origin, Project, TimeRange, Track,
+    Transaction,
+};
+use sky_session::{GameExportOptions, LoopExportOptions, Session, SessionError};
 
 fn mcp(tool: &str, commands: Vec<Command>) -> Transaction {
     Transaction::new(
@@ -291,6 +295,180 @@ fn export_loop_writes_a_manifest() {
     let mut buf = vec![0.0f32; 2 * 48_000];
     rt.render(&mut buf);
     assert!(buf.iter().any(|s| s.abs() > 0.01));
+}
+
+fn game_asset(name: &str, category: Category, kind: GameAssetKind) -> GameAsset {
+    GameAsset {
+        id: AssetId::new(),
+        name: name.into(),
+        category,
+        tags: vec![],
+        kind,
+    }
+}
+
+#[test]
+fn export_game_writes_loops_with_intros_and_sfx_sets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = demo_project();
+    let bar = project.ticks_per_bar();
+    let battle = game_asset(
+        "battle",
+        Category::Music,
+        GameAssetKind::Loop {
+            range: TimeRange::new(bar, bar * 4).unwrap(),
+            intro_start: Some(0),
+        },
+    );
+    let mut hits = game_asset(
+        "hit",
+        Category::Sfx,
+        GameAssetKind::sfx(TimeRange::new(0, bar).unwrap().split(4)),
+    );
+    if let GameAssetKind::Sfx {
+        selection,
+        pitch_semitones,
+        tail_seconds,
+        mono,
+        ..
+    } = &mut hits.kind
+    {
+        *selection = Selection::RoundRobin;
+        *pitch_semitones = RandomRange::new(-1.0, 1.0);
+        *tail_seconds = 0.25;
+        *mono = true;
+    }
+    project.game.assets = vec![battle.clone(), hits.clone()];
+    project.game.export_dir = Some("game/audio".into());
+    let session = headless(project);
+
+    // An unsaved project has no folder for a relative export folder.
+    assert!(session.game_export_dir().is_err());
+    session
+        .save(Some(&tmp.path().join("Game.skyproj")))
+        .unwrap();
+    let dir = session.game_export_dir().unwrap();
+    assert_eq!(dir, tmp.path().join("Game.skyproj").join("game/audio"));
+
+    let out = session.export_game(&GameExportOptions::default()).unwrap();
+    assert_eq!(out.dir, dir);
+    assert_eq!(out.files.len(), 5);
+    let beat = 24_000;
+    let Asset::Loop(l) = &out.assets[0].asset else {
+        panic!()
+    };
+    // Bar 1 plays once, bars 2 to 4 repeat.
+    assert_eq!(l.id, battle.id);
+    assert_eq!((l.loop_start, l.loop_end), (4 * beat, 16 * beat));
+    assert_eq!(l.bars, Some(3.0));
+    let seam = out.assets[0].seam.as_ref().unwrap();
+    assert_eq!(seam.verdict, "seamless", "{seam:?}");
+    let Asset::Sfx(s) = &out.assets[1].asset else {
+        panic!()
+    };
+    assert_eq!(s.variations.len(), 4);
+    assert_eq!(s.selection, Selection::RoundRobin);
+    for v in &s.variations {
+        assert_eq!(v.channels, 1);
+        // A beat plus at most the tail, with trailing silence cut.
+        assert!(v.length_samples <= beat + 12_000, "{v:?}");
+        assert!(dir.join(&v.path).is_file());
+    }
+    assert_eq!(s.variations[0].path, "sfx/hit_01.wav");
+
+    // The game runtime plays both without warnings.
+    let mut rt = sky_runtime::Runtime::new(48_000);
+    rt.load_manifest(&dir).unwrap();
+    assert!(rt.warnings().is_empty(), "{:?}", rt.warnings());
+    rt.play_by_name("battle", Default::default()).unwrap();
+    rt.play_by_name("hit", Default::default()).unwrap();
+    let mut buf = vec![0.0f32; 2 * 48_000];
+    rt.render(&mut buf);
+    assert!(buf.iter().any(|x| x.abs() > 0.01));
+
+    // Exporting one asset leaves the others alone.
+    let only = session
+        .export_game(&GameExportOptions {
+            only: vec!["hit".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(only.assets.len(), 1);
+    assert!(only.removed.is_empty());
+    assert!(
+        session
+            .export_game(&GameExportOptions {
+                only: vec!["nope".into()],
+                ..Default::default()
+            })
+            .is_err()
+    );
+
+    // Dropping the SFX set from the project removes it from the game folder.
+    session
+        .apply(mcp(
+            "game_asset_remove",
+            vec![Command::RemoveGameAsset { id: hits.id }],
+        ))
+        .unwrap();
+    let out = session.export_game(&GameExportOptions::default()).unwrap();
+    assert_eq!(out.removed, ["hit"]);
+    assert_eq!(out.deleted.len(), 4);
+    assert!(!dir.join("sfx/hit_01.wav").exists());
+    let manifest = sky_game::read_manifest(&dir).unwrap().unwrap();
+    assert_eq!(manifest.assets.len(), 1);
+}
+
+#[test]
+fn unsaved_projects_export_like_one_off_exports() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = GameExportOptions {
+        dir: Some(tmp.path().join("audio")),
+        ..Default::default()
+    };
+    // Each run of the demo is a new project ID; exporting again into the
+    // same folder still works.
+    for _ in 0..2 {
+        let out = headless(demo_project()).export_game(&opts).unwrap();
+        assert!(out.removed.is_empty());
+    }
+    let manifest = sky_game::read_manifest(&tmp.path().join("audio"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.assets.len(), 2);
+    assert!(manifest.assets.iter().all(|a| a.project_id().is_none()));
+
+    // Once saved, the project takes its entries over.
+    let session = headless(demo_project());
+    session
+        .save(Some(&tmp.path().join("Demo.skyproj")))
+        .unwrap();
+    session.export_game(&opts).unwrap();
+    let manifest = sky_game::read_manifest(&tmp.path().join("audio"))
+        .unwrap()
+        .unwrap();
+    let id = session.project().id.to_string();
+    assert!(
+        manifest
+            .assets
+            .iter()
+            .all(|a| a.project_id() == Some(id.as_str()))
+    );
+}
+
+#[test]
+fn export_game_needs_assets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = demo_project();
+    project.game.assets.clear();
+    let session = headless(project);
+    let e = session
+        .export_game(&GameExportOptions {
+            dir: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(e.to_string().contains("no game assets"), "{e}");
 }
 
 /// A local pack folder: `bd` with two variations, `sd`, and `keys` pitched.
