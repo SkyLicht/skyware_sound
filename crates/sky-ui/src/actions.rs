@@ -61,14 +61,7 @@ impl NewTrack {
 
 /// A name like "Synth 3" that no track in the project uses yet.
 pub fn unique_track_name(project: &Project, base: &str) -> String {
-    let taken = |name: &str| project.tracks.iter().any(|t| t.name == name);
-    if !taken(base) {
-        return base.to_string();
-    }
-    (2..)
-        .map(|n| format!("{base} {n}"))
-        .find(|n| !taken(n))
-        .unwrap_or_else(|| base.to_string())
+    project.unique_track_name(base)
 }
 
 pub fn new_track(project: &Project, kind: NewTrack) -> Track {
@@ -496,23 +489,7 @@ pub fn add_audio_clip(
 ) -> ActionResult<ClipId> {
     let project = session.project();
     let entry = project.pool_entry(source).map_err(|e| e.to_string())?;
-    let seconds = entry.frames as f64 / entry.sample_rate.max(1) as f64;
-    let start = start.max(0);
-    let begin = project.tempo.tick_to_seconds(start);
-    let end_tick = project.tempo.seconds_to_ticks(begin + seconds).ceil() as Ticks;
-    let clip = Clip {
-        id: ClipId::new(),
-        name: entry.name.clone(),
-        start,
-        length: (end_tick - start).max(1),
-        content: ClipContent::Audio {
-            source,
-            offset: 0,
-            gain_db: 0.0,
-            fade_in: 0,
-            fade_out: 0,
-        },
-    };
+    let clip = sky_session::audio_clip(&project, entry, start);
     let id = clip.id;
     apply(
         session,

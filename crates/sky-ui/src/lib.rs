@@ -16,6 +16,7 @@ mod app;
 mod arrange;
 mod audio;
 mod audition;
+mod browser;
 mod dialogs;
 mod game;
 mod jobs;
@@ -52,6 +53,9 @@ pub struct UiConfig {
     pub mcp: Option<McpInfo>,
     /// `--stress-ui`: replace the project with one that has this many tracks.
     pub demo_tracks: Option<usize>,
+    /// The file that keeps the browser's folders between runs; `None` keeps
+    /// them only while the app runs.
+    pub browser_store: Option<std::path::PathBuf>,
 }
 
 /// Opens the main window and runs until it is closed.

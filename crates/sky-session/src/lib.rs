@@ -41,6 +41,10 @@ use sky_model::{
 };
 use thiserror::Error;
 
+mod place;
+
+pub use place::{AudioInput, AudioTarget, ImportedFiles, Placed, audio_clip, sound_name};
+
 /// Longest render the session will make in one call.
 const MAX_RENDER_SECONDS: f64 = 30.0 * 60.0;
 /// Activity entries kept for the AI panel.
@@ -968,39 +972,12 @@ impl Session {
     /// Decodes an audio file into the project's pool as one undo step and
     /// returns its ID.
     pub fn import_audio(&self, path: &Path, origin: Origin) -> Result<AudioId, SessionError> {
-        let data = read_audio(path)?;
-        if data.frames() == 0 {
-            return Err(SessionError::Invalid(format!(
-                "{} has no audio in it",
-                path.display()
-            )));
-        }
-        let id = AudioId::new();
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "audio".into());
-        let entry = PoolEntry {
-            id,
-            name: name.clone(),
-            file: format!("{}/{id}.wav", file::AUDIO_DIR),
-            channels: data.channel_count() as u16,
-            sample_rate: data.sample_rate,
-            frames: data.frames() as u64,
-            source: None,
-        };
-        let mut st = lock(&self.inner.state);
-        if let Some(dir) = &st.path {
-            write_wav(&dir.join(&entry.file), &data, WavFormat::Float32, false)?;
-        }
-        st.audio.insert(id, Arc::new(data));
-        let tx = Transaction::new(
-            format!("Import {name}"),
+        self.place_audio(
+            AudioInput::File(path.to_path_buf()),
+            AudioTarget::Pool,
             origin,
-            vec![Command::AddPoolAudio { entry, index: None }],
-        );
-        self.apply_locked(&mut st, tx)?;
-        Ok(id)
+        )
+        .map(|p| p.audio)
     }
 
     /// The sound-pack library used by [`Session::load_bank`].

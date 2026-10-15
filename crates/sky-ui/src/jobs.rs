@@ -7,12 +7,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::app::Action;
 use crate::audition::{PreviewKey, Rendered};
+use crate::browser::{FolderIndex, PackListing};
 use crate::dialogs::{LoopSummary, PathPurpose, WavSummary};
 use crate::game::GameSummary;
 use crate::waveform::Peaks;
 use sky_core::AudioId;
 use sky_library::Pack;
-use sky_session::BankLoaded;
+use sky_session::{BankLoaded, ImportedFiles, Placed};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,10 +26,13 @@ pub enum JobOutput {
         then: Option<Action>,
     },
     Opened(Result<(PathBuf, usize), String>),
-    Imported {
+    /// Audio put into the project from a file or a pack.
+    Placed {
         name: String,
-        result: Result<AudioId, String>,
+        result: Result<Placed, String>,
     },
+    /// Several files brought into the project's audio at once.
+    FilesImported(Result<ImportedFiles, String>),
     LoopExported(Result<LoopSummary, String>),
     GameExported(Result<GameSummary, String>),
     WavExported(Result<WavSummary, String>),
@@ -46,6 +50,16 @@ pub enum JobOutput {
         result: Result<Arc<Pack>, String>,
     },
     BankLoaded(Result<BankLoaded, String>),
+    /// A sound pack's sample map, read for the browser.
+    BrowserPack {
+        map: String,
+        result: Result<Arc<PackListing>, String>,
+    },
+    /// One of the browser's folders, looked through.
+    FolderIndexed {
+        path: PathBuf,
+        result: Result<Arc<FolderIndex>, String>,
+    },
     /// Audio rendered or fetched to be heard.
     Previewed {
         key: PreviewKey,

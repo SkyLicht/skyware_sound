@@ -112,6 +112,20 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Save as…", "Ctrl+Shift+S", Action::SaveAs),
         entry("Import audio…", "", Action::ImportAudio),
         entry("Load sounds from a sample pack…", "", Action::LoadSounds),
+        entry(
+            if app.browser.open {
+                "Hide the browser"
+            } else {
+                "Show the browser"
+            },
+            "Ctrl+B",
+            Action::ToggleBrowser,
+        ),
+        entry(
+            "Add a folder of samples to the browser…",
+            "",
+            Action::AddBrowserFolder,
+        ),
         entry("Export loop for a game…", "", Action::ExportLoop),
         entry(
             "Game assets: loops and SFX sets for a game…",

@@ -13,12 +13,13 @@ use sky_core::Ticks;
 use sky_core::manifest::{Asset, Category};
 use sky_io::WavFormat;
 use sky_io::device::OutputMode;
-use sky_model::{LicenseReport, Origin};
+use sky_model::LicenseReport;
 use sky_session::LoopExportOptions;
 
 use crate::app::{Action, App};
 use crate::audio::{self, BUFFER_SIZES, SAMPLE_RATES};
 use crate::audition::{PreviewKey, preview_button};
+use crate::browser::Item;
 use crate::game::GameDialog;
 use crate::jobs::JobOutput;
 use crate::sounds::{LoadSoundsDialog, license_report_ui};
@@ -33,6 +34,8 @@ pub enum PathPurpose {
     ExportWavFile,
     SoundPack,
     GameFolder,
+    /// A folder of samples for the browser.
+    BrowseFolder,
 }
 
 impl PathPurpose {
@@ -45,6 +48,7 @@ impl PathPurpose {
             PathPurpose::ExportWavFile => "Export WAV to",
             PathPurpose::SoundPack => "Sound pack folder",
             PathPurpose::GameFolder => "Game export folder",
+            PathPurpose::BrowseFolder => "Add a folder to the browser",
         }
     }
 
@@ -59,6 +63,7 @@ impl PathPurpose {
             PathPurpose::ExportWavFile => "A .wav file",
             PathPurpose::SoundPack => "A folder with a strudel.json sample map in it",
             PathPurpose::GameFolder => "Your game's audio folder, such as assets/audio",
+            PathPurpose::BrowseFolder => "A folder of WAV, FLAC, OGG or MP3 samples",
         }
     }
 }
@@ -247,7 +252,8 @@ fn native_pick(purpose: PathPurpose, default: &Path) -> Option<PathBuf> {
         PathPurpose::OpenProject
         | PathPurpose::ExportLoopFolder
         | PathPurpose::SoundPack
-        | PathPurpose::GameFolder => d.pick_folder(),
+        | PathPurpose::GameFolder
+        | PathPurpose::BrowseFolder => d.pick_folder(),
         PathPurpose::SaveAs => d.save_file(),
         PathPurpose::ImportAudio => d
             .add_filter("Audio", &["wav", "flac", "ogg", "mp3"])
@@ -287,6 +293,12 @@ impl App {
                 .session
                 .game_export_dir()
                 .unwrap_or_else(|_| default_dir().join("export")),
+            PathPurpose::BrowseFolder => self
+                .browser
+                .folders
+                .last()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .unwrap_or_else(default_dir),
         }
     }
 
@@ -316,7 +328,10 @@ impl App {
         let mut text = default.display().to_string();
         if matches!(
             purpose,
-            PathPurpose::OpenProject | PathPurpose::ImportAudio | PathPurpose::SoundPack
+            PathPurpose::OpenProject
+                | PathPurpose::ImportAudio
+                | PathPurpose::SoundPack
+                | PathPurpose::BrowseFolder
         ) && !text.ends_with(std::path::MAIN_SEPARATOR)
         {
             text.push(std::path::MAIN_SEPARATOR);
@@ -413,19 +428,8 @@ impl App {
                     self.error(msg.clone());
                     return Some(msg);
                 }
-                let session = self.session.clone();
-                let name = path
-                    .file_stem()
-                    .map_or_else(|| "audio".to_string(), |s| s.to_string_lossy().into_owned());
-                self.jobs
-                    .spawn(ctx, Some(format!("Importing {name}")), move || {
-                        JobOutput::Imported {
-                            result: session
-                                .import_audio(&path, Origin::User)
-                                .map_err(|e| e.to_string()),
-                            name,
-                        }
-                    });
+                let target = self.default_audio_target();
+                self.drop_item(ctx, &Item::File(path), target);
             }
             PathPurpose::ExportLoopFolder => {
                 if let Some(d) = self.dialogs.export_loop.as_mut() {
@@ -450,6 +454,16 @@ impl App {
                     d.chosen.clear();
                 }
                 self.read_pack(ctx);
+            }
+            PathPurpose::BrowseFolder => {
+                if !path.is_dir() {
+                    let msg = format!("{} is not a folder", path.display());
+                    self.error(msg.clone());
+                    return Some(msg);
+                }
+                if !self.browser.add_folder(path.clone()) {
+                    self.info(format!("{} is in the browser already", path.display()));
+                }
             }
         }
         None

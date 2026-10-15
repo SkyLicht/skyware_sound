@@ -12,7 +12,7 @@ use egui::{
 };
 use sky_core::TrackId;
 use sky_dsp::InstrumentType;
-use sky_library::{MAX_FILES, MapFile, PACKS, Pack, PackSource, packs};
+use sky_library::{MAX_FILES, MapFile, PACKS, Pack, PackInfo, PackSource, packs};
 use sky_model::{
     Command, InstrumentSlot, License, LicenseReport, Origin, Project, SampleBank, Track, TrackKind,
     Transaction,
@@ -283,6 +283,24 @@ impl App {
             running: false,
             result: None,
         });
+    }
+
+    /// Opens Load sounds on one of the known packs, and a bank of it, for
+    /// the selected sample bank or a new one.
+    pub fn open_load_sounds_on(&mut self, ctx: &Context, info: &PackInfo, bank: Option<&str>) {
+        self.run_action(ctx, crate::app::Action::LoadSounds);
+        let read = self.browser.listing(info.map).map(|l| l.pack.clone());
+        let Some(d) = self.dialogs.load_sounds.as_mut() else {
+            return;
+        };
+        d.pack = PACKS.iter().position(|p| p.id == info.id);
+        d.address.clear();
+        d.bank = bank.map(str::to_string);
+        d.chosen.clear();
+        // The browser has read it already: no need to read it again.
+        if let Some(pack) = read {
+            d.set_listing(info.map.to_string(), Ok(pack));
+        }
     }
 
     /// Reads the chosen pack's sample map in the background.

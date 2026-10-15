@@ -432,6 +432,7 @@ fn run_app(
             token: info.token.clone(),
         }),
         demo_tracks: stress_ui,
+        browser_store: config::browser_folders_file(),
     };
     let result = sky_ui::run(session, config);
     if let Some((srv, _)) = server {

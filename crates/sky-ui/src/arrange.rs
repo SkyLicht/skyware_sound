@@ -260,6 +260,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     corner_ui(app, ui, corner, project);
     ruler_ui(app, ui, ruler, project);
     rows(app, ui, body, project);
+    crate::browser::arrange_drop(app, ui, body, project);
     hscrollbar(app, ui, hbar, project);
     ui.advance_cursor_after_rect(full);
 }
@@ -270,6 +271,9 @@ fn toolbar(app: &mut App, ui: &mut Ui, project: &Project) {
         .inner_margin(Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.toggle_value(&mut app.browser.open, "Browser")
+                    .on_hover_text("Show or hide the browser of audio and sample packs (Ctrl+B)");
+                ui.separator();
                 ui.label(RichText::new("Add track").color(theme::TEXT_WEAK));
                 for kind in NewTrack::ALL {
                     let tip = match kind {

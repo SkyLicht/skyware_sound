@@ -23,6 +23,11 @@ pub fn documents_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Where the browser keeps its list of sample folders.
+pub fn browser_folders_file() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "Skyware Sound").map(|d| d.config_dir().join("browser-folders.txt"))
+}
+
 fn token_path() -> anyhow::Result<PathBuf> {
     Ok(dirs()?.config_dir().join("mcp-token"))
 }

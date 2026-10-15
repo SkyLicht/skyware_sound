@@ -777,3 +777,226 @@ fn game_assets_render_as_they_export() {
     }
     assert!(session.render_game_asset("nope").is_err());
 }
+
+fn pack_sound(url: &str) -> sky_session::AudioInput {
+    let tone: Vec<f32> = (0..4_800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+    sky_session::AudioInput::Pack {
+        name: "Kit bd".into(),
+        sound: "BD".into(),
+        audio: std::sync::Arc::new(AudioData {
+            sample_rate: 48_000,
+            channels: vec![tone.clone(), tone],
+        }),
+        source: sky_model::AudioSource {
+            pack: "Test kit".into(),
+            url: url.into(),
+            license: sky_model::License::Cc0,
+            credit: None,
+        },
+        root: None,
+    }
+}
+
+#[test]
+fn audio_lands_where_it_is_dropped_in_one_undo_step() {
+    use sky_dsp::InstrumentType;
+    use sky_session::{AudioInput, AudioTarget};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let wav = tmp.path().join("tone.wav");
+    sine_file(&wav, 0.5);
+    let mut project = empty_project("Drops");
+    let vox = Track::new_audio("Vox");
+    let keys = Track::new_instrument("Keys", InstrumentType::Sampler);
+    let kit = Track::new_instrument("Kit", InstrumentType::Bank);
+    let lead = Track::new_instrument("Lead", InstrumentType::Synth);
+    let ids = [vox.id, keys.id, kit.id, lead.id];
+    project.tracks.extend([vox, keys, kit, lead]);
+    let session = headless(project);
+    let [vox, keys, kit, lead] = ids;
+    let file = || AudioInput::File(wav.clone());
+
+    // A file onto an audio track: into the pool and a clip, one step.
+    let history = session.view().history.len();
+    let placed = session
+        .place_audio(
+            file(),
+            AudioTarget::Clip {
+                track: vox,
+                start: PPQ * 4,
+            },
+            Origin::User,
+        )
+        .unwrap();
+    assert!(!placed.reused);
+    let project = session.project();
+    assert_eq!(project.audio_pool.len(), 1);
+    let (track, clip) = project.find_clip(placed.clip.unwrap()).unwrap();
+    assert_eq!((track.id, clip.start), (vox, PPQ * 4));
+    assert_eq!(clip.length, PPQ, "half a second at 120 bpm is one beat");
+    assert_eq!(session.view().history.len(), history + 1);
+    assert_eq!(session.view().undo_label.as_deref(), Some("Add tone"));
+    assert!(session.audio(placed.audio).is_some());
+    session.undo().unwrap();
+    let project = session.project();
+    assert!(project.audio_pool.is_empty());
+    assert!(project.track(vox).unwrap().clips.is_empty());
+
+    // On a new track after the first one; the same audio again on another.
+    let placed = session
+        .place_audio(
+            file(),
+            AudioTarget::NewTrack {
+                start: 0,
+                index: Some(1),
+            },
+            Origin::User,
+        )
+        .unwrap();
+    assert!(placed.new_track);
+    let project = session.project();
+    assert_eq!(project.tracks[1].id, placed.track.unwrap());
+    assert_eq!(project.tracks[1].name, "tone");
+    assert_eq!(project.tracks[1].clips.len(), 1);
+    assert_eq!(
+        session.view().undo_label.as_deref(),
+        Some("Add tone on a new track")
+    );
+    let again = session
+        .place_audio(
+            AudioInput::Pool(placed.audio),
+            AudioTarget::NewTrack {
+                start: 0,
+                index: None,
+            },
+            Origin::User,
+        )
+        .unwrap();
+    assert!(again.reused);
+    assert_eq!(again.audio, placed.audio);
+    let project = session.project();
+    assert_eq!(project.audio_pool.len(), 1);
+    assert_eq!(project.tracks.last().unwrap().name, "tone 2");
+
+    // Into a sampler.
+    session
+        .place_audio(
+            AudioInput::Pool(placed.audio),
+            AudioTarget::Sampler(keys),
+            Origin::User,
+        )
+        .unwrap();
+    let project = session.project();
+    let slot = project.track(keys).unwrap().instrument.clone().unwrap();
+    assert_eq!(slot.sample, Some(placed.audio));
+    assert_eq!(
+        session.view().undo_label.as_deref(),
+        Some("Load tone into Keys")
+    );
+
+    // A pack sound into a sample bank: the same address is used again and
+    // becomes a second variation.
+    let first = session
+        .place_audio(
+            pack_sound("https://example.com/bd.wav"),
+            AudioTarget::Bank(kit),
+            Origin::User,
+        )
+        .unwrap();
+    assert_eq!(first.sound, Some(("bd".to_string(), 0)));
+    let second = session
+        .place_audio(
+            pack_sound("https://example.com/bd.wav"),
+            AudioTarget::Bank(kit),
+            Origin::User,
+        )
+        .unwrap();
+    assert!(second.reused);
+    assert_eq!(second.audio, first.audio);
+    assert_eq!(second.sound, Some(("bd".to_string(), 1)));
+    let project = session.project();
+    assert_eq!(project.audio_pool.len(), 2);
+    let bank = project
+        .track(kit)
+        .unwrap()
+        .instrument
+        .as_ref()
+        .unwrap()
+        .bank
+        .clone()
+        .unwrap();
+    assert_eq!(bank.name, "Test kit");
+    assert_eq!(bank.sounds["bd"].len(), 2);
+    let entry = project.pool_entry(first.audio).unwrap();
+    assert_eq!(entry.source.as_ref().unwrap().pack, "Test kit");
+
+    // Where audio cannot go, nothing changes, not even the pool.
+    let before = session.view().revision;
+    for (target, what) in [
+        (
+            AudioTarget::Clip {
+                track: lead,
+                start: 0,
+            },
+            "Lead is not an audio track",
+        ),
+        (AudioTarget::Sampler(vox), "Vox is not a sampler"),
+        (AudioTarget::Bank(keys), "Keys is not a sample bank"),
+    ] {
+        let e = session
+            .place_audio(file(), target, Origin::User)
+            .unwrap_err();
+        assert!(e.to_string().contains(what), "{e}");
+    }
+    let text = tmp.path().join("notes.wav");
+    std::fs::write(&text, "not audio").unwrap();
+    assert!(
+        session
+            .place_audio(AudioInput::File(text), AudioTarget::Pool, Origin::User)
+            .is_err()
+    );
+    assert_eq!(session.view().revision, before);
+    assert_eq!(session.project().audio_pool.len(), 2);
+
+    // A saved project gets the file's audio in its folder.
+    let dir = tmp.path().join("Drops.skyproj");
+    session.save(Some(&dir)).unwrap();
+    let placed = session
+        .place_audio(file(), AudioTarget::Pool, Origin::User)
+        .unwrap();
+    let entry = session.project().pool_entry(placed.audio).unwrap().clone();
+    assert!(dir.join(&entry.file).is_file());
+    assert_eq!(session.view().undo_label.as_deref(), Some("Import tone"));
+}
+
+#[test]
+fn several_files_import_as_one_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("kick.wav");
+    let b = tmp.path().join("snare.wav");
+    let bad = tmp.path().join("readme.wav");
+    sine_file(&a, 0.1);
+    sine_file(&b, 0.1);
+    std::fs::write(&bad, "not audio").unwrap();
+    let session = headless(empty_project("Import"));
+
+    let done = session
+        .import_files(&[a.clone(), bad.clone(), b.clone()], Origin::User)
+        .unwrap();
+    assert_eq!(done.audio.len(), 2);
+    assert_eq!(done.failed.len(), 1);
+    let project = session.project();
+    let names: Vec<&str> = project.audio_pool.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["kick", "snare"]);
+    assert_eq!(session.view().undo_label.as_deref(), Some("Import 2 files"));
+    session.undo().unwrap();
+    assert!(session.project().audio_pool.is_empty());
+
+    // Nothing readable is an error that changes nothing.
+    let before = session.view().revision;
+    let e = session
+        .import_files(&[bad.clone(), bad], Origin::User)
+        .unwrap_err();
+    assert!(e.to_string().contains("none of the 2 files"), "{e}");
+    assert_eq!(session.view().revision, before);
+}

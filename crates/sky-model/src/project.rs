@@ -797,6 +797,19 @@ impl Project {
             .ok_or(ModelError::TrackNotFound(id))
     }
 
+    /// `base`, or `base 2`, `base 3` and so on: the first that no track
+    /// is called yet.
+    pub fn unique_track_name(&self, base: &str) -> String {
+        let taken = |name: &str| self.tracks.iter().any(|t| t.name == name);
+        if !taken(base) {
+            return base.to_string();
+        }
+        (2..)
+            .map(|n| format!("{base} {n}"))
+            .find(|n| !taken(n))
+            .unwrap_or_else(|| base.to_string())
+    }
+
     pub fn track_index(&self, id: TrackId) -> Result<usize, ModelError> {
         self.tracks
             .iter()
