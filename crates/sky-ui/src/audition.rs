@@ -570,7 +570,7 @@ pub fn keyboard(app: &mut App, ui: &mut Ui, track: &Track) {
             .map(|w| (*w, y))
     };
     if response.is_pointer_button_down_on()
-        && let Some((pitch, depth)) = ui.input(|i| i.pointer.latest_pos()).and_then(&key_at)
+        && let Some((pitch, depth)) = ui.input(|i| i.pointer.latest_pos()).and_then(key_at)
     {
         let velocity = (40.0 + depth.clamp(0.0, 1.0) * 87.0).round() as u8;
         app.hold_key(track.id, Some(pitch), velocity);
@@ -585,7 +585,7 @@ pub fn keyboard(app: &mut App, ui: &mut Ui, track: &Track) {
     } else {
         "Press to hear the instrument; lower on a key plays louder"
     };
-    let hovered = response.hover_pos().and_then(&key_at).map(|(k, _)| k);
+    let hovered = response.hover_pos().and_then(key_at).map(|(k, _)| k);
     response.on_hover_ui(|ui| {
         ui.label(tip);
         if let Some(k) = hovered {
