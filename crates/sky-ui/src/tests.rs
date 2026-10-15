@@ -20,10 +20,11 @@ use sky_session::Session;
 
 use crate::actions::{self, NewTrack};
 use crate::app::{Action, App, Tab};
+use crate::audition::{ButtonState, PreviewKey};
 use crate::dialogs::PathPurpose;
 use crate::waveform::Peaks;
 use crate::widgets::Gestures;
-use crate::{UiConfig, arrange, palette, pattern_editor, sounds, theme};
+use crate::{UiConfig, arrange, game, palette, pattern_editor, sounds, theme};
 
 const TABS: [Tab; 4] = [Tab::Editor, Tab::Mixer, Tab::Instrument, Tab::Ai];
 
@@ -35,11 +36,22 @@ struct Harness {
     events: Vec<Event>,
     modifiers: Modifiers,
     screen: Rect,
+    /// The audio-thread end of the engine, run by hand, when there is one.
+    engine: Option<sky_engine::Engine>,
 }
 
 impl Harness {
     fn with_config(project: Project, config: UiConfig) -> Self {
-        let (session, _engine) = Session::new(project, None);
+        Self::build(project, config, None)
+    }
+
+    /// With an engine at 48 kHz that [`heard`](Self::heard) runs.
+    fn with_engine(project: Project) -> Self {
+        Self::build(project, UiConfig::default(), Some(48_000))
+    }
+
+    fn build(project: Project, config: UiConfig, engine_rate: Option<u32>) -> Self {
+        let (session, engine) = Session::new(project, engine_rate);
         let ctx = Context::default();
         theme::apply(&ctx);
         let app = App::new(session, config, false);
@@ -50,9 +62,34 @@ impl Harness {
             events: Vec::new(),
             modifiers: Modifiers::NONE,
             screen: Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0)),
+            engine,
         };
         h.frames(3);
         h
+    }
+
+    /// Runs the engine for 50 ms and returns the loudest sample.
+    fn heard(&mut self) -> f32 {
+        let engine = self.engine.as_mut().expect("an engine");
+        let mut l = vec![0.0f32; 2_400];
+        let mut r = vec![0.0f32; 2_400];
+        engine.process_planar(&mut l, &mut r);
+        l.iter().chain(&r).fold(0.0, |m, s| m.max(s.abs()))
+    }
+
+    /// Runs the engine until what it plays dies away.
+    fn quiet(&mut self) {
+        for _ in 0..40 {
+            self.heard();
+        }
+    }
+
+    /// Where a widget with this id was last laid out.
+    fn rect_of(&self, id: Id) -> Rect {
+        self.ctx
+            .read_response(id)
+            .unwrap_or_else(|| panic!("no widget {id:?}"))
+            .rect
     }
 
     fn with_project(project: Project) -> Self {
@@ -1378,7 +1415,9 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("app.rs"),
         include_str!("arrange.rs"),
         include_str!("audio.rs"),
+        include_str!("audition.rs"),
         include_str!("dialogs.rs"),
+        include_str!("game.rs"),
         include_str!("jobs.rs"),
         include_str!("lib.rs"),
         include_str!("mixer.rs"),
@@ -1432,7 +1471,6 @@ fn unique_names_and_new_tracks() {
 
 #[test]
 fn opening_game_assets_changes_nothing() {
-    use crate::game;
     use sky_core::manifest::RandomRange;
     use sky_model::GameAssetKind;
 
@@ -1460,7 +1498,6 @@ fn opening_game_assets_changes_nothing() {
 
 #[test]
 fn game_assets_are_added_edited_and_exported() {
-    use crate::game;
     use sky_model::GameAssetKind;
 
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1547,4 +1584,253 @@ fn game_assets_are_added_edited_and_exported() {
     h.app.dialogs.game = None;
     h.frames(1);
     assert_eq!(h.project().game.assets.len(), 3);
+}
+
+#[test]
+fn piano_keys_and_placed_notes_are_heard() {
+    let mut h = Harness::with_engine(demo_project());
+    let bass = h.track_named("Bass");
+    let clip = bass.clips[0].id;
+    h.app.sel.select_clip(bass.id, clip);
+    h.app.tab = Tab::Editor;
+    h.frames(3);
+    let history = h.history_len();
+    assert_eq!(h.heard(), 0.0, "nothing plays while stopped");
+
+    // Pressing a key holds it; letting go releases it.
+    let keys = h.rect_of(Id::new(("piano_keys", clip)));
+    let key = keys.center();
+    h.move_to(key);
+    h.pointer(key, true);
+    h.frame();
+    let held = h.app.audition.held.expect("a key is held");
+    assert_eq!(held.0, bass.id);
+    assert!(h.heard() > 0.01, "the key is heard");
+    // Dragging along the keys plays the next one.
+    h.move_to(key + vec2(0.0, -40.0));
+    let next = h.app.audition.held.expect("still held");
+    assert!(next.1 > held.1, "{next:?} after {held:?}");
+    h.pointer(key, false);
+    h.frame();
+    assert_eq!(h.app.audition.held, None);
+    h.quiet();
+    assert!(h.heard() < 1e-3, "the key was let go");
+
+    // A note added on the grid sounds once, and only the note is a change.
+    let grid = h.rect_of(Id::new(("piano_bg", clip)));
+    let notes = |h: &Harness| match &h.clip(clip).content {
+        ClipContent::Midi { notes } => notes.len(),
+        _ => 0,
+    };
+    let before = notes(&h);
+    h.click(grid.left_top() + vec2(4.0, 4.0));
+    assert_eq!(notes(&h), before + 1);
+    assert_eq!(h.history_len(), history + 1);
+    assert!(h.heard() > 0.01, "the new note is heard");
+    h.quiet();
+    assert!(h.heard() < 1e-3, "and it ends by itself");
+
+    // With hearing notes off, adding one is silent.
+    h.app.audition.hear_notes = false;
+    h.click(grid.left_top() + vec2(4.0, 30.0));
+    assert_eq!(notes(&h), before + 2);
+    assert_eq!(h.heard(), 0.0);
+}
+
+#[test]
+fn the_instrument_keyboard_plays_the_track() {
+    let mut h = Harness::with_engine(demo_project());
+    let pad = h.track_named("Pad");
+    h.app.sel.select_track(pad.id);
+    h.app.tab = Tab::Instrument;
+    h.frames(3);
+    let keys = h.rect_of(crate::audition::keyboard_id(pad.id));
+    let at = keys.left_bottom() + vec2(keys.width() / 2.0, -4.0);
+    h.move_to(at);
+    h.pointer(at, true);
+    h.frame();
+    assert!(h.app.audition.held.is_some_and(|(t, _)| t == pad.id));
+    assert!(h.heard() > 0.01);
+    h.pointer(at, false);
+    h.frame();
+    assert_eq!(h.app.audition.held, None);
+    // Only a project with no device stays silent, without complaint.
+    let mut off = Harness::demo();
+    let pad = off.track_named("Pad");
+    off.app.sel.select_track(pad.id);
+    off.app.tab = Tab::Instrument;
+    off.frames(3);
+    let keys = off.rect_of(crate::audition::keyboard_id(pad.id));
+    off.click(keys.center());
+    assert_eq!(off.app.audition.held, None);
+    assert!(off.app.notice.is_none());
+}
+
+#[test]
+fn game_loops_and_sfx_sets_are_heard_as_they_export() {
+    let mut h = Harness::with_engine(demo_project());
+    let ctx = h.ctx();
+    let music = h.app.report(game::add_loop(&h.app.session)).expect("loop");
+    let sfx = h.app.report(game::add_sfx(&h.app.session)).expect("sfx");
+    h.run(Action::GameAssets);
+    h.frames(2);
+    let play = PreviewKey::GameLoop {
+        asset: music,
+        join: false,
+    };
+
+    // Play renders in the background, then loops until stopped.
+    h.app.toggle_preview(&ctx, play.clone());
+    assert_eq!(h.app.preview_state(&play), ButtonState::Pending);
+    h.frames(2);
+    h.wait_jobs();
+    assert_eq!(h.app.preview_state(&play), ButtonState::Playing);
+    assert!(h.heard() > 0.01);
+    let id = h.app.session.previewing().expect("the engine plays it");
+    // The demo loop is four bars, eight seconds; ten seconds later it
+    // still plays.
+    for _ in 0..200 {
+        h.heard();
+    }
+    assert_eq!(h.app.session.previewing(), Some(id));
+    assert_eq!(h.history_len(), 2, "auditions are not changes");
+
+    // Join starts another render, which replaces it; then Stop stops.
+    let join = PreviewKey::GameLoop {
+        asset: music,
+        join: true,
+    };
+    h.app.toggle_preview(&ctx, join.clone());
+    h.wait_jobs();
+    h.heard();
+    assert_eq!(h.app.preview_state(&join), ButtonState::Playing);
+    assert_eq!(h.app.preview_state(&play), ButtonState::Idle);
+    h.app.toggle_preview(&ctx, join.clone());
+    h.heard();
+    h.frames(20);
+    assert_eq!(h.app.preview_state(&join), ButtonState::Idle);
+    assert_eq!(h.app.session.previewing(), None);
+
+    // An SFX set renders once, then each trigger plays the next variation.
+    h.app.trigger_sfx(&ctx, sfx);
+    h.wait_jobs();
+    assert!(h.heard() > 0.0);
+    let first = h
+        .app
+        .audition
+        .last_trigger
+        .get(&sfx)
+        .cloned()
+        .expect("played");
+    assert!(first.starts_with("Variation "), "{first}");
+    // The second needs no render.
+    h.app.trigger_sfx(&ctx, sfx);
+    assert_ne!(
+        h.app.preview_state(&PreviewKey::GameSfx(sfx)),
+        ButtonState::Pending
+    );
+    assert!(h.heard() > 0.0);
+    h.frames(2);
+
+    // Closing the window stops what it started.
+    h.app.toggle_preview(&ctx, play.clone());
+    h.wait_jobs();
+    h.heard();
+    assert!(h.app.session.previewing().is_some());
+    h.app.dialogs.game = None;
+    h.frames(2);
+    h.heard();
+    h.heard();
+    assert_eq!(h.app.session.previewing(), None);
+
+    // Without a device, Play says why it is silent.
+    let mut off = Harness::demo();
+    let ctx = off.ctx();
+    let music = off
+        .app
+        .report(game::add_loop(&off.app.session))
+        .expect("loop");
+    off.run(Action::GameAssets);
+    let play = PreviewKey::GameLoop {
+        asset: music,
+        join: false,
+    };
+    off.app.toggle_preview(&ctx, play.clone());
+    assert_eq!(off.app.preview_state(&play), ButtonState::Idle);
+    assert!(off.app.notice.as_ref().is_some_and(|n| n.error));
+}
+
+#[test]
+fn the_loop_region_and_pack_sounds_are_heard_before_export_or_load() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let folder = dir.path().join("kit");
+    write_pack(&folder);
+    let mut h = Harness::with_engine(empty_project("Banks"));
+    let ctx = h.ctx();
+
+    // A pack's sound plays from the Load sounds dialog before loading.
+    h.app.run_action(&ctx, Action::LoadSounds);
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    d.pack = None;
+    d.address = folder.display().to_string();
+    h.app.read_pack(&ctx);
+    h.wait_jobs();
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    d.bank = Some("Kit".into());
+    assert!(d.hear, "on by default");
+    h.app
+        .start_preview(&ctx, PreviewKey::PackSound("sd".into()));
+    h.wait_jobs();
+    let p = h.heard();
+    // sd.wav is a constant 0.3.
+    assert!((p - 0.3).abs() < 0.01, "{p}");
+    assert!(h.project().audio_pool.is_empty(), "nothing loaded yet");
+    h.app.dialogs.load_sounds = None;
+    h.frames(2);
+
+    // Bank sounds play through the track, each click the next variation.
+    let track = Track::new_instrument("Kit", InstrumentType::Bank);
+    let track_id = track.id;
+    h.app
+        .session
+        .apply(Transaction::single(Command::AddTrack {
+            track: Box::new(track),
+            index: None,
+        }))
+        .expect("add track");
+    let request = sky_session::BankRequest {
+        source: sky_library::PackSource::parse(&folder.to_string_lossy(), Some(License::Cc0)),
+        bank: Some("Kit".into()),
+        sounds: Vec::new(),
+        add: false,
+        pitched: None,
+    };
+    h.app
+        .session
+        .load_bank(track_id, &request, Origin::User)
+        .expect("load");
+    h.frames(2);
+    h.quiet();
+    h.app.hear_bank_sound(track_id, "bd", 2);
+    let first = h.heard();
+    h.quiet();
+    h.app.hear_bank_sound(track_id, "bd", 2);
+    let second = h.heard();
+    // bd0 and bd1 are 0.1 and 0.2.
+    assert!(second > first * 1.5, "{first} then {second}");
+
+    // Export loop's Play renders the loop region and loops it.
+    h.app.session.new_project(demo_project());
+    h.frames(2);
+    h.run(Action::ExportLoop);
+    let play = PreviewKey::LoopRegion { join: false };
+    h.app.toggle_preview(&ctx, play.clone());
+    h.wait_jobs();
+    assert!(h.heard() > 0.01);
+    assert_eq!(h.app.preview_state(&play), ButtonState::Playing);
+    // The transport's Stop stops previews too.
+    h.app.stop();
+    h.heard();
+    h.heard();
+    assert_eq!(h.app.session.previewing(), None);
 }

@@ -45,6 +45,8 @@ pub struct EngineShared {
     /// Share of the buffer time the last callback used, as f32 bits.
     pub load: AtomicU32,
     pub callbacks: AtomicU64,
+    /// The id of the preview playing, or 0.
+    pub preview: AtomicU64,
     pub master: Meter,
     pub tracks: Vec<Meter>,
 }
@@ -60,6 +62,7 @@ impl EngineShared {
             overruns: AtomicU64::new(0),
             load: AtomicU32::new(0),
             callbacks: AtomicU64::new(0),
+            preview: AtomicU64::new(0),
             master: Meter::default(),
             tracks: (0..MAX_METERS).map(|_| Meter::default()).collect(),
         }
@@ -75,6 +78,11 @@ impl EngineShared {
 
     pub fn load(&self) -> f32 {
         f32::from_bits(self.load.load(Ordering::Relaxed))
+    }
+
+    /// The id of the preview playing, if one is.
+    pub fn preview(&self) -> Option<u64> {
+        Some(self.preview.load(Ordering::Relaxed)).filter(|id| *id != 0)
     }
 
     pub fn track_meter(&self, index: usize) -> Option<&Meter> {

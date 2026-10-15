@@ -635,3 +635,145 @@ fn unknown_licenses_warn_and_bad_requests_change_nothing() {
     assert_eq!(report.warnings.len(), 1);
     assert!(report.warnings[0].starts_with("Test kit does not state a license"));
 }
+
+fn peak_of(engine: &mut sky_engine::Engine, frames: usize) -> f32 {
+    let mut l = vec![0.0f32; frames];
+    let mut r = vec![0.0f32; frames];
+    engine.process_planar(&mut l, &mut r);
+    l.iter().chain(&r).fold(0.0f32, |m, s| m.max(s.abs()))
+}
+
+#[test]
+fn auditions_play_while_stopped_and_change_nothing() {
+    let (session, engine) = Session::new(demo_project(), Some(48_000));
+    let mut engine = engine.unwrap();
+    let project = session.project();
+    let bass = project.tracks[1].id;
+    let revision = session.view().revision;
+    assert_eq!(peak_of(&mut engine, 4_800), 0.0);
+
+    session.note_on(bass, 48, 100, Some(0.1)).unwrap();
+    assert!(peak_of(&mut engine, 4_800) > 0.01, "the key is heard");
+    assert!(!session.transport().playing);
+    // The bass's release is short: a second later it is quiet again.
+    peak_of(&mut engine, 48_000);
+    assert!(peak_of(&mut engine, 4_800) < 1e-3);
+
+    let audio = std::sync::Arc::new(AudioData {
+        sample_rate: 24_000,
+        channels: vec![vec![0.25; 2_400]],
+    });
+    let opts = sky_session::PreviewOptions {
+        loop_start: Some(0),
+        semitones: 12.0,
+        gain_db: -6.0,
+        ..Default::default()
+    };
+    let id = session.preview(audio.clone(), opts).unwrap();
+    // An octave up undoes the half rate: 24 kHz audio plays at 48 kHz
+    // speed. At -6 dB, 0.25 plays at about 0.125.
+    let p = peak_of(&mut engine, 48_000);
+    assert!((p - 0.125).abs() < 0.01, "{p}");
+    assert_eq!(session.previewing(), Some(id));
+    session.stop_preview().unwrap();
+    peak_of(&mut engine, 4_800);
+    assert_eq!(session.previewing(), None);
+
+    // None of it is a change to the project.
+    assert_eq!(session.view().revision, revision);
+    assert!(session.view().history.is_empty());
+
+    assert!(matches!(
+        session.note_on(bass, 128, 100, None),
+        Err(SessionError::Invalid(_))
+    ));
+    let mut with_audio = demo_project();
+    with_audio.tracks.push(Track::new_audio("Audio"));
+    let audio_track = with_audio.tracks[3].id;
+    session.new_project(with_audio);
+    assert!(session.note_on(audio_track, 60, 100, None).is_err());
+    let off = headless(demo_project());
+    let bass = off.project().tracks[1].id;
+    assert!(matches!(
+        off.note_on(bass, 60, 100, None),
+        Err(SessionError::NoEngine)
+    ));
+    assert!(matches!(
+        off.preview(audio, sky_session::PreviewOptions::default()),
+        Err(SessionError::NoEngine)
+    ));
+    assert_eq!(off.previewing(), None);
+}
+
+#[test]
+fn bank_sounds_play_by_name_and_variation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    pack_folder(&pack);
+    let mut project = empty_project("Banks");
+    let track = Track::new_instrument("Beat", sky_dsp::InstrumentType::Bank);
+    let track_id = track.id;
+    project.tracks.push(track);
+    let (session, engine) = Session::new(project, Some(48_000));
+    let mut engine = engine.unwrap();
+    session.set_library(sky_library::Library::new(tmp.path().join("cache")));
+    let request = pack_request(&pack, sky_model::License::Cc0);
+    session.load_bank(track_id, &request, Origin::User).unwrap();
+
+    peak_of(&mut engine, 480);
+    session.play_sound(track_id, "bd", 1, 127).unwrap();
+    assert!(peak_of(&mut engine, 4_800) > 0.1);
+    let err = session.play_sound(track_id, "cp", 0, 127).unwrap_err();
+    assert!(err.to_string().contains("no loaded sound"), "{err}");
+}
+
+#[test]
+fn game_assets_render_as_they_export() {
+    let mut project = demo_project();
+    let bar = project.ticks_per_bar();
+    project.game.assets = vec![
+        game_asset(
+            "battle",
+            Category::Music,
+            GameAssetKind::Loop {
+                range: TimeRange::new(bar, bar * 3).unwrap(),
+                intro_start: Some(0),
+            },
+        ),
+        game_asset(
+            "hit",
+            Category::Sfx,
+            GameAssetKind::sfx(TimeRange::new(0, bar).unwrap().split(4)),
+        ),
+    ];
+    let session = headless(project);
+    let battle = session.render_game_asset("battle").unwrap();
+    // One bar of intro, then two bars of body: 2 s and 4 s at 120 BPM.
+    assert_eq!(battle.audio.len(), 1);
+    assert_eq!(battle.loop_start, 96_000);
+    assert_eq!(battle.audio[0].frames(), 96_000 * 3);
+    assert!(battle.seam.is_some());
+    let hit = session.render_game_asset("hit").unwrap();
+    assert_eq!(hit.audio.len(), 4);
+    assert!(hit.seam.is_none());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out = session
+        .export_game(&GameExportOptions {
+            dir: Some(tmp.path().to_path_buf()),
+            only: Vec::new(),
+        })
+        .unwrap();
+    let Asset::Loop(l) = &out.assets[0].asset else {
+        panic!()
+    };
+    assert_eq!(l.loop_start, battle.loop_start as u64);
+    let Asset::Sfx(s) = &out.assets[1].asset else {
+        panic!()
+    };
+    for (file, audio) in s.variations.iter().zip(&hit.audio) {
+        assert_eq!(file.length_samples, audio.frames() as u64);
+    }
+    assert!(session.render_game_asset("nope").is_err());
+}
