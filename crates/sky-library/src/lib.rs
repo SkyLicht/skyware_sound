@@ -432,6 +432,20 @@ impl Library {
         sky_io::read_audio(&path).map_err(|e| e.to_string())
     }
 
+    /// One file of a pack, decoded, such as to hear a sound before loading
+    /// it. It comes from the cache when it was fetched before, and stays
+    /// there for a later load.
+    pub fn fetch(&self, pack: &Pack, file: &MapFile) -> Result<AudioData, String> {
+        let location = pack.map.locate(file);
+        let audio = self
+            .fetch_audio(&location)
+            .map_err(|e| format!("{location}: {e}"))?;
+        if audio.frames() == 0 {
+            return Err(format!("{location}: the file has no audio in it"));
+        }
+        Ok(audio)
+    }
+
     /// Downloads and decodes the chosen sounds, several files at a time.
     /// Files that fail are listed in [`LoadedBank::failed`]; it is an error
     /// only when none load.

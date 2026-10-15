@@ -7,9 +7,15 @@
 //! undo step, is written to the crash journal, and reaches the engine as a
 //! new snapshot. Readers never lock: [`Session::view`] returns the latest
 //! published [`ProjectView`].
+//!
+//! Auditioning changes nothing in the project: [`Session::note_on`] and
+//! [`Session::play_sound`] play a track's instrument live, and
+//! [`Session::preview`] plays audio, such as a game asset rendered by
+//! [`Session::render_game_asset`], straight to the output.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,15 +26,17 @@ use sky_core::{AudioId, Ticks, TrackId};
 use sky_dsp::AudioData;
 use sky_dsp::InstrumentType;
 use sky_dsp::analysis::{self, SeamReport};
+use sky_dsp::util::db_to_gain;
+use sky_engine::compile::CompiledBank;
 use sky_engine::{
-    AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, compile, create_engine,
+    AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, Preview, compile, create_engine,
 };
 use sky_game::{AssetAudio, AssetExport, ExportSet, Exported, LoopExport};
 use sky_io::{WavFormat, read_audio, write_wav};
 use sky_library::{Library, LibraryError, PackSource};
 use sky_model::file::{self, Journal};
 use sky_model::{
-    AudioSource, BankSample, Command, GameAssetKind, History, InstrumentSlot, License,
+    AudioSource, BankSample, Command, GameAsset, GameAssetKind, History, InstrumentSlot, License,
     LicenseReport, ModelError, Origin, PoolEntry, Project, SampleBank, TrackKind, Transaction,
 };
 use thiserror::Error;
@@ -190,6 +198,31 @@ pub struct GameExported {
     pub licenses: LicenseReport,
 }
 
+/// A game asset rendered the way [`Session::export_game`] renders it.
+#[derive(Clone, Debug)]
+pub struct RenderedAsset {
+    /// A loop's audio (its intro, then one pass of its body), or one
+    /// recording per SFX variation, trimmed and folded to mono as exported.
+    pub audio: Vec<AudioData>,
+    /// For loops: the frame the body starts at, after the intro.
+    pub loop_start: usize,
+    /// For loops: how the end of the body meets its start.
+    pub seam: Option<SeamReport>,
+}
+
+/// Options for [`Session::preview`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PreviewOptions {
+    /// The frame of the audio to start at.
+    pub start: usize,
+    /// The frame playback jumps back to at the end, so it loops until
+    /// stopped; `None` plays once.
+    pub loop_start: Option<usize>,
+    /// A pitch shift that also changes the speed, as `sky-runtime` does.
+    pub semitones: f32,
+    pub gain_db: f32,
+}
+
 /// Samples quieter than this (about -80 dBFS) count as silence when SFX
 /// variations are trimmed.
 const SILENCE: f32 = 1e-4;
@@ -205,6 +238,74 @@ fn game_export_dir(project: &Project, path: Option<&Path>) -> Result<PathBuf, Se
         ))),
         (None, Some(p)) => Ok(p.join(file::RENDERS_DIR).join("export")),
         (None, None) => Err(SessionError::NoProjectPath),
+    }
+}
+
+/// Renders `asset` as an export does, adding its length to
+/// `total_seconds` and failing once that passes the render limit.
+fn render_asset(
+    project: &Project,
+    audio: &AudioCache,
+    asset: &GameAsset,
+    total_seconds: &mut f64,
+) -> Result<RenderedAsset, SessionError> {
+    let sr = project.sample_rate;
+    let to_sample = |t: Ticks| project.tempo.tick_to_sample(t, sr);
+    match &asset.kind {
+        GameAssetKind::Loop { range, intro_start } => {
+            let (s, e) = (to_sample(range.start), to_sample(range.end));
+            if e <= s {
+                return Err(SessionError::Invalid(format!(
+                    "the loop {:?} is empty",
+                    asset.name
+                )));
+            }
+            let i = intro_start.map_or(s, to_sample).min(s);
+            *total_seconds += ((s - i) + 2 * (e - s)) as f64 / sr as f64;
+            Session::check_length(*total_seconds)?;
+            let snap = compile(project, audio, sr, 0);
+            let out = if i < s {
+                sky_engine::render_intro_loop(snap, i, s, e)
+            } else {
+                sky_engine::render_loop(snap, s, e, 2)
+            };
+            let loop_start = (s - i) as usize;
+            let seam = analysis::seam_check(&out, loop_start, out.frames());
+            Ok(RenderedAsset {
+                audio: vec![out],
+                loop_start,
+                seam: Some(seam),
+            })
+        }
+        GameAssetKind::Sfx {
+            variations,
+            tail_seconds,
+            mono,
+            ..
+        } => {
+            let tail = f64::from(*tail_seconds);
+            let mut outs = Vec::with_capacity(variations.len());
+            for v in variations {
+                let (s, e) = (to_sample(v.start), to_sample(v.end));
+                *total_seconds += (e - s) as f64 / sr as f64 + tail;
+                Session::check_length(*total_seconds)?;
+                let frames = (e - s) as usize + (tail * sr as f64) as usize;
+                let snap = compile(project, audio, sr, 0);
+                // Only what starts in the variation, so the tail does not
+                // pick up the next one.
+                let mut out = sky_engine::render_one_shot(snap, s, e, frames);
+                trim_silence(&mut out);
+                if *mono {
+                    fold_to_mono(&mut out);
+                }
+                outs.push(out);
+            }
+            Ok(RenderedAsset {
+                audio: outs,
+                loop_start: 0,
+                seam: None,
+            })
+        }
     }
 }
 
@@ -294,6 +395,8 @@ struct Inner {
     engine: Mutex<Option<EngineHandle>>,
     shared: ArcSwapOption<EngineShared>,
     view: ArcSwap<ProjectView>,
+    /// The id of the last preview sent to the engine.
+    last_preview: AtomicU64,
 }
 
 /// A handle to the live session. Clones share the same session.
@@ -411,6 +514,7 @@ impl Session {
             engine: Mutex::new(handle_out),
             shared: ArcSwapOption::new(shared_out),
             view: ArcSwap::from_pointee(view),
+            last_preview: AtomicU64::new(0),
         });
         spawn_housekeeping(Arc::downgrade(&inner));
         (Session { inner }, engine_out)
@@ -598,6 +702,141 @@ impl Session {
             dropouts: shared.dropouts.load(Relaxed),
             overruns: shared.overruns.load(Relaxed),
         }
+    }
+
+    // ----- audition -----
+
+    /// The engine's sample rate, for timing live notes and previews.
+    fn engine_rate(&self) -> Result<u32, SessionError> {
+        self.view().engine_rate.ok_or(SessionError::NoEngine)
+    }
+
+    /// An instrument track, or why `track` is not one.
+    fn instrument_track(&self, track: TrackId) -> Result<(), SessionError> {
+        if self.project().track(track)?.kind != TrackKind::Instrument {
+            return Err(ModelError::NotAnInstrumentTrack(track).into());
+        }
+        Ok(())
+    }
+
+    /// Plays a key on a track's instrument now, whether or not the
+    /// transport runs, through the track's effects and mixer channel (so a
+    /// muted track stays silent). With `seconds` the key lets go by itself;
+    /// without, [`note_off`](Self::note_off) ends it. Changes nothing in
+    /// the project.
+    pub fn note_on(
+        &self,
+        track: TrackId,
+        pitch: u8,
+        velocity: u8,
+        seconds: Option<f64>,
+    ) -> Result<(), SessionError> {
+        if pitch > 127 {
+            return Err(SessionError::Invalid(format!(
+                "the key {pitch} is outside 0 to 127"
+            )));
+        }
+        self.instrument_track(track)?;
+        let sr = self.engine_rate()?;
+        let frames = seconds.map(|s| (s.clamp(0.0, 60.0) * f64::from(sr)).max(1.0) as u32);
+        self.send(EngineMsg::NoteOn {
+            track,
+            pitch,
+            velocity: velocity.clamp(1, 127),
+            frames,
+        })
+    }
+
+    /// Lets go of a key [`note_on`](Self::note_on) started.
+    pub fn note_off(&self, track: TrackId, pitch: u8) -> Result<(), SessionError> {
+        self.send(EngineMsg::NoteOff {
+            track,
+            pitch: pitch.min(127),
+        })
+    }
+
+    /// Plays variation `variation` of a sound of a track's sample bank, as
+    /// a pattern's `name:variation` would, whether or not the transport
+    /// runs. Changes nothing in the project.
+    pub fn play_sound(
+        &self,
+        track: TrackId,
+        name: &str,
+        variation: u32,
+        velocity: u8,
+    ) -> Result<(), SessionError> {
+        // Under the lock, the bank and its audio are the ones the engine's
+        // latest snapshot was compiled from, so the numbering matches.
+        let st = lock(&self.inner.state);
+        let t = st.project.track(track)?;
+        let bank = t
+            .instrument
+            .as_ref()
+            .filter(|i| i.kind == InstrumentType::Bank)
+            .and_then(|i| i.bank.as_ref())
+            .ok_or_else(|| {
+                SessionError::Invalid(format!("the track \"{}\" has no sample bank", t.name))
+            })?;
+        let sound = CompiledBank::new(bank, &st.audio)
+            .sound(name, variation)
+            .ok_or_else(|| {
+                SessionError::Invalid(format!(
+                    "the bank {} has no loaded sound {name:?}",
+                    bank.name
+                ))
+            })?;
+        drop(st);
+        self.send(EngineMsg::SoundOn {
+            track,
+            sound,
+            velocity: velocity.clamp(1, 127),
+        })
+    }
+
+    /// Plays `audio` straight to the output, after the master channel,
+    /// replacing any preview playing, and returns the preview's id. The
+    /// project and the transport are left alone.
+    pub fn preview(
+        &self,
+        audio: Arc<AudioData>,
+        opts: PreviewOptions,
+    ) -> Result<u64, SessionError> {
+        let sr = self.engine_rate()?;
+        if audio.frames() == 0 || audio.sample_rate == 0 {
+            return Err(SessionError::Invalid("there is no audio to play".into()));
+        }
+        let pitch = 2f64.powf(f64::from(opts.semitones.clamp(-48.0, 48.0)) / 12.0);
+        let id = self.inner.last_preview.fetch_add(1, Ordering::Relaxed) + 1;
+        let frames = audio.frames();
+        self.send(EngineMsg::Preview(Box::new(Preview {
+            id,
+            rate: f64::from(audio.sample_rate) / f64::from(sr) * pitch,
+            start: opts.start.min(frames - 1) as f64,
+            loop_start: opts.loop_start.filter(|s| *s < frames).map(|s| s as f64),
+            gain: db_to_gain(opts.gain_db.clamp(-120.0, 24.0)),
+            audio,
+        })))?;
+        Ok(id)
+    }
+
+    /// Fades out the preview playing, if any.
+    pub fn stop_preview(&self) -> Result<(), SessionError> {
+        self.send(EngineMsg::StopPreview)
+    }
+
+    /// The id of the preview playing, if one is.
+    pub fn previewing(&self) -> Option<u64> {
+        self.engine_shared()?.preview()
+    }
+
+    /// Renders a game asset exactly as [`export_game`](Self::export_game)
+    /// would, without writing anything, so it can be heard first.
+    pub fn render_game_asset(&self, name: &str) -> Result<RenderedAsset, SessionError> {
+        let (project, audio) = self.render_inputs();
+        let asset = project.game.find(name).ok_or_else(|| {
+            SessionError::Invalid(format!("the project has no game asset {name:?}"))
+        })?;
+        render_asset(&project, &audio, asset, &mut 0.0)
     }
 
     /// Creates a new engine at `sample_rate`, replacing any old one, and
@@ -1121,8 +1360,6 @@ impl Session {
             .collect();
 
         // Render first, so a bad range fails before anything is written.
-        let sr = project.sample_rate;
-        let to_sample = |t: Ticks| project.tempo.tick_to_sample(t, sr);
         let constant_tempo = project.tempo.points().len() == 1;
         let time_signature = Some([
             project.time_signature.numerator,
@@ -1131,55 +1368,14 @@ impl Session {
         let mut total_seconds = 0.0;
         let mut rendered = Vec::with_capacity(selected.len());
         for asset in &selected {
-            match &asset.kind {
-                GameAssetKind::Loop { range, intro_start } => {
-                    let (s, e) = (to_sample(range.start), to_sample(range.end));
-                    let i = intro_start.map_or(s, to_sample);
-                    total_seconds += ((s - i) + 2 * (e - s)) as f64 / sr as f64;
-                    Self::check_length(total_seconds)?;
-                    let snap = compile(&project, &audio, sr, 0);
-                    let out = if i < s {
-                        sky_engine::render_intro_loop(snap, i, s, e)
-                    } else {
-                        sky_engine::render_loop(snap, s, e, 2)
-                    };
-                    let loop_start = (s - i) as u64;
-                    let seam = analysis::seam_check(&out, loop_start as usize, out.frames());
-                    rendered.push((vec![out], loop_start, Some(seam)));
-                }
-                GameAssetKind::Sfx {
-                    variations,
-                    tail_seconds,
-                    mono,
-                    ..
-                } => {
-                    let tail = f64::from(*tail_seconds);
-                    let mut outs = Vec::with_capacity(variations.len());
-                    for v in variations {
-                        let (s, e) = (to_sample(v.start), to_sample(v.end));
-                        total_seconds += (e - s) as f64 / sr as f64 + tail;
-                        Self::check_length(total_seconds)?;
-                        let frames = (e - s) as usize + (tail * sr as f64) as usize;
-                        let snap = compile(&project, &audio, sr, 0);
-                        // Only what starts in the variation, so the tail
-                        // does not pick up the next one.
-                        let mut out = sky_engine::render_one_shot(snap, s, e, frames);
-                        trim_silence(&mut out);
-                        if *mono {
-                            fold_to_mono(&mut out);
-                        }
-                        outs.push(out);
-                    }
-                    rendered.push((outs, 0, None));
-                }
-            }
+            rendered.push(render_asset(&project, &audio, asset, &mut total_seconds)?);
         }
 
         let licenses = sky_model::license_report(&project);
         let exports: Vec<AssetExport> = selected
             .iter()
             .zip(&rendered)
-            .map(|(asset, (outs, loop_start, _))| AssetExport {
+            .map(|(asset, r)| AssetExport {
                 name: asset.name.clone(),
                 id: asset.id,
                 category: asset.category,
@@ -1187,9 +1383,9 @@ impl Session {
                 credits: licenses.credits.clone(),
                 audio: match &asset.kind {
                     GameAssetKind::Loop { range, .. } => AssetAudio::Loop {
-                        audio: &outs[0],
-                        loop_start: *loop_start,
-                        loop_end: outs[0].frames() as u64,
+                        audio: &r.audio[0],
+                        loop_start: r.loop_start as u64,
+                        loop_end: r.audio[0].frames() as u64,
                         tempo_bpm: constant_tempo.then(|| project.tempo.initial_bpm()),
                         time_signature,
                         bars: Some(range.length() as f64 / project.ticks_per_bar() as f64),
@@ -1200,7 +1396,7 @@ impl Session {
                         gain_db,
                         ..
                     } => AssetAudio::Sfx {
-                        variations: outs.iter().collect(),
+                        variations: r.audio.iter().collect(),
                         selection: *selection,
                         pitch_semitones: *pitch_semitones,
                         gain_db: *gain_db,
@@ -1220,7 +1416,10 @@ impl Session {
             .assets
             .into_iter()
             .zip(rendered)
-            .map(|(asset, (_, _, seam))| GameAssetExported { asset, seam })
+            .map(|(asset, r)| GameAssetExported {
+                asset,
+                seam: r.seam,
+            })
             .collect();
         Ok(GameExported {
             dir,

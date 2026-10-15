@@ -18,6 +18,7 @@ use sky_session::LoopExportOptions;
 
 use crate::app::{Action, App};
 use crate::audio::{self, BUFFER_SIZES, SAMPLE_RATES};
+use crate::audition::{PreviewKey, preview_button};
 use crate::game::GameDialog;
 use crate::jobs::JobOutput;
 use crate::sounds::{LoadSoundsDialog, license_report_ui};
@@ -770,6 +771,9 @@ pub(crate) fn bits_choice(ui: &mut Ui, bits: &mut u16) {
 }
 
 fn export_loop_dialog(app: &mut App, ctx: &Context) {
+    let play = PreviewKey::LoopRegion { join: false };
+    let join = PreviewKey::LoopRegion { join: true };
+    let (play_state, join_state) = (app.preview_state(&play), app.preview_state(&join));
     let Some(d) = app.dialogs.export_loop.as_mut() else {
         return;
     };
@@ -777,6 +781,7 @@ fn export_loop_dialog(app: &mut App, ctx: &Context) {
     let mut browse = false;
     let mut run = false;
     let mut close = false;
+    let mut preview = None;
     let modal = Modal::new(Id::new("export_loop")).show(ctx, |ui| {
         ui.set_width(560.0);
         ui.label(RichText::new("Export loop").heading());
@@ -892,6 +897,23 @@ fn export_loop_dialog(app: &mut App, ctx: &Context) {
             } else if ui.button(RichText::new("Export").strong()).clicked() {
                 run = true;
             }
+            ui.separator();
+            if preview_button(
+                ui,
+                "Join",
+                "Play from just before the end, to hear the loop wrap around to its start",
+                join_state,
+            ) {
+                preview = Some(join.clone());
+            }
+            if preview_button(
+                ui,
+                "Play",
+                "Play the loop as it exports, repeating until stopped",
+                play_state,
+            ) {
+                preview = Some(play.clone());
+            }
         });
     });
     if modal.should_close() && !app.dialogs.export_loop.as_ref().is_some_and(|d| d.running) {
@@ -899,6 +921,8 @@ fn export_loop_dialog(app: &mut App, ctx: &Context) {
     }
     if close {
         app.dialogs.export_loop = None;
+    } else if let Some(key) = preview {
+        app.toggle_preview(ctx, key);
     } else if browse {
         app.request_path(ctx, PathPurpose::ExportLoopFolder);
     } else if run {

@@ -8,6 +8,10 @@
 //! returns the old snapshot through a second queue so it is freed elsewhere.
 //! Meters and the playhead flow back through atomics.
 //!
+//! Auditioning goes through the same queue: keys played live on a track's
+//! instrument, and a preview player that mixes audio in after the master
+//! channel, both whether or not the transport runs.
+//!
 //! The offline renderer runs the very same [`Engine`] without a device, so
 //! what you hear is what you export.
 #![cfg_attr(
@@ -23,11 +27,13 @@
 pub mod compile;
 pub mod engine;
 pub mod offline;
+pub mod preview;
 pub mod shared;
 
 pub use compile::{AudioCache, compile};
 pub use engine::{Engine, EngineHandle, EngineMsg, create_engine};
 pub use offline::{render, render_intro_loop, render_loop, render_one_shot};
+pub use preview::Preview;
 pub use shared::{EngineShared, MAX_METERS};
 
 pub use sky_dsp::MAX_BLOCK;

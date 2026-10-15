@@ -18,6 +18,7 @@ use sky_session::{GameExportOptions, Session};
 
 use crate::actions::{ActionResult, apply};
 use crate::app::App;
+use crate::audition::{ButtonState, PreviewKey, preview_button};
 use crate::dialogs::{CATEGORIES, PathPurpose, bits_choice};
 use crate::jobs::JobOutput;
 use crate::sounds::license_report_ui;
@@ -297,6 +298,51 @@ struct Wanted {
     add_sfx: bool,
     browse: bool,
     export: bool,
+    preview: Option<PreviewKey>,
+    trigger: Option<AssetId>,
+}
+
+/// What the assets' Play, Join and Trigger buttons show, read before the
+/// window borrows the dialog.
+struct Listen {
+    states: Vec<(PreviewKey, ButtonState)>,
+    last: HashMap<AssetId, String>,
+}
+
+impl Listen {
+    fn new(app: &App, project: &Project) -> Self {
+        let mut states = Vec::new();
+        for a in &project.game.assets {
+            let keys = match a.kind {
+                GameAssetKind::Loop { .. } => vec![
+                    PreviewKey::GameLoop {
+                        asset: a.id,
+                        join: false,
+                    },
+                    PreviewKey::GameLoop {
+                        asset: a.id,
+                        join: true,
+                    },
+                ],
+                GameAssetKind::Sfx { .. } => vec![PreviewKey::GameSfx(a.id)],
+            };
+            for key in keys {
+                let state = app.preview_state(&key);
+                states.push((key, state));
+            }
+        }
+        Self {
+            states,
+            last: app.audition.last_trigger.clone(),
+        }
+    }
+
+    fn state(&self, key: &PreviewKey) -> ButtonState {
+        self.states
+            .iter()
+            .find(|(k, _)| k == key)
+            .map_or(ButtonState::Idle, |(_, s)| *s)
+    }
 }
 
 /// Shows the window if it is open.
@@ -306,6 +352,7 @@ pub fn window(app: &mut App, ctx: &Context) {
     }
     let project = app.view.project.clone();
     let has_path = app.view.path.is_some();
+    let listen = Listen::new(app, &project);
     let mut open = true;
     let mut w = Wanted::default();
     Window::new("Game assets")
@@ -374,7 +421,7 @@ pub fn window(app: &mut App, ctx: &Context) {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for asset in &project.game.assets {
-                            asset_row(ui, &project, asset, &mut d.names, &mut w);
+                            asset_row(ui, &project, asset, &mut d.names, &listen, &mut w);
                         }
                     });
                 ui.horizontal(|ui| {
@@ -442,6 +489,12 @@ pub fn window(app: &mut App, ctx: &Context) {
     if w.export {
         app.start_game_export(ctx);
     }
+    if let Some(key) = w.preview {
+        app.toggle_preview(ctx, key);
+    }
+    if let Some(asset) = w.trigger {
+        app.trigger_sfx(ctx, asset);
+    }
     app.refresh();
 }
 
@@ -491,6 +544,7 @@ fn asset_row(
     project: &Project,
     asset: &GameAsset,
     names: &mut HashMap<AssetId, String>,
+    listen: &Listen,
     w: &mut Wanted,
 ) {
     let id = asset.id;
@@ -542,6 +596,55 @@ fn asset_row(
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Remove").clicked() {
                     w.remove = Some(id);
+                }
+                ui.separator();
+                match asset.kind {
+                    GameAssetKind::Loop { .. } => {
+                        let join = PreviewKey::GameLoop {
+                            asset: id,
+                            join: true,
+                        };
+                        let play = PreviewKey::GameLoop {
+                            asset: id,
+                            join: false,
+                        };
+                        if preview_button(
+                            ui,
+                            "Join",
+                            "Play from just before the body ends, to hear it wrap around to \
+                             its start",
+                            listen.state(&join),
+                        ) {
+                            w.preview = Some(join);
+                        }
+                        if preview_button(
+                            ui,
+                            "Play",
+                            "Play it as the game will: the intro once, then the body \
+                             repeating until stopped",
+                            listen.state(&play),
+                        ) {
+                            w.preview = Some(play);
+                        }
+                    }
+                    GameAssetKind::Sfx { .. } => {
+                        let key = PreviewKey::GameSfx(id);
+                        if ui
+                            .button("Trigger")
+                            .on_hover_text(
+                                "Play it as the game will: the next variation by its pick \
+                                 rule, with a random pitch and gain",
+                            )
+                            .clicked()
+                        {
+                            w.trigger = Some(id);
+                        }
+                        if listen.state(&key) == ButtonState::Pending {
+                            ui.spinner();
+                        } else if let Some(last) = listen.last.get(&id) {
+                            ui.label(RichText::new(last).small().color(theme::TEXT_WEAK));
+                        }
+                    }
                 }
             });
         });

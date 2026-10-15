@@ -12,7 +12,7 @@ use egui::{
 };
 use sky_core::TrackId;
 use sky_dsp::InstrumentType;
-use sky_library::{MAX_FILES, PACKS, Pack, PackSource, packs};
+use sky_library::{MAX_FILES, MapFile, PACKS, Pack, PackSource, packs};
 use sky_model::{
     Command, InstrumentSlot, License, LicenseReport, Origin, Project, SampleBank, Track, TrackKind,
     Transaction,
@@ -21,6 +21,7 @@ use sky_session::{BankLoaded, BankRequest};
 
 use crate::actions;
 use crate::app::{App, Tab};
+use crate::audition::PreviewKey;
 use crate::jobs::JobOutput;
 use crate::theme;
 
@@ -56,6 +57,8 @@ pub struct LoadSoundsDialog {
     pub chosen: BTreeSet<String>,
     /// Add to the track's sounds instead of replacing them.
     pub add: bool,
+    /// Play each sound as it is clicked.
+    pub hear: bool,
     pub listing: Option<Listing>,
     /// The map address being read now.
     pub reading: Option<String>,
@@ -82,6 +85,23 @@ impl LoadSoundsDialog {
     fn current(&self) -> Option<&Listing> {
         let map = self.source()?.map;
         self.listing.as_ref().filter(|l| l.map == map)
+    }
+
+    /// The pack as read, when the chosen one is.
+    pub fn listed_pack(&self) -> Option<Arc<Pack>> {
+        self.current()?.pack.as_ref().ok().cloned()
+    }
+
+    /// The files of a sound on offer.
+    pub fn files_of(&self, name: &str) -> Option<Vec<MapFile>> {
+        let Some(Ok(pack)) = self.current().map(|l| &l.pack) else {
+            return None;
+        };
+        let sounds = match &self.bank {
+            Some(b) => pack.map.bank_sounds(Some(b)),
+            None => pack.map.plain_sounds(),
+        };
+        sounds.get(name).map(|f| f.to_vec())
     }
 
     /// The sounds on offer from the chosen bank, with their file counts.
@@ -257,6 +277,7 @@ impl App {
             bank: bank.map(|b| b.name.clone()),
             chosen: BTreeSet::new(),
             add: false,
+            hear: true,
             listing: None,
             reading: None,
             running: false,
@@ -436,6 +457,7 @@ pub fn bank_panel(app: &mut App, ui: &mut Ui, track: TrackId, slot: &InstrumentS
     let mut next: Option<(SampleBank, &str)> = None;
     let mut load = false;
     let mut pattern = false;
+    let mut hear: Option<(String, usize)> = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new(&bank.name).strong().color(theme::TEXT));
         ui.label(
@@ -510,18 +532,25 @@ pub fn bank_panel(app: &mut App, ui: &mut Ui, track: TrackId, slot: &InstrumentS
                         theme::TEXT
                     };
                     let tip = match samples.len() {
-                        1 => format!("{name} in a pattern\nRight-click to remove it"),
+                        1 => format!(
+                            "{name} in a pattern\nClick to hear it, right-click to remove it"
+                        ),
                         n => format!(
-                            "{name} or {name}:0 to {name}:{} in a pattern\nRight-click to remove it",
+                            "{name} or {name}:0 to {name}:{} in a pattern\nClick to hear its \
+                             {n} variations in turn, right-click to remove it",
                             n - 1
                         ),
                     };
-                    ui.add(
-                        Label::new(RichText::new(text).monospace().color(color))
-                            .sense(Sense::click()),
-                    )
-                    .on_hover_text(tip)
-                    .context_menu(|ui| {
+                    let chip = ui
+                        .add(
+                            Label::new(RichText::new(text).monospace().color(color))
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_text(tip);
+                    if chip.clicked() {
+                        hear = Some((name.clone(), samples.len()));
+                    }
+                    chip.context_menu(|ui| {
                         if ui.button(format!("Remove {name}")).clicked() {
                             let mut b = bank.clone();
                             b.sounds.remove(name);
@@ -550,6 +579,9 @@ pub fn bank_panel(app: &mut App, ui: &mut Ui, track: TrackId, slot: &InstrumentS
         s.bank = Some(b);
         let r = actions::set_instrument(&app.session, track, s, label);
         app.report(r);
+    }
+    if let Some((name, variations)) = hear {
+        app.hear_bank_sound(track, &name, variations);
     }
     if load {
         app.open_load_sounds(Some(track));
@@ -617,6 +649,7 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
     let mut load = false;
     let mut close = false;
     let mut add_pattern = None;
+    let mut hear: Option<String> = None;
     let modal = Modal::new(Id::new("load_sounds")).show(ctx, |ui| {
         ui.set_width(620.0);
         ui.label(RichText::new("Load sounds").heading());
@@ -774,6 +807,9 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
                                                 } else {
                                                     d.chosen.insert(name.clone());
                                                 }
+                                                if d.hear {
+                                                    hear = Some(name.clone());
+                                                }
                                             }
                                         }
                                     });
@@ -786,7 +822,14 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
                             } else {
                                 format!("{} chosen, {files} files.", d.chosen.len())
                             };
-                            ui.label(RichText::new(caption).small().color(theme::TEXT_WEAK));
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(caption).small().color(theme::TEXT_WEAK));
+                                ui.checkbox(&mut d.hear, RichText::new("Hear as you click").small())
+                                    .on_hover_text(
+                                        "Play a sound's first file when you click it; it is \
+                                         downloaded once and kept for the load",
+                                    );
+                            });
                             if files > MAX_FILES {
                                 ui.label(
                                     RichText::new(format!(
@@ -939,6 +982,9 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
     let running = app.dialogs.load_sounds.as_ref().is_some_and(|d| d.running);
     if modal.should_close() && !running {
         close = true;
+    }
+    if let Some(name) = hear.filter(|_| !close) {
+        app.start_preview(ctx, PreviewKey::PackSound(name));
     }
     if close {
         app.dialogs.load_sounds = None;

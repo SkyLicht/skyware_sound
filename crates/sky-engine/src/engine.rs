@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
-use sky_dsp::MAX_BLOCK;
+use sky_core::TrackId;
+use sky_dsp::{Instrument, MAX_BLOCK};
 
 use crate::compile::{
     AudioClipNode, ChannelNode, EngineSnapshot, NoteEvent, SourceNode, TrackNode, Triggers,
 };
+use crate::preview::{Preview, PreviewVoice};
 use crate::shared::EngineShared;
 
 /// Messages from the control thread to the audio thread.
@@ -24,12 +26,54 @@ pub enum EngineMsg {
     Seek(i64),
     /// Silence every instrument and clear every effect tail.
     AllSoundOff,
+    /// Starts a key on a track's instrument now, whether or not the
+    /// transport runs, to hear a note as it is played or placed. With
+    /// `frames` it ends by itself after that many frames.
+    NoteOn {
+        track: TrackId,
+        pitch: u8,
+        velocity: u8,
+        frames: Option<u32>,
+    },
+    NoteOff {
+        track: TrackId,
+        pitch: u8,
+    },
+    /// Starts sound number `sound` of a track's sample bank as a one-shot.
+    SoundOn {
+        track: TrackId,
+        sound: u32,
+        velocity: u8,
+    },
+    /// Plays audio straight to the output after the master channel,
+    /// replacing any preview playing.
+    Preview(Box<Preview>),
+    /// Fades the preview out.
+    StopPreview,
+}
+
+/// What the audio thread hands back to be freed on the control thread.
+enum Garbage {
+    Snapshot(#[allow(dead_code)] Box<EngineSnapshot>),
+    Preview(#[allow(dead_code)] Box<Preview>),
+}
+
+/// Most live notes that end by themselves sounding at once.
+const MAX_LIVE: usize = 32;
+
+/// A live note that ends by itself.
+#[derive(Clone, Copy)]
+struct LiveNote {
+    track: TrackId,
+    pitch: u8,
+    /// Frames until it ends.
+    left: i64,
 }
 
 /// The control-thread end of the engine's queues.
 pub struct EngineHandle {
     tx: Producer<EngineMsg>,
-    trash: Consumer<Box<EngineSnapshot>>,
+    trash: Consumer<Garbage>,
     pending: VecDeque<EngineMsg>,
     shared: Arc<EngineShared>,
 }
@@ -58,7 +102,8 @@ impl EngineHandle {
         }
     }
 
-    /// Frees snapshots the audio thread has finished with. Call regularly.
+    /// Frees snapshots and previews the audio thread has finished with.
+    /// Call regularly.
     pub fn collect_garbage(&mut self) -> usize {
         let mut freed = 0;
         while let Ok(old) = self.trash.pop() {
@@ -80,13 +125,15 @@ impl EngineHandle {
 pub struct Engine {
     snapshot: Box<EngineSnapshot>,
     rx: Consumer<EngineMsg>,
-    trash: Producer<Box<EngineSnapshot>>,
-    pending_trash: Option<Box<EngineSnapshot>>,
+    trash: Producer<Garbage>,
+    pending_trash: Option<Garbage>,
     shared: Arc<EngineShared>,
     playing: bool,
     position: i64,
     mix: [Vec<f32>; 2],
     smoothing: f32,
+    live: [Option<LiveNote>; MAX_LIVE],
+    preview: Option<PreviewVoice>,
 }
 
 /// Creates the two ends of an engine around a first snapshot.
@@ -111,8 +158,21 @@ pub fn create_engine(snapshot: EngineSnapshot) -> (EngineHandle, Engine) {
         position: 0,
         mix: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
         smoothing,
+        live: [None; MAX_LIVE],
+        preview: None,
     };
     (handle, engine)
+}
+
+/// The instrument of a track, if it has one.
+fn instrument_of(snapshot: &mut EngineSnapshot, track: TrackId) -> Option<&mut dyn Instrument> {
+    match &mut snapshot.tracks.iter_mut().find(|t| t.id == track)?.source {
+        SourceNode::Instrument {
+            instrument: Some(inst),
+            ..
+        } => Some(inst.as_mut()),
+        _ => None,
+    }
 }
 
 fn seek_cursor(notes: &[NoteEvent], position: i64) -> usize {
@@ -397,9 +457,7 @@ impl Engine {
                     self.shared
                         .version
                         .store(self.snapshot.version, Ordering::Relaxed);
-                    if let Err(PushError::Full(old)) = self.trash.push(old) {
-                        self.pending_trash = Some(old);
-                    }
+                    self.discard(Garbage::Snapshot(old));
                 }
                 EngineMsg::Play => {
                     if !self.playing {
@@ -440,8 +498,130 @@ impl Engine {
                     for fx in snap.master.effects.iter_mut() {
                         fx.effect.reset();
                     }
+                    self.live = [None; MAX_LIVE];
+                    if let Some(v) = self.preview.as_mut() {
+                        v.done = true;
+                    }
+                }
+                EngineMsg::NoteOn {
+                    track,
+                    pitch,
+                    velocity,
+                    frames,
+                } => {
+                    let pitch = pitch.min(127);
+                    if let Some(inst) = instrument_of(&mut self.snapshot, track) {
+                        inst.note_on(pitch, velocity.clamp(1, 127));
+                        self.set_live(track, pitch, frames);
+                    }
+                }
+                EngineMsg::NoteOff { track, pitch } => {
+                    if let Some(inst) = instrument_of(&mut self.snapshot, track) {
+                        inst.note_off(pitch.min(127));
+                    }
+                    self.set_live(track, pitch.min(127), None);
+                }
+                EngineMsg::SoundOn {
+                    track,
+                    sound,
+                    velocity,
+                } => {
+                    if let Some(inst) = instrument_of(&mut self.snapshot, track) {
+                        inst.sound_on(sound, velocity.clamp(1, 127));
+                    }
+                }
+                EngineMsg::Preview(preview) => {
+                    let id = preview.id;
+                    let voice = PreviewVoice::new(preview, self.snapshot.sample_rate);
+                    if let Some(old) = self.preview.replace(voice) {
+                        self.discard(Garbage::Preview(old.preview));
+                    }
+                    self.shared.preview.store(id, Ordering::Relaxed);
+                }
+                EngineMsg::StopPreview => {
+                    if let Some(v) = self.preview.as_mut() {
+                        v.stop();
+                    }
                 }
             }
+        }
+    }
+
+    /// Hands `garbage` to the control thread to free. When its queue is
+    /// full, it waits here, and no new message is taken until it is gone.
+    fn discard(&mut self, garbage: Garbage) {
+        if let Err(PushError::Full(g)) = self.trash.push(garbage) {
+            self.pending_trash = Some(g);
+        }
+    }
+
+    /// Notes when a live note ends: after `frames`, or (`None`) when told.
+    fn set_live(&mut self, track: TrackId, pitch: u8, frames: Option<u32>) {
+        for slot in self.live.iter_mut() {
+            if slot.is_some_and(|n| n.track == track && n.pitch == pitch) {
+                *slot = None;
+            }
+        }
+        let Some(frames) = frames else {
+            return;
+        };
+        let note = LiveNote {
+            track,
+            pitch,
+            left: i64::from(frames),
+        };
+        if let Some(slot) = self.live.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(note);
+            return;
+        }
+        // All taken: end the note closest to its end now and take its slot.
+        let Some(slot) = self
+            .live
+            .iter_mut()
+            .min_by_key(|s| s.map_or(i64::MIN, |n| n.left))
+        else {
+            return;
+        };
+        if let Some(old) = slot.replace(note)
+            && let Some(inst) = instrument_of(&mut self.snapshot, old.track)
+        {
+            inst.note_off(old.pitch);
+        }
+    }
+
+    /// Ends the live notes whose time is up after `frames` more frames.
+    fn advance_live(&mut self, frames: usize) {
+        for i in 0..MAX_LIVE {
+            let Some(slot) = self.live.get_mut(i) else {
+                break;
+            };
+            let Some(note) = slot.as_mut() else {
+                continue;
+            };
+            note.left -= frames as i64;
+            if note.left > 0 {
+                continue;
+            }
+            let (track, pitch) = (note.track, note.pitch);
+            *slot = None;
+            if let Some(inst) = instrument_of(&mut self.snapshot, track) {
+                inst.note_off(pitch);
+            }
+        }
+    }
+
+    /// Lets go of a preview that has finished, once the garbage queue has
+    /// room for it.
+    fn retire_preview(&mut self) {
+        if !self.preview.as_ref().is_some_and(|v| v.done) {
+            return;
+        }
+        self.shared.preview.store(0, Ordering::Relaxed);
+        if self.pending_trash.is_some() {
+            return;
+        }
+        if let Some(v) = self.preview.take() {
+            self.discard(Garbage::Preview(v.preview));
         }
     }
 
@@ -515,6 +695,11 @@ impl Engine {
         feed_sidechains(&mut snap.master, &snap.triggers);
         let (pl, pr) = apply_channel(&mut snap.master, k, ml, mr);
         self.shared.master.record(pl, pr);
+        if let Some(v) = self.preview.as_mut() {
+            v.render_add(ml, mr);
+        }
+        self.retire_preview();
+        self.advance_live(frames);
     }
 
     fn publish(&self) {
