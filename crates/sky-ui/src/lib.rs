@@ -26,6 +26,7 @@ mod params;
 mod pattern_editor;
 mod piano_roll;
 mod sounds;
+mod step_editor;
 mod theme;
 mod tracks;
 mod transport;

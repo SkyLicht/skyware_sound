@@ -274,6 +274,7 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
                 ("New empty project", Action::NewEmpty),
                 ("New demo project", Action::NewDemo),
                 ("New techno loop", Action::NewTechno),
+                ("New acid loop", Action::NewAcid),
                 ("Open project…", Action::Open),
                 ("Save as…", Action::SaveAs),
                 ("Import audio…", Action::ImportAudio),

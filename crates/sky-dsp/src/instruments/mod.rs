@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 use crate::AudioData;
 use crate::params::ParamSpec;
 
+mod acid;
 mod bank;
 mod drums;
 mod envelope;
 mod sampler;
 mod synth;
 
+pub use acid::{ACCENT_THRESHOLD, Acid};
 pub use bank::{Bank, BankMap, KeyZone};
 pub use drums::DrumKit;
 pub use envelope::Adsr;
@@ -72,6 +74,8 @@ pub enum InstrumentType {
     Sampler,
     /// Plays named sounds, with variations, from loaded sample packs.
     Bank,
+    /// Monophonic acid bass line synth with accent and slide.
+    Acid,
 }
 
 /// The audio an instrument plays.
@@ -86,8 +90,9 @@ pub enum InstrumentAudio {
 }
 
 impl InstrumentType {
-    pub const ALL: [InstrumentType; 4] = [
+    pub const ALL: [InstrumentType; 5] = [
         InstrumentType::Synth,
+        InstrumentType::Acid,
         InstrumentType::Drums,
         InstrumentType::Sampler,
         InstrumentType::Bank,
@@ -99,6 +104,7 @@ impl InstrumentType {
             InstrumentType::Drums => "drums",
             InstrumentType::Sampler => "sampler",
             InstrumentType::Bank => "bank",
+            InstrumentType::Acid => "acid",
         }
     }
 
@@ -108,6 +114,7 @@ impl InstrumentType {
             InstrumentType::Drums => "Drum machine",
             InstrumentType::Sampler => "Sampler",
             InstrumentType::Bank => "Sample bank",
+            InstrumentType::Acid => "Acid bass",
         }
     }
 
@@ -127,6 +134,12 @@ impl InstrumentType {
                 "Plays named sounds from a loaded sample pack, such as bd, sd:2 or piano; \
                  notes play the drums on General MIDI notes, or one pitched sound"
             }
+            InstrumentType::Acid => {
+                "Mono acid bass line: a saw or square into a squelchy 18 dB resonant low-pass with \
+                 env mod and decay, then drive. Velocity above 100 accents a note (louder, with a \
+                 brighter sweep that builds over consecutive accents); a note that starts while \
+                 another is held slides to it"
+            }
         }
     }
 
@@ -142,6 +155,7 @@ impl InstrumentType {
             InstrumentType::Drums => drums::DRUM_PARAMS,
             InstrumentType::Sampler => sampler::SAMPLER_PARAMS,
             InstrumentType::Bank => bank::BANK_PARAMS,
+            InstrumentType::Acid => acid::ACID_PARAMS,
         }
     }
 
@@ -161,6 +175,7 @@ impl InstrumentType {
     ) -> Box<dyn Instrument> {
         let mut inst: Box<dyn Instrument> = match (self, audio) {
             (InstrumentType::Synth, _) => Box::new(Synth::new(sample_rate)),
+            (InstrumentType::Acid, _) => Box::new(Acid::new(sample_rate)),
             (InstrumentType::Drums, _) => Box::new(DrumKit::new(sample_rate)),
             (InstrumentType::Sampler, InstrumentAudio::Sample(sample)) => {
                 Box::new(Sampler::new(sample_rate, Some(sample)))

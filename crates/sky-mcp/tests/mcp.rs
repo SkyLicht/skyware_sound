@@ -436,6 +436,115 @@ async fn an_assistant_builds_a_ducked_techno_loop() {
     client.cancel().await.unwrap();
 }
 
+/// The phase 2 gate over MCP: an assistant writes a 12-step Acid bass line
+/// with accents, slides and locks over a 16-step beat, and it loops.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assistant_writes_an_acid_line_in_steps() {
+    let (session, _) = Session::new(empty_project("Acid"), None);
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Edit, vec![]),
+    ))
+    .await;
+    ok(&client, "set_tempo", json!({ "bpm": 128 })).await;
+    ok(
+        &client,
+        "track_create",
+        json!({ "name": "Drums", "instrument": "drums", "params": { "style": "909" } }),
+    )
+    .await;
+    ok(
+        &client,
+        "track_create",
+        json!({ "name": "Acid", "instrument": "acid", "params": { "resonance": 0.8, "env_mod": 0.6 } }),
+    )
+    .await;
+    let beat = ok(
+        &client,
+        "steps_write",
+        json!({
+            "track": "Drums", "length_bars": 4, "name": "Beat",
+            "lanes": [
+                { "note": "bd", "steps": "X . . . x . . . x . . . x . . ." },
+                { "note": "cp", "steps": ". . . . x . . . . . . . x . . x@fill" },
+                { "note": "hh", "steps": "x . x?50 . x . x*2 . x . x?50 . x . x>10 .",
+                  "locks": { "hat_decay": ". . . . . . 2 . . . . . . . . ." } },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(beat["type"], "steps", "{beat}");
+    assert_eq!(beat["lanes"][0]["note"], "C2");
+    assert_eq!(
+        beat["lanes"][2]["locks"]["hat_decay"],
+        ". . . . . . 2 . . . . . . . . ."
+    );
+    let line = ok(
+        &client,
+        "steps_write",
+        json!({
+            "track": "Acid", "length_bars": 4, "name": "Line",
+            "lanes": [{ "note": "c2", "steps": "x x/ c3! x . d#2/ f2 x! - g1 x a#1/",
+                        "locks": { "cutoff": "300 . 900 . . . . . . . . ." } }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        line["lanes"][0]["steps"], "x x/ c3! x . d#2/ f2 X - g1 x a#1/",
+        "{line}"
+    );
+    // A lock the instrument does not have, and a bad step, are caught.
+    let (text, is_error) = call(
+        &client,
+        "steps_write",
+        json!({ "clip": "Line", "lanes": [{ "note": "c2", "steps": "x", "locks": { "kick_tune": "1" } }] }),
+    )
+    .await;
+    assert!(
+        is_error && text.contains("acid") && text.contains("env_mod"),
+        "{text}"
+    );
+    let (text, is_error) = call(
+        &client,
+        "steps_write",
+        json!({ "clip": "Line", "lanes": [{ "note": "c2", "steps": "x x*9" }] }),
+    )
+    .await;
+    assert!(
+        is_error && text.contains("lane 1") && text.contains("step 2"),
+        "{text}"
+    );
+    // Changing settings keeps the lanes, and pattern tools refuse step clips.
+    let swung = ok(
+        &client,
+        "steps_write",
+        json!({ "clip": "Beat", "swing": 56 }),
+    )
+    .await;
+    assert_eq!(swung["swing"]["amount"], 56);
+    assert_eq!(swung["lanes"].as_array().unwrap().len(), 3);
+    let (text, is_error) = call(
+        &client,
+        "pattern_set",
+        json!({ "clip": "Beat", "pattern": "bd" }),
+    )
+    .await;
+    assert!(is_error && text.contains("steps"), "{text}");
+
+    ok(&client, "set_loop", json!({ "start_bar": 1, "end_bar": 5 })).await;
+    let seam = ok(&client, "loop_check_seam", json!({})).await;
+    assert_eq!(seam["seam"]["verdict"], "seamless", "{seam}");
+
+    let acid = ok(
+        &client,
+        "project_new",
+        json!({ "template": "acid", "name": "Acid club", "discard_unsaved": true }),
+    )
+    .await;
+    assert_eq!(acid["tracks"].as_array().unwrap().len(), 2);
+    client.cancel().await.unwrap();
+}
+
 async fn http_status(addr: std::net::SocketAddr, token: Option<&str>) -> String {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
     let auth = token

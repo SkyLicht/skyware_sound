@@ -14,7 +14,7 @@ use sky_dsp::{
 };
 use sky_model::command::VELOCITY;
 use sky_model::{
-    Channel, Clip, ClipContent, InstrumentSlot, Project, SampleBank, Track, TrackKind,
+    Channel, Clip, ClipContent, InstrumentSlot, Project, SampleBank, StepClip, Track, TrackKind,
 };
 use sky_pattern::{Time, Value};
 
@@ -209,9 +209,9 @@ type Resolve<'a> = dyn Fn(&Value) -> Option<(u8, Option<u32>)> + 'a;
 /// The velocity of a note with none given.
 const DEFAULT_VELOCITY: u8 = 100;
 
-/// The instrument parameters a track's patterns set per note. Once any
-/// clip sets one, every note on the track carries a value for it, the
-/// usual one where nothing else says, so a note always sounds the same
+/// The instrument parameters a track's patterns and steps set per note.
+/// Once any clip sets one, every note on the track carries a value for it,
+/// the usual one where nothing else says, so a note always sounds the same
 /// whatever played before it.
 struct Locks {
     params: Vec<&'static ParamSpec>,
@@ -231,16 +231,16 @@ impl Locks {
             return locks;
         };
         let specs = slot.kind.params();
-        let mut names: Vec<&str> = track
-            .clips
-            .iter()
-            .filter_map(|c| match &c.content {
-                ClipContent::Pattern { controls, .. } => Some(controls.keys()),
-                _ => None,
-            })
-            .flatten()
-            .map(String::as_str)
-            .collect();
+        let mut names: Vec<&str> = Vec::new();
+        for clip in &track.clips {
+            match &clip.content {
+                ClipContent::Pattern { controls, .. } => {
+                    names.extend(controls.keys().map(String::as_str));
+                }
+                ClipContent::Steps(steps) => names.extend(steps.locked_params()),
+                _ => {}
+            }
+        }
         names.sort_unstable();
         names.dedup();
         for spec in names
@@ -398,6 +398,40 @@ fn pattern_notes(
             pitch,
             velocity,
             sound,
+            lock_start,
+            lock_end,
+        });
+    }
+}
+
+fn step_notes(
+    tempo: &TempoMap,
+    sr: u32,
+    clip: &Clip,
+    steps: &StepClip,
+    locks: &mut Locks,
+    out: &mut Vec<NoteEvent>,
+) {
+    let clip_end = clip.start + clip.length;
+    let names: Vec<&'static str> = locks.params.iter().map(|s| s.name).collect();
+    for n in steps.notes(clip.length) {
+        let begin = steps.swing.apply(clip.start + n.start);
+        let end = steps.swing.apply(clip.start + n.end).min(clip_end);
+        if end <= begin {
+            continue;
+        }
+        let (lock_start, lock_end) = locks.push(|i| {
+            names
+                .get(i)
+                .and_then(|name| n.locks.get(*name))
+                .map(|v| f64::from(*v))
+        });
+        out.push(NoteEvent {
+            time: ticks_to_samples(tempo, begin, sr),
+            end: ticks_to_samples(tempo, end, sr),
+            pitch: n.pitch,
+            velocity: n.velocity,
+            sound: None,
             lock_start,
             lock_end,
         });
@@ -566,6 +600,9 @@ fn track_node(
                     }
                     ClipContent::Pattern { .. } => {
                         pattern_notes(tempo, sr, clip, &resolve, &mut locks, &mut notes);
+                    }
+                    ClipContent::Steps(steps) => {
+                        step_notes(tempo, sr, clip, steps, &mut locks, &mut notes);
                     }
                     ClipContent::Audio { .. } => {}
                 }

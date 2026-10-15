@@ -17,6 +17,7 @@ use sky_core::{
 
 use crate::error::ModelError;
 use crate::project::*;
+use crate::steps::StepClip;
 
 /// A mixer channel: the master or a track's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +187,11 @@ pub enum Command {
         #[serde(default)]
         swing: Swing,
     },
+    /// Replaces a step clip's lanes and settings.
+    SetSteps {
+        clip: ClipId,
+        steps: Box<StepClip>,
+    },
     AddPoolAudio {
         entry: PoolEntry,
         index: Option<usize>,
@@ -301,6 +307,14 @@ fn validate_clip(project: &Project, track: &Track, clip: &Clip) -> Result<(), Mo
             validate_pattern(source, *cycle)?;
             validate_controls(controls)?;
             validate_swing(*swing)?;
+        }
+        ClipContent::Steps(steps) => {
+            if track.kind != TrackKind::Instrument {
+                return Err(ModelError::InvalidValue(
+                    "step clips go on instrument tracks".into(),
+                ));
+            }
+            steps.validate()?;
         }
     }
     Ok(())
@@ -641,6 +655,7 @@ impl Command {
             Command::RemoveNotes { .. } => "Delete notes",
             Command::UpdateNotes { .. } => "Edit notes",
             Command::SetPattern { .. } => "Edit pattern",
+            Command::SetSteps { .. } => "Edit steps",
             Command::AddPoolAudio { .. } => "Import audio",
             Command::RemovePoolAudio { .. } => "Remove audio",
             Command::SetGameExport { .. } => "Change game export",
@@ -1159,6 +1174,22 @@ impl Command {
                     cycle: std::mem::replace(cy, cycle),
                     controls: std::mem::replace(ct, controls),
                     swing: std::mem::replace(sw, swing),
+                }
+            }
+            Command::SetSteps { clip, steps } => {
+                steps.validate()?;
+                let c = project.clip_mut(clip)?;
+                let actual = c.kind_name();
+                let ClipContent::Steps(current) = &mut c.content else {
+                    return Err(ModelError::WrongClipType {
+                        id: clip,
+                        expected: "steps",
+                        actual,
+                    });
+                };
+                Command::SetSteps {
+                    clip,
+                    steps: Box::new(std::mem::replace(current, *steps)),
                 }
             }
             Command::AddPoolAudio { entry, index } => {

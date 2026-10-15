@@ -27,10 +27,11 @@ use sky_library::{PACKS, PackSource};
 use sky_model::command::VELOCITY;
 use sky_model::notes::{format_note_list, parse_note_list};
 use sky_model::summary::{clip_json, game_asset_json, game_json, project_summary, track_json};
-use sky_model::templates::{demo_project, empty_project, techno_project};
+use sky_model::templates::{acid_project, demo_project, empty_project, techno_project};
 use sky_model::{
     ChannelRef, Clip, ClipContent, Command, EffectSlot, GameAsset, GameAssetKind, InstrumentSlot,
-    License, MAX_SFX_VARIATIONS, Origin, Project, Swing, TimeRange, Track, TrackKind, Transaction,
+    License, MAX_SFX_VARIATIONS, Origin, Project, StepClip, StepLane, Swing, TimeRange, Track,
+    TrackKind, Transaction,
 };
 use sky_session::{BankRequest, GameExportOptions, LoopExportOptions, Session};
 
@@ -83,6 +84,18 @@ bank or some sounds into a track. MIDI notes on a bank track play its drums by \
 General MIDI number, or its pitched sound (piano) when it has one. Packs keep \
 their license: exports list the credits they need and warn about unknown \
 licenses.\n\
+\n\
+Step clips (steps_write) work like a drum machine or an acid bass: lanes of \
+steps, one token per step. On drums give a lane per piece (note bd, sd, cp, hh, \
+oh); for a bass line give one lane whose steps play notes, such as \
+\"c2 c2/ c3! - . d#2 g1 c2!\": ! accents, / slides into the next note, - ties. \
+Lanes may differ in length (a 12-step line over a 16-step beat drifts against \
+it), and steps can have a probability (?50), condition (@1:2, @fill for the \
+lane's last pass in the clip), ratchet (*3), micro-timing (>10) and locks of \
+instrument parameters (locks: {\"cutoff\": \". 800 . 1600\"}). The Acid bass \
+(instrument acid) is the classic squelchy mono bass: velocity above 100 (an \
+accented step) accents a note, and a slide glides into the next note without \
+starting again; turn up resonance and env_mod for more squelch.\n\
 \n\
 For a game loop: set_loop to the bars, loop_check_seam to confirm it repeats \
 cleanly, then export_loop writes the WAV and the manifest the game reads.\n\
@@ -375,6 +388,54 @@ fn names_of(specs: &[ParamSpec]) -> String {
     names(specs.iter().map(|s| s.name))
 }
 
+/// A lane's key from a tool argument: a drum name, a note name or a number.
+fn lane_key(text: &str) -> Result<u8, String> {
+    let t = text.trim();
+    if let Ok(n) = t.parse::<u8>() {
+        return if n <= 127 {
+            Ok(n)
+        } else {
+            Err(format!("MIDI note {n} is above 127"))
+        };
+    }
+    sky_pattern::drum_note(t)
+        .or_else(|| sky_core::music::parse_note_name(t).ok())
+        .ok_or_else(|| {
+            format!("{t:?} is not a drum name (bd, sd, hh, ...), note name (c2) or MIDI number")
+        })
+}
+
+/// A step lane from a tool argument, with its locks checked against the
+/// track's instrument.
+fn step_lane(project: &Project, track: TrackId, arg: &StepLaneArg) -> Result<StepLane, String> {
+    let mut lane = StepLane::parse(lane_key(&arg.note)?, &arg.steps).map_err(|e| e.to_string())?;
+    if let Some(gate) = arg.gate {
+        lane.gate = gate;
+    }
+    lane.mute = arg.mute.unwrap_or(false);
+    if let Some(locks) = &arg.locks {
+        let slot = project
+            .track(track)
+            .map_err(|e| e.to_string())?
+            .instrument
+            .as_ref();
+        for (param, values) in locks {
+            if let Some(slot) = slot
+                && params::find(slot.kind.params(), param).is_none()
+            {
+                return Err(format!(
+                    "a lock is a parameter of the track's {}, which has no {param:?}; it has: {}",
+                    slot.kind.name(),
+                    names_of(slot.kind.params())
+                ));
+            }
+            sky_model::steps::parse_locks(&mut lane.steps, param, values)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(lane)
+}
+
 /// A swing from the tool arguments, on top of `current`.
 fn swing_of(current: Swing, amount: Option<u8>, grid: Option<u8>) -> Swing {
     Swing::new(
@@ -592,7 +653,7 @@ pub struct TrackCreateArgs {
     pub name: String,
     /// instrument (default) or audio.
     pub kind: Option<String>,
-    /// For instrument tracks: synth (default), drums, sampler or bank.
+    /// For instrument tracks: synth (default), acid, drums, sampler or bank.
     pub instrument: Option<String>,
     /// Instrument parameters, such as {"wave": "square", "cutoff": 800}.
     pub params: Option<BTreeMap<String, Value>>,
@@ -753,6 +814,51 @@ pub struct NotesWriteArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct StepLaneArg {
+    /// The key the lane plays: a drum name (bd, sd, cp, hh, oh, ...), a note
+    /// name (c2) or a MIDI number (36). Steps can play other keys.
+    pub note: String,
+    /// One token per step: . rest, - tie, x the lane's key, X accented, or
+    /// a note name; after a note ! accent, / slide, *3 ratchet, ?50
+    /// probability, @1:2 or @first, @!first, @fill, @!fill condition, =80
+    /// velocity, >10 or <10 micro-timing in % of a step. 1 to 64 steps; the
+    /// lane repeats over the clip.
+    pub steps: String,
+    /// How long notes hold, in % of a step. Default 50.
+    pub gate: Option<u8>,
+    pub mute: Option<bool>,
+    /// Parameter locks by instrument parameter: one value or . per step,
+    /// such as {"cutoff": ". 800 . . 1600 . . ."}.
+    pub locks: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StepsWriteArgs {
+    /// The step clip to change (ID or name). Leave out to add a step clip
+    /// to track.
+    pub clip: Option<String>,
+    /// For a new clip: the track (ID or name).
+    pub track: Option<String>,
+    /// For a new clip: where it starts. Default 1.
+    pub start_bar: Option<f64>,
+    /// For a new clip: its length. Default 1.
+    pub length_bars: Option<f64>,
+    pub name: Option<String>,
+    /// The lanes, replacing all of the clip's lanes. Required for a new
+    /// clip.
+    pub lanes: Option<Vec<StepLaneArg>>,
+    /// The step size as steps per whole note: 16 (sixteenths, default), 8,
+    /// 4, 32, or 12 and 24 for triplets.
+    pub rate: Option<u8>,
+    /// Swing from 50 (straight) to 75.
+    pub swing: Option<u8>,
+    /// The step that swings: 4, 8, 16 or 32.
+    pub swing_grid: Option<u8>,
+    /// Seeds the probabilities, so a render always plays the same.
+    pub seed: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatternSetArgs {
     /// Pattern clip ID or name.
     pub clip: String,
@@ -779,8 +885,9 @@ pub struct UndoArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProjectNewArgs {
     pub name: Option<String>,
-    /// empty (default), demo, or techno (a four-bar techno loop that uses
-    /// controls, swing and a duck).
+    /// empty (default), demo, techno (a four-bar techno loop that uses
+    /// controls, swing and a duck) or acid (a four-bar acid loop of step
+    /// clips with the Acid bass).
     pub template: Option<String>,
     /// Required when the open project has unsaved changes.
     pub discard_unsaved: Option<bool>,
@@ -1315,7 +1422,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Adds a track: an instrument track with a synth, drum kit, sampler or sample bank, or an audio track. Returns its ID. Load sounds into a bank track with bank_load."
+        description = "Adds a track: an instrument track with a synth, Acid bass, drum kit, sampler or sample bank, or an audio track. Returns its ID. Load sounds into a bank track with bank_load."
     )]
     async fn track_create(
         &self,
@@ -1334,7 +1441,7 @@ impl SkywareMcp {
             "instrument" | "midi" => {
                 let name = a.instrument.as_deref().unwrap_or("synth");
                 let kind = InstrumentType::from_name(name).ok_or_else(|| {
-                    format!("instrument {name:?} is not one of synth, drums, sampler, bank")
+                    format!("instrument {name:?} is not one of synth, acid, drums, sampler, bank")
                 })?;
                 Track::new_instrument(a.name.clone(), kind)
             }
@@ -1653,7 +1760,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Adds a clip: a MIDI clip (notes in the compact list), a pattern clip (mini-notation) on an instrument track, or an audio clip on an audio track. Returns the clip."
+        description = "Adds a clip: a MIDI clip (notes in the compact list), a pattern clip (mini-notation) on an instrument track, or an audio clip on an audio track. Step clips are added with steps_write. Returns the clip."
     )]
     async fn clip_create(
         &self,
@@ -1928,6 +2035,110 @@ impl SkywareMcp {
         Ok(clip_json(&project, clip, true).to_string())
     }
 
+    #[tool(
+        description = "Writes a step clip, as on a drum machine or an acid bass: lanes of steps, each lane on a key (a drum or a note) and of its own length, with accents, slides, ties, ratchets, probabilities, conditions, micro-timing and parameter locks. Give clip to change one, or track to add one. Returns the clip."
+    )]
+    async fn steps_write(
+        &self,
+        Parameters(a): Parameters<StepsWriteArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let project = self.session.project();
+        let existing = match &a.clip {
+            Some(c) => {
+                let id = find_clip(&project, c)?;
+                let (track, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
+                let ClipContent::Steps(steps) = &clip.content else {
+                    return Err(format!(
+                        "{} is a {} clip, not a step clip; leave out clip and give track to add one",
+                        clip.name,
+                        clip.kind_name()
+                    ));
+                };
+                Some((id, track.id, steps.clone(), clip.name.clone()))
+            }
+            None => None,
+        };
+        let track = match (&existing, &a.track) {
+            (Some((_, track, _, _)), None) => *track,
+            (Some(_), Some(_)) => {
+                return Err(
+                    "give clip to change a step clip, or track to add one, not both".into(),
+                );
+            }
+            (None, Some(t)) => find_track(&project, t)?,
+            (None, None) => {
+                return Err("give clip to change a step clip, or track to add one".into());
+            }
+        };
+        let mut steps = match &existing {
+            Some((_, _, steps, _)) => steps.clone(),
+            None => {
+                if a.lanes.is_none() {
+                    return Err("a new step clip needs lanes".into());
+                }
+                StepClip::new(16, Vec::new())
+            }
+        };
+        if let Some(rate) = a.rate {
+            steps.rate = rate;
+        }
+        steps.swing = swing_of(steps.swing, a.swing, a.swing_grid);
+        if let Some(seed) = a.seed {
+            steps.seed = seed;
+        }
+        if let Some(lanes) = &a.lanes {
+            steps.lanes = lanes
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    step_lane(&project, track, l).map_err(|e| format!("lane {}: {e}", i + 1))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        let (cmd, id, label) = match existing {
+            Some((id, _, _, name)) => (
+                Command::SetSteps {
+                    clip: id,
+                    steps: Box::new(steps),
+                },
+                id,
+                format!("Write steps in {name}"),
+            ),
+            None => {
+                let clip = Clip {
+                    id: ClipId::new(),
+                    name: a.name.clone().unwrap_or_else(|| "Steps".into()),
+                    start: bar_tick(&project, a.start_bar.unwrap_or(1.0))?,
+                    length: bars_len(&project, a.length_bars.unwrap_or(1.0))?,
+                    content: ClipContent::Steps(steps),
+                };
+                let id = clip.id;
+                let label = format!("Add step clip {}", clip.name);
+                (
+                    Command::AddClip {
+                        track,
+                        clip: Box::new(clip),
+                    },
+                    id,
+                    label,
+                )
+            }
+        };
+        let mut cmds = vec![cmd];
+        if let (Some(name), Some(_)) = (&a.name, &a.clip) {
+            cmds.push(Command::SetClipName {
+                id,
+                name: name.clone(),
+            });
+        }
+        drop(project);
+        self.apply(&ctx, "steps_write", label, cmds)?;
+        let project = self.session.project();
+        let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
+        Ok(clip_json(&project, clip, true).to_string())
+    }
+
     #[tool(description = "Undoes the latest change or changes, whoever made them.")]
     async fn undo(&self, Parameters(a): Parameters<UndoArgs>) -> ToolResult {
         let steps = a.steps.unwrap_or(1).clamp(1, 50);
@@ -1949,7 +2160,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Starts a new project: empty, the demo, or the techno loop template. The open project must be saved first unless discard_unsaved is true.",
+        description = "Starts a new project: empty, the demo, or the techno or acid loop template. The open project must be saved first unless discard_unsaved is true.",
         annotations(destructive_hint = true)
     )]
     async fn project_new(&self, Parameters(a): Parameters<ProjectNewArgs>) -> ToolResult {
@@ -1959,7 +2170,12 @@ impl SkywareMcp {
             "empty" => empty_project(&name),
             "demo" => demo_project(),
             "techno" => techno_project(),
-            other => return Err(format!("template {other:?} is not empty, demo or techno")),
+            "acid" => acid_project(),
+            other => {
+                return Err(format!(
+                    "template {other:?} is not empty, demo, techno or acid"
+                ));
+            }
         };
         project.name = name;
         self.session.new_project(project);

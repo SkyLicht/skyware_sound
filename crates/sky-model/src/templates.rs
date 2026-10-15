@@ -7,6 +7,7 @@ use sky_dsp::{EffectType, InstrumentType};
 
 use crate::notes::parse_note_list;
 use crate::project::*;
+use crate::steps::{StepClip, StepLane};
 
 /// An empty project with one drum track, ready for a pattern.
 pub fn empty_project(name: &str) -> Project {
@@ -280,6 +281,99 @@ pub fn techno_project() -> Project {
         .effects
         .push(EffectSlot::new(EffectType::Limiter).with_params(&[("ceiling", -1.0)]));
     p.tracks = vec![kick, hats, bass, stab];
+    p.loop_region = TimeRange {
+        start: 0,
+        end: bar * bars,
+    };
+    p
+}
+
+/// A step clip `bars` long from the start.
+fn step_clip(name: &str, bars: i64, bar: i64, steps: StepClip) -> Clip {
+    Clip {
+        id: ClipId::new(),
+        name: name.into(),
+        start: 0,
+        length: bar * bars,
+        content: ClipContent::Steps(steps),
+    }
+}
+
+fn lane(note: u8, steps: &str) -> StepLane {
+    StepLane::parse(note, steps).expect("template steps parse")
+}
+
+/// A four-bar acid techno loop at 128 BPM made of step clips: a 909-style
+/// beat whose hats use probability, ratchets and a fill on the last bar,
+/// and a 12-step Acid bass line with accents and slides that drifts
+/// against the 16-step beat, ducked lightly by the kick and echoed by a
+/// dotted delay.
+pub fn acid_project() -> Project {
+    let mut p = Project::new("Acid loop");
+    p.tempo = TempoMap::constant(128.0);
+    let bar = p.ticks_per_bar();
+    let bars = 4;
+
+    let mut drums = Track::new_instrument("Drums", InstrumentType::Drums);
+    set_params(
+        &mut drums,
+        &[
+            ("style", 1.0),
+            ("kick_tune", -2.0),
+            ("kick_drive", 6.0),
+            ("hat_decay", 0.8),
+            ("clap_level", -4.0),
+            ("gain", -5.0),
+        ],
+    );
+    let beat = StepClip::new(
+        16,
+        vec![
+            lane(36, "X . . . x . . . x . . . x . . ."),
+            lane(39, ". . . . x . . . . . . . x . . x@fill"),
+            lane(46, ". . x . . . x . . . x . . . x ."),
+            lane(
+                42,
+                "x=70 x?50=50 . x=70 x=70 x?50=50 . x=70 x=70 x?50=50 . x=70 x=70 x?50=50 . x*2@fill",
+            ),
+        ],
+    );
+    drums.clips.push(step_clip("Beat", bars, bar, beat));
+
+    let mut acid = Track::new_instrument("Acid", InstrumentType::Acid);
+    set_params(
+        &mut acid,
+        &[
+            ("cutoff", 320.0),
+            ("resonance", 0.82),
+            ("env_mod", 0.6),
+            ("decay", 300.0),
+            ("accent", 0.8),
+            ("drive", 9.0),
+            ("gain", -9.0),
+        ],
+    );
+    let mut line = StepClip::new(16, vec![lane(36, "x x/ c3! x . d#2/ f2 x! - g1 x a#1/")]);
+    line.seed = 1;
+    acid.clips.push(step_clip("Acid line", bars, bar, line));
+    acid.channel.effects.push(
+        EffectSlot::new(EffectType::Duck)
+            .with_params(&[("depth", 0.5), ("length", 0.5), ("attack", 1.0)])
+            .with_sidechain(drums.id),
+    );
+    acid.channel
+        .effects
+        .push(EffectSlot::new(EffectType::Delay).with_params(&[
+            ("sync", 7.0),
+            ("feedback", 0.35),
+            ("mix", 0.2),
+            ("damping", 3_000.0),
+        ]));
+
+    p.master
+        .effects
+        .push(EffectSlot::new(EffectType::Limiter).with_params(&[("ceiling", -1.0)]));
+    p.tracks = vec![drums, acid];
     p.loop_region = TimeRange {
         start: 0,
         end: bar * bars,

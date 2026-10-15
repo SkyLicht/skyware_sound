@@ -33,8 +33,8 @@ pub fn check_project(bars: u32) -> Project {
     for track in &mut p.tracks {
         let mut clips = Vec::new();
         for clip in std::mem::take(&mut track.clips) {
-            if let ClipContent::Pattern { .. } = clip.content {
-                // A pattern repeats every cycle, so one long clip covers it.
+            if let ClipContent::Pattern { .. } | ClipContent::Steps(_) = clip.content {
+                // Patterns and steps repeat, so one long clip covers them.
                 clips.push(sky_model::Clip {
                     length: end - clip.start,
                     ..clip

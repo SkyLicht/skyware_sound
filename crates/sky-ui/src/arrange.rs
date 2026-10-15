@@ -369,7 +369,7 @@ fn follow_playhead(app: &mut App) {
 fn clip_fits(track: &Track, clip: &Clip) -> bool {
     match clip.content {
         ClipContent::Audio { .. } => track.kind == TrackKind::Audio,
-        ClipContent::Midi { .. } | ClipContent::Pattern { .. } => {
+        ClipContent::Midi { .. } | ClipContent::Pattern { .. } | ClipContent::Steps(_) => {
             track.kind == TrackKind::Instrument
         }
     }
@@ -918,6 +918,15 @@ fn lane_menu(app: &mut App, ui: &mut Ui, project: &Project, track: &Track) {
                     app.tab = Tab::Editor;
                 }
             }
+            if ui.button("Add step clip here").clicked() {
+                let steps = actions::starter_steps(track);
+                let r = actions::add_step_clip(&app.session, track.id, start, bar * 4, steps);
+                if let Some(id) = app.report(r) {
+                    app.refresh();
+                    app.sel.select_clip(track.id, id);
+                    app.tab = Tab::Editor;
+                }
+            }
         }
         TrackKind::Audio => {
             if ui.button("Import audio…").clicked() {
@@ -1135,6 +1144,23 @@ fn draw_clip(
                 cycle,
                 ..
             } => draw_pattern(app, &p, r, body, vis, clip, source, *seed, *cycle, color),
+            ClipContent::Steps(steps) => {
+                let notes: Vec<Note> = steps
+                    .notes(clip.length)
+                    .into_iter()
+                    .map(|n| Note::new(n.start, n.end - n.start, n.pitch, n.velocity))
+                    .collect();
+                draw_notes(
+                    &p,
+                    r,
+                    body,
+                    vis,
+                    clip,
+                    &notes,
+                    app.arrange.px_per_tick,
+                    color,
+                );
+            }
             ClipContent::Audio {
                 source,
                 offset,

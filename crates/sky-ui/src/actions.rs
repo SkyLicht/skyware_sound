@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use sky_core::{ClipId, EffectId, NoteId, PPQ, Ticks, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::{
-    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project, Swing,
-    Track, Transaction,
+    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project, StepClip,
+    StepLane, Swing, Track, Transaction,
 };
 use sky_session::Session;
 
@@ -38,8 +38,9 @@ pub enum NewTrack {
 }
 
 impl NewTrack {
-    pub const ALL: [NewTrack; 5] = [
+    pub const ALL: [NewTrack; 6] = [
         NewTrack::Instrument(InstrumentType::Synth),
+        NewTrack::Instrument(InstrumentType::Acid),
         NewTrack::Instrument(InstrumentType::Drums),
         NewTrack::Instrument(InstrumentType::Sampler),
         NewTrack::Instrument(InstrumentType::Bank),
@@ -52,6 +53,7 @@ impl NewTrack {
             NewTrack::Instrument(InstrumentType::Drums) => "Drums",
             NewTrack::Instrument(InstrumentType::Sampler) => "Sampler",
             NewTrack::Instrument(InstrumentType::Bank) => "Sample bank",
+            NewTrack::Instrument(InstrumentType::Acid) => "Acid bass",
             NewTrack::Audio => "Audio",
         }
     }
@@ -388,6 +390,94 @@ pub fn add_pattern_clip(
         None,
     )?;
     Ok(id)
+}
+
+/// Whether a track's step lanes are drums, one per piece, rather than a
+/// melody whose steps each play their own key.
+pub fn plays_drums(track: &Track) -> bool {
+    track.instrument.as_ref().is_some_and(|i| match i.kind {
+        InstrumentType::Drums => true,
+        InstrumentType::Bank => i.bank.as_ref().is_none_or(|b| b.pitched.is_none()),
+        _ => false,
+    })
+}
+
+/// A one-bar step clip to start from: a beat on drums, a bass line on the
+/// Acid bass, and an empty lane on anything else.
+pub fn starter_steps(track: &Track) -> StepClip {
+    let lane =
+        |note: u8, text: &str| StepLane::parse(note, text).unwrap_or(StepLane::new(note, 16));
+    let lanes = if plays_drums(track) {
+        vec![
+            lane(36, "x . . . x . . . x . . . x . . ."),
+            lane(39, ". . . . x . . . . . . . x . . ."),
+            lane(42, ". . x . . . x . . . x . . . x ."),
+        ]
+    } else if track
+        .instrument
+        .as_ref()
+        .is_some_and(|i| i.kind == InstrumentType::Acid)
+    {
+        vec![lane(36, "x x c3! x . x/ d#2 x g1 . X c3/ a#2 x . d#2")]
+    } else {
+        vec![StepLane::new(48, 16)]
+    };
+    StepClip::new(16, lanes)
+}
+
+/// Adds a step clip with `steps`.
+pub fn add_step_clip(
+    session: &Session,
+    track: TrackId,
+    start: Ticks,
+    length: Ticks,
+    steps: StepClip,
+) -> ActionResult<ClipId> {
+    let clip = Clip {
+        id: ClipId::new(),
+        name: "Steps".into(),
+        start: start.max(0),
+        length: length.max(1),
+        content: ClipContent::Steps(steps),
+    };
+    let id = clip.id;
+    apply(
+        session,
+        Transaction::user(
+            "Add step clip",
+            vec![Command::AddClip {
+                track,
+                clip: Box::new(clip),
+            }],
+        ),
+        None,
+    )?;
+    Ok(id)
+}
+
+/// Changes a step clip through `edit`.
+pub fn edit_steps(
+    session: &Session,
+    clip: ClipId,
+    key: Option<u64>,
+    edit: impl FnOnce(&mut StepClip),
+) -> ActionResult<u64> {
+    let project = session.project();
+    let (_, c) = project.find_clip(clip).map_err(|e| e.to_string())?;
+    let ClipContent::Steps(steps) = &c.content else {
+        return Err(format!("{} is not a step clip", c.name));
+    };
+    let mut steps = steps.clone();
+    drop(project);
+    edit(&mut steps);
+    single(
+        session,
+        Command::SetSteps {
+            clip,
+            steps: Box::new(steps),
+        },
+        key,
+    )
 }
 
 /// Adds an audio clip that plays a pool entry from its start, at its full length.

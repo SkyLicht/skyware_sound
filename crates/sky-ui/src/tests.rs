@@ -970,6 +970,101 @@ fn the_techno_template_renders_everywhere() {
 }
 
 #[test]
+fn the_acid_template_renders_everywhere() {
+    let mut h = Harness::with_project(sky_model::templates::acid_project());
+    h.every_tab();
+    for t in h.project().tracks.clone() {
+        for c in &t.clips {
+            h.app.sel.select_clip(t.id, c.id);
+            h.every_tab();
+        }
+    }
+    h.run(Action::NewEmpty);
+    h.run(Action::NewAcid);
+    assert_eq!(h.project().name, "Acid loop");
+}
+
+#[test]
+fn step_clips_are_edited_by_clicking_steps() {
+    let mut h = Harness::demo();
+    let drums = h.track_named("Drums");
+    let steps_of = |h: &Harness, id: ClipId| match h.clip(id).content {
+        ClipContent::Steps(s) => s,
+        other => panic!("{other:?}"),
+    };
+    // A new step clip on drums starts from a beat.
+    let start = h.project().ticks_per_bar() * 8;
+    let id = h
+        .app
+        .report(actions::add_step_clip(
+            &h.app.session,
+            drums.id,
+            start,
+            start / 2,
+            actions::starter_steps(&drums),
+        ))
+        .unwrap();
+    assert_eq!(steps_of(&h, id).lanes.len(), 3);
+    h.app.sel.select_clip(drums.id, id);
+    h.app.tab = Tab::Editor;
+    h.frames(3);
+    let cell = |h: &Harness, lane: usize, step: usize| {
+        h.app
+            .steps
+            .cells
+            .iter()
+            .find(|(at, _)| *at == (lane, step))
+            .map(|(_, r)| r.center())
+            .expect("the step is drawn")
+    };
+    // A click turns a step on and selects it; the inspector shows.
+    let before = h.history_len();
+    h.click(cell(&h, 0, 1));
+    assert!(steps_of(&h, id).lanes[0].steps[1].is_note());
+    assert_eq!(h.app.steps.selected, Some((id, 0, 1)));
+    assert_eq!(h.history_len(), before + 1);
+    h.frames(2);
+    // Shift accents, Ctrl ties, and a second click turns it off.
+    h.set_modifiers(Modifiers::SHIFT);
+    h.click(cell(&h, 0, 1));
+    assert!(steps_of(&h, id).lanes[0].steps[1].accent);
+    h.set_modifiers(Modifiers::CTRL);
+    h.click(cell(&h, 0, 2));
+    assert_eq!(
+        steps_of(&h, id).lanes[0].steps[2].kind,
+        sky_model::StepKind::Tie
+    );
+    h.set_modifiers(Modifiers::NONE);
+    h.click(cell(&h, 0, 1));
+    assert!(!steps_of(&h, id).lanes[0].steps[1].is_note());
+    h.run(Action::Undo);
+    assert!(steps_of(&h, id).lanes[0].steps[1].accent);
+    // Settings and locks go through the same command.
+    h.app
+        .report(actions::edit_steps(&h.app.session, id, None, |s| {
+            s.lanes[2].steps[2].locks.insert("hat_decay".into(), 2.0);
+            s.lanes[2].resize(12);
+            s.swing = sky_model::Swing::new(60, 16);
+        }))
+        .unwrap();
+    h.app.steps.selected = Some((id, 2, 2));
+    h.frames(3);
+    let steps = steps_of(&h, id);
+    assert_eq!(steps.lanes[2].len(), 12);
+    assert_eq!(steps.locked_params(), ["hat_decay"]);
+    // The arrange view draws the clip, and an Acid track starts from a line.
+    h.app.tab = Tab::Editor;
+    h.show_bars(16);
+    let acid = Track::new_instrument("Acid", sky_dsp::InstrumentType::Acid);
+    assert!(
+        actions::starter_steps(&acid).lanes[0]
+            .steps
+            .iter()
+            .any(|s| s.slide)
+    );
+}
+
+#[test]
 fn ai_changes_flash_the_indicator_and_can_be_undone() {
     let mut h = Harness::with_config(
         demo_project(),
