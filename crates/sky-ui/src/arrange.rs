@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The arrangement: bar ruler with the loop region and playhead, and one
-//! lane of clips per track next to its header.
+//! The arrangement: bar ruler with the loop region and playhead, the game
+//! asset lane under it, and one lane of clips per track next to its header.
 
 use std::collections::HashMap;
 
@@ -9,12 +9,13 @@ use egui::{
     Margin, Painter, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder,
     pos2, vec2,
 };
-use sky_core::{ClipId, PPQ, Ticks, TimeSignature, TrackId};
+use sky_core::{AssetId, ClipId, PPQ, Ticks, TimeSignature, TrackId};
 use sky_model::{Clip, ClipContent, Command, Note, Project, Track, TrackKind, Transaction};
 use sky_pattern::{Pattern, Time};
 
 use crate::actions::{self, NewTrack};
 use crate::app::{Action, App, Focus, Tab};
+use crate::asset_lane::{self, AssetDrag};
 use crate::widgets::Marquee;
 use crate::{keys, theme};
 
@@ -165,6 +166,10 @@ pub struct ArrangeState {
     /// A rectangle being dragged over the lanes to select clips.
     pub marquee: Option<Marquee<ClipId>>,
     pub loop_drag: Option<LoopDrag>,
+    /// A game asset region being moved or changed in the asset lane.
+    pub asset_drag: Option<AssetDrag>,
+    /// The game asset last clicked in the asset lane.
+    pub asset: Option<AssetId>,
     pub scrubbing: bool,
     /// Lane rects drawn this frame and the last, for finding drop targets.
     pub lanes: Vec<(TrackId, Rect)>,
@@ -189,6 +194,8 @@ impl Default for ArrangeState {
             drag: None,
             marquee: None,
             loop_drag: None,
+            asset_drag: None,
+            asset: None,
             scrubbing: false,
             lanes: Vec::new(),
             prev_lanes: Vec::new(),
@@ -220,6 +227,8 @@ impl ArrangeState {
         self.drag = None;
         self.marquee = None;
         self.loop_drag = None;
+        self.asset_drag = None;
+        self.asset = None;
         self.scrubbing = false;
         self.renaming = None;
         self.patterns = PatternCache::default();
@@ -254,9 +263,18 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         pos2(full.right(), full.top() + RULER_H),
     );
     let corner = Rect::from_min_max(full.min, pos2(lane_left, ruler.bottom()));
+    let assets_h = asset_lane::height(project).min(full.height() - RULER_H - 30.0);
+    let assets = Rect::from_min_max(
+        pos2(lane_left, ruler.bottom()),
+        pos2(full.right(), ruler.bottom() + assets_h),
+    );
+    let assets_corner = Rect::from_min_max(
+        pos2(full.left(), assets.top()),
+        pos2(lane_left, assets.bottom()),
+    );
     let hbar = Rect::from_min_max(pos2(lane_left, full.bottom() - HBAR_H), full.max);
     let body = Rect::from_min_max(
-        pos2(full.left(), ruler.bottom()),
+        pos2(full.left(), assets.bottom()),
         pos2(full.right(), hbar.top()),
     );
     {
@@ -271,9 +289,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     update_clip_drag(app, ui.ctx(), project);
     update_marquee(app, ui.ctx(), project);
     update_loop_drag(app, ui.ctx(), project);
+    asset_lane::update_drag(app, ui.ctx(), project);
 
     corner_ui(app, ui, corner, project);
     ruler_ui(app, ui, ruler, project);
+    asset_lane::show(app, ui, assets_corner, assets, project);
     rows(app, ui, body, project);
     if let Some(m) = &app.arrange.marquee {
         m.paint(&ui.painter_at(body));
@@ -665,7 +685,7 @@ fn bar_step(project: &Project, px_per_tick: f32) -> i64 {
         .unwrap_or(512)
 }
 
-fn draw_grid(painter: &Painter, st: &ArrangeState, rect: Rect, project: &Project) {
+pub(crate) fn draw_grid(painter: &Painter, st: &ArrangeState, rect: Rect, project: &Project) {
     let tpb = project.ticks_per_bar().max(1);
     let beat = project.time_signature.ticks_per_beat().max(1);
     let from = st.tick_at(rect.left()).max(0.0) as i64;
@@ -1000,6 +1020,7 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
         app.sel.select_track(track.id);
         if !adding {
             app.sel.clips.clear();
+            app.arrange.asset = None;
         }
     }
     if resp.drag_started()

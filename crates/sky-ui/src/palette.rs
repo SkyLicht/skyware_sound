@@ -129,6 +129,7 @@ pub fn entries(app: &App) -> Vec<Entry> {
             Tab::Mixer => "the mixer",
             Tab::Instrument => "the instrument panel",
             Tab::Ai => "AI activity",
+            Tab::Loop => "the loop inspector",
         };
         let verb = if app.workspace.is_open(tab) {
             "Hide"

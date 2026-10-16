@@ -559,7 +559,10 @@ impl App {
     pub fn select_none(&mut self) {
         match self.target() {
             Target::Notes(_) => self.sel.notes.clear(),
-            Target::Clips => self.sel.clips.clear(),
+            Target::Clips => {
+                self.sel.clips.clear();
+                self.arrange.asset = None;
+            }
         }
     }
 

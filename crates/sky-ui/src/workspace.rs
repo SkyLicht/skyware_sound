@@ -26,20 +26,23 @@ pub enum Tab {
     Ai,
     /// Project audio, sample packs and folders of samples.
     Browser,
+    /// A game loop's seam: the waveform either side of it, and the check.
+    Loop,
 }
 
 impl Tab {
     /// In the order the View menu lists them.
-    pub const ALL: [Tab; 6] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Arrange,
         Tab::Browser,
         Tab::Editor,
         Tab::Mixer,
         Tab::Instrument,
+        Tab::Loop,
         Tab::Ai,
     ];
     /// The panels that share the lower area unless moved.
-    pub const LOWER: [Tab; 4] = [Tab::Editor, Tab::Mixer, Tab::Instrument, Tab::Ai];
+    pub const LOWER: [Tab; 5] = [Tab::Editor, Tab::Mixer, Tab::Instrument, Tab::Loop, Tab::Ai];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -49,6 +52,7 @@ impl Tab {
             Tab::Instrument => "Instrument",
             Tab::Ai => "AI activity",
             Tab::Browser => "Browser",
+            Tab::Loop => "Loop inspector",
         }
     }
 }
@@ -98,7 +102,7 @@ impl Default for Workspace {
 }
 
 /// The browser on the left, the arrangement above the editor, mixer,
-/// instrument and AI tabs.
+/// instrument, loop inspector and AI tabs.
 pub fn default_dock() -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Arrange]).with_translations(translations());
     let tree = dock.main_surface_mut();
@@ -399,6 +403,7 @@ impl TabViewer for Panels<'_> {
                 Tab::Instrument => crate::params::instrument_panel(app, ui),
                 Tab::Ai => crate::ai_panel::show(app, ui),
                 Tab::Browser => crate::browser::panel(app, ui),
+                Tab::Loop => crate::loop_inspector::show(app, ui),
             }
         });
     }

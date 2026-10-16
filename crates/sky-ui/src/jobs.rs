@@ -10,6 +10,7 @@ use crate::audition::{PreviewKey, Rendered};
 use crate::browser::{FolderIndex, PackListing};
 use crate::dialogs::{LoopSummary, PathPurpose, WavSummary};
 use crate::game::GameSummary;
+use crate::loop_inspector::{Checked, Target};
 use crate::waveform::Peaks;
 use sky_core::AudioId;
 use sky_library::Pack;
@@ -64,6 +65,12 @@ pub enum JobOutput {
     Previewed {
         key: PreviewKey,
         result: Result<Rendered, String>,
+    },
+    /// A loop rendered for the Loop inspector, with its seam checked.
+    SeamChecked {
+        target: Target,
+        revision: u64,
+        result: Result<Arc<Checked>, String>,
     },
 }
 
