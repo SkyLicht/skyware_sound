@@ -22,6 +22,7 @@ mod game;
 mod loops;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -150,12 +151,16 @@ pub(crate) struct TempFolder(PathBuf);
 
 impl TempFolder {
     pub(crate) fn new(what: &str) -> Result<Self, String> {
+        // Checks running at once in one process can read the same time,
+        // so a count keeps their folders apart.
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let n = MADE.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let path = std::env::temp_dir().join(format!(
-            "skyware-check-{what}-{}-{nanos}",
+            "skyware-check-{what}-{}-{nanos}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path)
