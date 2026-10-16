@@ -24,6 +24,7 @@ mod edit;
 mod game;
 mod jobs;
 mod keys;
+mod live_pattern;
 mod loop_inspector;
 mod menu;
 mod mixer;
