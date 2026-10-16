@@ -1684,10 +1684,12 @@ fn draw_pattern(
         }
     }
     let text_left = r.left().max(vis.left());
+    // A pattern written on several lines reads as one here.
+    let line = source.split_whitespace().collect::<Vec<_>>().join(" ");
     p.text(
         pos2(text_left + 4.0, body.top() + 1.0),
         Align2::LEFT_TOP,
-        source,
+        line,
         theme::mono(11.0),
         theme::lighten(color, 0.55),
     );

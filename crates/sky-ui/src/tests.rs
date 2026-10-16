@@ -903,13 +903,21 @@ fn pattern_status_and_mcp_command() {
 }
 
 #[test]
-fn pattern_edits_apply_on_enter() {
+fn pattern_edits_apply_on_ctrl_enter_and_span_lines() {
     let mut h = Harness::demo();
     let drums = h.track_named("Drums");
     let clip = drums.clips[0].id;
-    let original = match &h.clip(clip).content {
+    let source = |h: &Harness| match &h.clip(clip).content {
         ClipContent::Pattern { source, .. } => source.clone(),
         other => panic!("{other:?}"),
+    };
+    let original = source(&h);
+    let notice = |h: &Harness| {
+        h.app
+            .notice
+            .as_ref()
+            .map(|n| n.text.clone())
+            .unwrap_or_default()
     };
     h.app.sel.select_clip(drums.id, clip);
     h.app.workspace.show(Tab::Editor);
@@ -917,38 +925,296 @@ fn pattern_edits_apply_on_enter() {
     let text_id = Id::new(("pattern_text", clip));
     h.ctx.memory_mut(|m| m.request_focus(text_id));
     h.frames(2);
-    // A typo is not applied.
+    // A typo is not applied, and the notice says where it is.
     h.key(Key::A, COMMAND);
     h.type_text("bd*2 [hh");
     assert_eq!(h.app.pattern.text, "bd*2 [hh");
-    h.key(Key::Enter, Modifiers::NONE);
-    let notice = h
-        .app
-        .notice
-        .as_ref()
-        .map(|n| n.text.clone())
-        .unwrap_or_default();
-    assert!(notice.starts_with("Pattern not applied"), "{notice}");
-    match &h.clip(clip).content {
-        ClipContent::Pattern { source, .. } => assert_eq!(*source, original),
-        other => panic!("{other:?}"),
-    }
-    // A good pattern is applied on Enter.
+    h.key(Key::Enter, COMMAND);
+    assert!(
+        notice(&h).starts_with("Pattern not applied") && notice(&h).contains("at column"),
+        "{}",
+        notice(&h)
+    );
+    assert_eq!(source(&h), original);
+
+    // Enter starts a new line; Ctrl+Enter applies the lines as layers.
     h.ctx.memory_mut(|m| m.request_focus(text_id));
     h.frames(2);
     h.key(Key::A, COMMAND);
-    h.type_text("bd*2, hh*4");
+    h.type_text("bd*2,");
     h.key(Key::Enter, Modifiers::NONE);
-    match &h.clip(clip).content {
-        ClipContent::Pattern { source, .. } => assert_eq!(source, "bd*2, hh*4"),
+    h.type_text("hh*4");
+    assert_eq!(h.app.pattern.text, "bd*2,\nhh*4");
+    assert_eq!(source(&h), original, "Enter alone does not apply");
+    h.key(Key::Enter, COMMAND);
+    assert_eq!(source(&h), "bd*2,\nhh*4");
+    assert!(
+        h.ctx.memory(|m| m.has_focus(text_id)),
+        "the box keeps the focus"
+    );
+    match pattern_editor::parse_status(&source(&h), 0) {
+        pattern_editor::ParseStatus::Ok { events } => assert_eq!(events, 6),
         other => panic!("{other:?}"),
     }
+
+    // An error on the second line is placed by line and column.
+    h.type_text(" [");
+    h.key(Key::Enter, COMMAND);
+    assert!(notice(&h).contains("at line 2, column"), "{}", notice(&h));
+    assert_eq!(source(&h), "bd*2,\nhh*4");
+    h.key(Key::A, COMMAND);
+    h.type_text("bd*4");
+    h.key(Key::Enter, COMMAND);
+    assert_eq!(source(&h), "bd*4");
     h.run(Action::Undo);
-    match &h.clip(clip).content {
-        ClipContent::Pattern { source, .. } => assert_eq!(*source, original),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(source(&h), "bd*2,\nhh*4");
+    h.run(Action::Undo);
+    h.ctx.memory_mut(|m| m.surrender_focus(text_id));
+    h.frames(2);
+    assert_eq!(source(&h), original);
     assert_eq!(h.app.pattern.text, original, "the box follows the undo");
+}
+
+#[test]
+fn sound_names_complete_in_the_pattern_box() {
+    let mut h = Harness::demo();
+    let drums = h.track_named("Drums");
+    let clip = drums.clips[0].id;
+    let source = |h: &Harness| match &h.clip(clip).content {
+        ClipContent::Pattern { source, .. } => source.clone(),
+        other => panic!("{other:?}"),
+    };
+    let original = source(&h);
+    let offered = |h: &Harness| {
+        let (names, pick) = h.app.pattern.offered();
+        (names.to_vec(), pick)
+    };
+    h.accessible();
+    h.app.sel.select_clip(drums.id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    let text_id = Id::new(("pattern_text", clip));
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+    h.key(Key::A, COMMAND);
+    h.type_text("bd h");
+    h.frames(1);
+    assert_eq!(offered(&h), (vec!["hh".into(), "ht".into()], 0));
+    assert!(h.find("Tab completes · Esc hides").is_some());
+
+    // The arrows move through the names, Tab takes one and the caret goes
+    // after it.
+    h.key(Key::ArrowDown, Modifiers::NONE);
+    assert_eq!(offered(&h).1, 1);
+    h.key(Key::ArrowUp, Modifiers::NONE);
+    assert_eq!(offered(&h).1, 0);
+    h.key(Key::Tab, Modifiers::NONE);
+    assert_eq!(h.app.pattern.text, "bd hh");
+    assert!(offered(&h).0.is_empty());
+    assert!(
+        h.ctx.memory(|m| m.has_focus(text_id)),
+        "Tab stays in the box"
+    );
+    h.type_text("*2");
+    assert_eq!(h.app.pattern.text, "bd hh*2");
+
+    // Escape hides the names without leaving the box or applying.
+    h.type_text(" s");
+    h.frames(1);
+    assert_eq!(
+        offered(&h).0,
+        ["sd", "sh", "sn", "snare", "shaker"].map(String::from)
+    );
+    h.key(Key::Escape, Modifiers::NONE);
+    h.frames(1);
+    assert!(offered(&h).0.is_empty());
+    assert!(h.ctx.memory(|m| m.has_focus(text_id)));
+    assert_eq!(source(&h), original);
+    // The next letter offers them again.
+    h.type_text("n");
+    h.frames(1);
+    assert_eq!(offered(&h).0, ["snare"].map(String::from));
+
+    // A click on a name takes it, and the edit goes on.
+    h.click_label("snare");
+    h.frames(2);
+    assert_eq!(h.app.pattern.text, "bd hh*2 snare");
+    assert_eq!(source(&h), original, "the click did not apply the text");
+    assert!(h.ctx.memory(|m| m.has_focus(text_id)));
+    h.key(Key::Enter, COMMAND);
+    assert_eq!(source(&h), "bd hh*2 snare");
+
+    // A synth has no sound names to offer.
+    let bass = h.track_named("Bass");
+    h.app.sel.select_clip(bass.id, bass.clips[0].id);
+    h.frames(3);
+    assert!(offered(&h).0.is_empty());
+}
+
+#[test]
+fn the_step_grid_writes_the_pattern() {
+    let mut h = Harness::demo();
+    let drums = h.track_named("Drums");
+    let clip = drums.clips[0].id;
+    let source = |h: &Harness| match &h.clip(clip).content {
+        ClipContent::Pattern { source, .. } => source.clone(),
+        other => panic!("{other:?}"),
+    };
+    let original = source(&h);
+    let cell = |h: &Harness, row: usize, step: usize| {
+        h.rect_of(Id::new(("grid_cell", clip, row, step))).center()
+    };
+    h.accessible();
+    h.app.sel.select_clip(drums.id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    assert!(
+        h.ctx
+            .read_response(Id::new(("grid_cell", clip, 0usize, 0usize)))
+            .is_none(),
+        "the grid is off at first"
+    );
+    h.click_in(Tab::Editor, "Step grid");
+    assert!(h.app.workspace.pattern_grid);
+    h.frames(2);
+    // bd*4, ~ sd ~ sd, hh*8 is three rows of 16 steps.
+    for (row, name) in ["bd", "sd", "hh"].iter().enumerate() {
+        assert!(h.find(name).is_some(), "no {name} row");
+        let _ = cell(&h, row, 15);
+    }
+
+    // A click on a step in the middle of a kick splits it.
+    let before = h.history_len();
+    h.click(cell(&h, 0, 2));
+    h.frames(2);
+    assert_eq!(h.history_len(), before + 1, "one undo step");
+    assert_eq!(source(&h), "bd bd bd _ bd _ bd _,\n~ sd ~ sd,\nhh*8");
+    assert_eq!(h.app.pattern.text, source(&h), "the box follows the grid");
+    // A click on an onset clears the hit.
+    h.frames(40);
+    h.click(cell(&h, 1, 4));
+    h.frames(2);
+    assert_eq!(source(&h), "bd bd bd _ bd _ bd _,\n~ ~ ~ sd,\nhh*8");
+    h.run(Action::Undo);
+    h.run(Action::Undo);
+    h.frames(2);
+    assert_eq!(source(&h), original);
+
+    // A new row starts empty, and stays after the undo of its first hit.
+    pick(&mut h, "Add row…", "cp");
+    assert!(h.find("cp").is_some());
+    assert_eq!(source(&h), original);
+    h.frames(40);
+    h.click(cell(&h, 3, 4));
+    h.frames(2);
+    assert_eq!(
+        source(&h),
+        "bd*4,\n~ sd ~ sd,\nhh*8,\n~ ~ ~ ~ cp ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~"
+    );
+    h.run(Action::Undo);
+    h.frames(2);
+    assert_eq!(source(&h), original);
+    assert!(h.find("cp").is_some(), "the empty row stays");
+    // Its × removes it, and the kick's × removes the kick.
+    let remove = |h: &Harness, row: usize| {
+        let y = cell(h, row, 0).y;
+        h.access
+            .iter()
+            .find(|(l, r, _)| l == "×" && (r.center().y - y).abs() < 4.0)
+            .map(|(_, r, _)| r.center())
+            .expect("a × on the row")
+    };
+    h.frames(40);
+    let before = h.history_len();
+    h.click(remove(&h, 3));
+    h.frames(2);
+    assert!(h.find("cp").is_none());
+    assert_eq!(h.history_len(), before, "an empty row is not in the text");
+    h.frames(40);
+    h.click(remove(&h, 0));
+    h.frames(2);
+    assert_eq!(source(&h), "~ sd ~ sd,\nhh*8");
+    h.run(Action::Undo);
+    h.frames(2);
+    assert_eq!(source(&h), original);
+
+    // Finer steps are offered when every hit stays on one.
+    pick(&mut h, "16", "32");
+    assert_eq!(h.app.pattern.grid_steps, Some(32));
+    assert_eq!(source(&h), original, "the step count alone changes nothing");
+    let _ = cell(&h, 0, 31);
+
+    // Typing hides the grid until the text is applied.
+    let text_id = Id::new(("pattern_text", clip));
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+    h.key(Key::A, COMMAND);
+    h.type_text("<bd sd>");
+    h.frames(1);
+    assert!(
+        h.find("Apply or revert what you typed to use the grid")
+            .is_some()
+    );
+    // A pattern that changes from cycle to cycle has no grid.
+    h.key(Key::Enter, COMMAND);
+    h.frames(2);
+    assert!(
+        h.find("This pattern changes from cycle to cycle, so one grid can't show it")
+            .is_some()
+    );
+
+    // The grid is still on next run.
+    let mut storage = MemoryStorage::default();
+    eframe::App::save(&mut h.app, &mut storage);
+    let mut next = Harness::demo();
+    next.app.restore(&storage);
+    assert!(next.app.workspace.pattern_grid);
+}
+
+#[test]
+fn the_playing_step_is_lit_while_playing() {
+    let mut h = Harness::with_engine(demo_project());
+    let drums = h.track_named("Drums");
+    let clip = drums.clips[0].id;
+    h.app.sel.select_clip(drums.id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.app.workspace.pattern_grid = true;
+    h.frames(3);
+    assert!(pattern_editor::lit_atoms(&h.app, clip).is_empty());
+    let bar = h.project().ticks_per_bar();
+    let lit = |h: &mut Harness, at: i64| {
+        arrange::seek(&mut h.app, at);
+        h.heard();
+        h.frames(2);
+        let pos = h.app.transport.position_ticks;
+        assert!(
+            pos >= at as f64 && pos < (at + bar / 8) as f64,
+            "{pos} is not just after {at}"
+        );
+        let mut starts: Vec<usize> = pattern_editor::lit_atoms(&h.app, clip)
+            .iter()
+            .map(|s| s.start)
+            .collect();
+        starts.sort_unstable();
+        starts
+    };
+    h.run(Action::PlayStop);
+    h.heard();
+    h.frames(2);
+    assert!(h.app.transport.playing);
+    // In "bd*4, ~ sd ~ sd, hh*8" three quarters into a bar the kick, the
+    // second snare and a hat sound; a quarter into the next bar, the first
+    // snare.
+    assert_eq!(lit(&mut h, bar * 3 / 4), [0, 13, 17]);
+    // Nothing is lit while the box holds other text.
+    h.app.pattern.text.push(' ');
+    assert!(pattern_editor::lit_atoms(&h.app, clip).is_empty());
+    h.app.pattern.text.pop();
+    assert_eq!(lit(&mut h, bar + bar / 4), [0, 8, 17]);
+    h.run(Action::PlayStop);
+    h.heard();
+    h.frames(2);
+    assert!(pattern_editor::lit_atoms(&h.app, clip).is_empty());
 }
 
 #[test]
@@ -1550,6 +1816,24 @@ fn sample_banks_load_from_a_pack_and_exports_credit_it() {
         ClipContent::Pattern { source, .. } => assert_eq!(source, "bd*4, ~ sd ~ sd, hh*8"),
         other => panic!("not a pattern: {other:?}"),
     }
+    // Its pattern box offers the bank's sound names.
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    let text_id = Id::new(("pattern_text", clip));
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+    h.key(Key::End, COMMAND);
+    h.type_text(", s");
+    h.frames(1);
+    assert_eq!(h.app.pattern.offered().0, ["sd"]);
+    h.key(Key::Tab, Modifiers::NONE);
+    h.key(Key::Enter, COMMAND);
+    match &h.clip(clip).content {
+        ClipContent::Pattern { source, .. } => {
+            assert_eq!(source, "bd*4, ~ sd ~ sd, hh*8, sd")
+        }
+        other => panic!("not a pattern: {other:?}"),
+    }
     h.every_tab();
 
     // Exports credit the pack.
@@ -1644,6 +1928,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("jobs.rs"),
         include_str!("keys.rs"),
         include_str!("lib.rs"),
+        include_str!("live_pattern.rs"),
         include_str!("loop_inspector.rs"),
         include_str!("menu.rs"),
         include_str!("mixer.rs"),

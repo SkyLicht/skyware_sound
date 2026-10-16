@@ -91,6 +91,8 @@ pub struct Workspace {
     pub lanes: Lanes,
     /// How the piano roll looks.
     pub piano: PianoPrefs,
+    /// Whether the pattern editor shows its step grid.
+    pub pattern_grid: bool,
 }
 
 impl Default for Workspace {
@@ -103,6 +105,7 @@ impl Default for Workspace {
             recent: Vec::new(),
             lanes: Lanes::default(),
             piano: PianoPrefs::default(),
+            pattern_grid: false,
         };
         w.apply();
         w
@@ -142,6 +145,7 @@ struct SavedRef<'a> {
     recent: &'a [PathBuf],
     lanes: Lanes,
     piano: PianoPrefs,
+    pattern_grid: bool,
 }
 
 impl Workspace {
@@ -267,8 +271,8 @@ impl Workspace {
         self.recent.retain(|p| p != path);
     }
 
-    /// The layout, the lanes shown, the piano roll's look and the recent
-    /// projects, for eframe's storage.
+    /// The layout, the lanes shown, the piano roll's look, the pattern
+    /// grid and the recent projects, for eframe's storage.
     pub fn saved_json(&mut self) -> String {
         self.apply();
         let saved = SavedRef {
@@ -276,6 +280,7 @@ impl Workspace {
             recent: &self.recent,
             lanes: self.lanes,
             piano: self.piano,
+            pattern_grid: self.pattern_grid,
         };
         serde_json::to_string(&saved).unwrap_or_default()
     }
@@ -307,6 +312,9 @@ impl Workspace {
         {
             piano.row_h = piano.row_h.clamp(ROW_MIN, ROW_MAX);
             self.piano = piano;
+        }
+        if let Some(grid) = value.get("pattern_grid").and_then(|g| g.as_bool()) {
+            self.pattern_grid = grid;
         }
         match value
             .get("dock")

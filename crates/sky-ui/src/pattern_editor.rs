@@ -4,17 +4,20 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use egui::text::{CCursor, CCursorRange};
 use egui::{
-    Align2, Color32, ComboBox, CornerRadius, DragValue, Id, RichText, Sense, Slider, Stroke,
-    TextEdit, Ui, vec2,
+    Align2, Button, Color32, ComboBox, Context, CornerRadius, DragValue, EventFilter, Frame, Id,
+    Key, Modifiers, Order, Rect, RichText, ScrollArea, Sense, Slider, Stroke, StrokeKind, TextEdit,
+    Ui, vec2,
 };
 use sky_core::{ClipId, PPQ, Ticks};
 use sky_model::command::VELOCITY;
 use sky_model::{Clip, ClipContent, Project, Swing, Track};
-use sky_pattern::Time;
+use sky_pattern::{Span, Time};
 
 use crate::actions::{self, AudioClipChange};
 use crate::app::App;
+use crate::live_pattern::{self, Grid, RESOLUTIONS, Row};
 use crate::theme;
 
 #[derive(Default)]
@@ -29,6 +32,49 @@ pub struct PatternState {
     pub controls: HashMap<String, String>,
     /// The clip and controls the control texts were loaded from.
     controls_synced: Option<(ClipId, BTreeMap<String, String>)>,
+    /// The names offered for the word before the caret, as last drawn.
+    completion: Option<Completion>,
+    /// The offered name the arrow keys are on.
+    pick: usize,
+    /// Escape hid the names for this text with the caret here.
+    dismissed: Option<(String, usize)>,
+    /// Where the names were drawn last frame.
+    popup: Option<Rect>,
+    /// The grid's step count, once picked.
+    pub grid_steps: Option<usize>,
+    /// Grid rows added or emptied on the grid, by clip: the text can't
+    /// hold a row with no hits.
+    pub grid_rows: Vec<(ClipId, String)>,
+}
+
+#[cfg(test)]
+impl PatternState {
+    /// The names offered for the word before the caret, and the one the
+    /// arrow keys are on.
+    pub fn offered(&self) -> (&[String], usize) {
+        match &self.completion {
+            Some(c) => (&c.names, self.pick),
+            None => (&[], 0),
+        }
+    }
+}
+
+/// Names that complete the word before the caret.
+#[derive(Clone, Debug, PartialEq)]
+struct Completion {
+    /// Where the word starts, in characters.
+    start: usize,
+    caret: usize,
+    names: Vec<String>,
+}
+
+/// Moves the text box's caret to character `caret`.
+fn set_caret(ctx: &Context, id: Id, caret: usize) {
+    let mut state = TextEdit::load_state(ctx, id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+    TextEdit::store_state(ctx, id, state);
 }
 
 pub fn clip_editor(app: &mut App, ui: &mut Ui) {
@@ -59,8 +105,13 @@ pub fn clip_editor(app: &mut App, ui: &mut Ui) {
             controls,
             swing,
         } => {
-            pattern_ui(app, ui, project, clip, source, *seed, *cycle);
-            groove_ui(app, ui, track, clip, controls, *swing);
+            ScrollArea::vertical()
+                .id_salt(("pattern_scroll", clip.id))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    pattern_ui(app, ui, project, track, clip, source, *seed, *cycle);
+                    groove_ui(app, ui, track, clip, controls, *swing);
+                });
         }
         ClipContent::Steps(steps) => crate::step_editor::show(app, ui, track, clip, steps),
         ClipContent::Audio {
@@ -154,8 +205,29 @@ fn clip_header(app: &mut App, ui: &mut Ui, project: &Project, track: &Track, cli
 /// The pattern's parse result, for the status line.
 #[derive(Debug)]
 pub enum ParseStatus {
-    Ok { events: usize },
-    Error { message: String, column: usize },
+    Ok {
+        events: usize,
+    },
+    Error {
+        message: String,
+        /// 1-based, counted in lines of the text.
+        line: usize,
+        column: usize,
+    },
+}
+
+impl ParseStatus {
+    /// Where the error is, as "Line 2, column 5", or "Column 5" in one-line
+    /// text.
+    fn place(&self, lines: usize) -> String {
+        match self {
+            ParseStatus::Error { line, column, .. } if lines > 1 => {
+                format!("Line {line}, column {column}")
+            }
+            ParseStatus::Error { column, .. } => format!("Column {column}"),
+            ParseStatus::Ok { .. } => String::new(),
+        }
+    }
 }
 
 pub fn parse_status(source: &str, seed: u64) -> ParseStatus {
@@ -166,9 +238,48 @@ pub fn parse_status(source: &str, seed: u64) -> ParseStatus {
                 .len(),
         },
         Err(e) => ParseStatus::Error {
+            line: source[..e.offset.min(source.len())].matches('\n').count() + 1,
             message: e.message,
             column: e.column,
         },
+    }
+}
+
+/// Where in the clip's pattern the playhead is, in cycles, while playing.
+fn playing_at(app: &App, clip: &Clip, cycle: Ticks) -> Option<f64> {
+    if !app.transport.playing {
+        return None;
+    }
+    live_pattern::cycle_at(clip, cycle, app.transport.position_ticks)
+}
+
+/// The atoms of a pattern clip sounding now, as byte spans of its source:
+/// none unless playing, or while the box holds text that isn't what plays.
+#[cfg(test)]
+pub fn lit_atoms(app: &App, clip: ClipId) -> Vec<Span> {
+    let project = app.session.project();
+    let Ok((_, clip)) = project.find_clip(clip) else {
+        return Vec::new();
+    };
+    match &clip.content {
+        ClipContent::Pattern {
+            source,
+            seed,
+            cycle,
+            ..
+        } => sounding_atoms(app, clip, source, *seed, *cycle),
+        _ => Vec::new(),
+    }
+}
+
+fn sounding_atoms(app: &App, clip: &Clip, source: &str, seed: u64, cycle: Ticks) -> Vec<Span> {
+    let at = playing_at(app, clip, cycle);
+    match (at, sky_pattern::parse(source)) {
+        (Some(at), Ok(p)) if app.pattern.text == source => live_pattern::sounding(&p, at, seed)
+            .into_iter()
+            .map(|e| e.source)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -177,30 +288,175 @@ fn pattern_ui(
     app: &mut App,
     ui: &mut Ui,
     project: &Project,
+    track: &Track,
     clip: &Clip,
     source: &str,
     seed: u64,
     cycle: Ticks,
 ) {
+    let ctx = ui.ctx().clone();
     let text_id = Id::new(("pattern_text", clip.id));
-    let focused = ui.ctx().memory(|m| m.has_focus(text_id));
+    let focused = ctx.memory(|m| m.has_focus(text_id));
     let current = (source.to_string(), seed, cycle);
     let st = &mut app.pattern;
+    if st.clip != Some(clip.id) {
+        st.completion = None;
+        st.dismissed = None;
+        st.grid_steps = None;
+    }
     if st.clip != Some(clip.id) || (!focused && st.synced.as_ref() != Some(&current)) {
         st.clip = Some(clip.id);
         st.text = source.to_string();
         st.synced = Some(current);
     }
+    if !focused {
+        st.completion = None;
+    }
+
+    // Keys the box would otherwise take: Ctrl+Enter applies, and while
+    // names are offered the arrows pick one, Tab takes it and Escape hides
+    // them.
+    let mut apply = false;
+    if focused {
+        apply = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
+        if let Some(c) = st.completion.clone() {
+            let (up, down, tab, escape) = ui.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(Modifiers::NONE, Key::Tab),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                )
+            });
+            let n = c.names.len().max(1);
+            if down {
+                st.pick = (st.pick + 1) % n;
+            }
+            if up {
+                st.pick = (st.pick + n - 1) % n;
+            }
+            if escape {
+                st.dismissed = Some((st.text.clone(), c.caret));
+                st.completion = None;
+            } else if tab && let Some(name) = c.names.get(st.pick.min(n - 1)) {
+                let caret = live_pattern::complete(&mut st.text, c.start, c.caret, name);
+                set_caret(&ctx, text_id, caret);
+                st.completion = None;
+            }
+        }
+    }
+    let offering = st.completion.is_some();
+
+    // The atoms sounding now, while the text is what plays.
+    let at = playing_at(app, clip, cycle);
+    let lit = sounding_atoms(app, clip, source, seed, cycle);
+    let font = theme::mono(15.0);
+    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+        let text = buf.as_str();
+        let error = sky_pattern::parse(text)
+            .err()
+            .map(|e| e.offset..e.offset + e.len);
+        let lit: &[Span] = if text == source { &lit } else { &[] };
+        let mut job = live_pattern::layout(text, &font, lit, error);
+        job.wrap.max_width = wrap;
+        ui.ctx().fonts_mut(|f| f.layout_job(job))
+    };
 
     ui.label(RichText::new("Pattern").color(theme::TEXT_WEAK));
-    let resp = ui.add(
-        TextEdit::singleline(&mut app.pattern.text)
-            .id(text_id)
-            .font(theme::mono(15.0))
-            .desired_width(f32::INFINITY)
-            .hint_text("bd*4, ~ sd ~ sd, hh*8"),
-    );
+    let out = TextEdit::multiline(&mut app.pattern.text)
+        .id(text_id)
+        .font(theme::mono(15.0))
+        .desired_width(f32::INFINITY)
+        .desired_rows(2)
+        .event_filter(EventFilter {
+            tab: offering,
+            escape: offering,
+            horizontal_arrows: true,
+            vertical_arrows: true,
+        })
+        .hint_text("bd*4, ~ sd ~ sd, hh*8")
+        .layouter(&mut layouter)
+        .show(ui);
+    let has_focus = out.response.response.has_focus();
+    let lost = out.response.response.lost_focus();
+
+    // Offer the track's sound names for the word before the caret.
+    let names = live_pattern::sound_names(track);
+    let st = &mut app.pattern;
+    let caret = out
+        .cursor_range
+        .filter(|r| r.is_empty() && has_focus)
+        .map(|r| r.primary.index.0);
+    let next = caret.and_then(|caret| {
+        let (start, word) = live_pattern::word_before(&st.text, caret)?;
+        if st.dismissed.as_ref() == Some(&(st.text.clone(), caret)) {
+            return None;
+        }
+        let names = live_pattern::completions(&word, &names);
+        (!names.is_empty()).then_some(Completion {
+            start,
+            caret,
+            names,
+        })
+    });
+    if next.as_ref().map(|c| &c.names) != st.completion.as_ref().map(|c| &c.names) {
+        st.pick = 0;
+    }
+    st.completion = next;
+    // A press on the names takes the focus from the box; that is not the
+    // end of the edit.
+    let over_names = st
+        .popup
+        .zip(ui.input(|i| i.pointer.interact_pos()))
+        .is_some_and(|(r, p)| r.contains(p));
+    // The box gives up the focus when the press ends, after the name is
+    // taken, so the names' place is kept until then.
+    if !ui.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+        st.popup = None;
+    }
+    if lost && over_names {
+        ctx.memory_mut(|m| m.request_focus(text_id));
+    }
+    if let Some(c) = st.completion.clone() {
+        let caret_rect = out.galley.pos_from_cursor(CCursor::new(c.caret));
+        let at = out.galley_pos + caret_rect.left_bottom().to_vec2() + vec2(0.0, 2.0);
+        let mut taken = None;
+        let area = egui::Area::new(Id::new(("pattern_names", clip.id)))
+            .order(Order::Foreground)
+            .fixed_pos(at)
+            .show(&ctx, |ui| {
+                Frame::popup(ui.style()).show(ui, |ui| {
+                    for (i, name) in c.names.iter().enumerate() {
+                        let r = ui.add(
+                            Button::selectable(
+                                i == st.pick,
+                                RichText::new(name).font(theme::mono(13.0)),
+                            )
+                            .min_size(vec2(120.0, 0.0)),
+                        );
+                        if r.is_pointer_button_down_on() {
+                            taken = Some(name.clone());
+                        }
+                    }
+                    ui.label(
+                        RichText::new("Tab completes · Esc hides")
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+            });
+        st.popup = Some(area.response.rect);
+        if let Some(name) = taken {
+            let caret = live_pattern::complete(&mut st.text, c.start, c.caret, &name);
+            set_caret(&ctx, text_id, caret);
+            ctx.memory_mut(|m| m.request_focus(text_id));
+            st.completion = None;
+        }
+    }
+
     let status = parse_status(&app.pattern.text, seed);
+    let lines = app.pattern.text.lines().count();
+    let changed = app.pattern.text != source;
     ui.horizontal(|ui| match &status {
         ParseStatus::Ok { events } => {
             ui.label(
@@ -210,28 +466,21 @@ fn pattern_ui(
                 ))
                 .color(theme::OK),
             );
-            if app.pattern.text != source {
+            if changed {
                 ui.label(
-                    RichText::new("Press Enter to apply")
+                    RichText::new("Ctrl+Enter or click away to apply")
                         .small()
                         .color(theme::TEXT_DIM),
                 );
             }
         }
-        ParseStatus::Error { message, column } => {
-            ui.label(RichText::new(format!("Column {column}: {message}")).color(theme::ERROR));
+        ParseStatus::Error { message, .. } => {
+            ui.label(
+                RichText::new(format!("{}: {message}", status.place(lines))).color(theme::ERROR),
+            );
         }
     });
-    if let ParseStatus::Error { column, .. } = &status {
-        // A caret under the offending column, in the same monospace font.
-        let caret = format!("{}^", " ".repeat(column.saturating_sub(1)));
-        ui.label(
-            RichText::new(caret)
-                .font(theme::mono(15.0))
-                .color(theme::ERROR),
-        );
-    }
-    if resp.lost_focus() && app.pattern.text != source {
+    if (apply || (lost && !over_names)) && changed {
         match &status {
             ParseStatus::Ok { .. } => {
                 let text = app.pattern.text.clone();
@@ -240,8 +489,11 @@ fn pattern_ui(
                     app.pattern.synced = Some((text, seed, cycle));
                 }
             }
-            ParseStatus::Error { message, column } => {
-                app.error(format!("Pattern not applied: {message} at column {column}"));
+            ParseStatus::Error { message, .. } => {
+                app.error(format!(
+                    "Pattern not applied: {message} at {}",
+                    status.place(lines).to_lowercase()
+                ));
             }
         }
     }
@@ -285,20 +537,27 @@ fn pattern_ui(
         if app.pattern.text != source && ui.button("Revert").clicked() {
             app.pattern.text = source.to_string();
         }
+        ui.separator();
+        ui.checkbox(&mut app.workspace.pattern_grid, "Step grid")
+            .on_hover_text("Click steps on and off instead of typing");
     });
+    if app.workspace.pattern_grid {
+        grid_ui(app, ui, track, clip, source, seed, cycle, at);
+    }
     ui.add_space(4.0);
     pattern_preview(
         ui,
         &app.pattern.text,
         seed,
         (clip.length as f64 / cycle.max(1) as f64).ceil() as i64,
+        at.filter(|_| app.pattern.text == source),
     );
     ui.collapsing("Syntax", |ui| {
         for (code, what) in [
             ("bd sd hh", "steps share the cycle equally"),
             ("~", "a rest"),
             ("[sd sd]", "a group in one step"),
-            ("bd*2, hh*4", "layers played together"),
+            ("bd*2, hh*4", "layers played together; a new line works too"),
             ("<c e g>", "one per cycle, in turn"),
             ("hh*8?", "drop events at random"),
             ("bd(3,8)", "Euclidean rhythm"),
@@ -310,6 +569,185 @@ fn pattern_ui(
             });
         }
     });
+}
+
+const CELL_H: f32 = 18.0;
+const CELL_GAP: f32 = 2.0;
+const ROW_LABEL_W: f32 = 64.0;
+
+/// The step grid: one row per sound or note, a click turns a step on or
+/// off, and each click writes the pattern again as one undo step.
+#[allow(clippy::too_many_arguments)]
+fn grid_ui(
+    app: &mut App,
+    ui: &mut Ui,
+    track: &Track,
+    clip: &Clip,
+    source: &str,
+    seed: u64,
+    cycle: Ticks,
+    at: Option<f64>,
+) {
+    let note = |ui: &mut Ui, text: &str| {
+        ui.label(RichText::new(text).small().color(theme::TEXT_DIM));
+    };
+    if app.pattern.text != source {
+        note(ui, "Apply or revert what you typed to use the grid");
+        return;
+    }
+    let mut grid = match live_pattern::grid_of(source, seed, app.pattern.grid_steps) {
+        Ok(g) => g,
+        Err(why) => {
+            note(ui, why);
+            return;
+        }
+    };
+    for (_, name) in app
+        .pattern
+        .grid_rows
+        .iter()
+        .filter(|(id, _)| *id == clip.id)
+    {
+        if !grid.rows.iter().any(|r| r.name == *name) {
+            grid.rows.push(Row {
+                name: name.clone(),
+                hits: vec![None; grid.steps],
+            });
+        }
+    }
+    let steps = grid.steps;
+    let mut changed: Option<Grid> = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Steps").color(theme::TEXT_WEAK));
+        ComboBox::from_id_salt(("grid_steps", clip.id))
+            .selected_text(steps.to_string())
+            .width(48.0)
+            .show_ui(ui, |ui| {
+                for s in RESOLUTIONS {
+                    if live_pattern::grid_fits(source, seed, s)
+                        && ui.selectable_label(s == steps, s.to_string()).clicked()
+                    {
+                        app.pattern.grid_steps = Some(s);
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Steps per cycle; only the counts that keep every hit are offered");
+        let names: Vec<String> = live_pattern::row_names(track)
+            .into_iter()
+            .filter(|n| !grid.rows.iter().any(|r| r.name.eq_ignore_ascii_case(n)))
+            .collect();
+        let mut added = None;
+        ComboBox::from_id_salt(("grid_add", clip.id))
+            .selected_text("Add row…")
+            .width(100.0)
+            .height(300.0)
+            .show_ui(ui, |ui| {
+                for n in &names {
+                    if ui.selectable_label(false, n).clicked() {
+                        added = Some(n.clone());
+                    }
+                }
+            });
+        if let Some(n) = added {
+            app.pattern.grid_rows.push((clip.id, n));
+        }
+    });
+
+    let playing = at.map(|a| ((a.fract() * steps as f64).floor() as usize).min(steps - 1));
+    let room = ui.available_width() - ROW_LABEL_W - 28.0;
+    let cell_w = (room / steps as f32 - CELL_GAP).clamp(8.0, 30.0);
+    let color = theme::track_color(track.color);
+    for (ri, row) in grid.rows.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = CELL_GAP;
+            ui.add_sized(
+                vec2(ROW_LABEL_W, CELL_H),
+                egui::Label::new(RichText::new(&row.name).font(theme::mono(13.0))).truncate(),
+            );
+            for step in 0..steps {
+                let (rect, _) = ui.allocate_exact_size(vec2(cell_w, CELL_H), Sense::hover());
+                let id = Id::new(("grid_cell", clip.id, ri, step));
+                let resp = ui.interact(rect, id, Sense::click());
+                let (on, starts) = row.at(step);
+                let group = step * 4 / steps;
+                let lane = if group % 2 == 0 {
+                    theme::LANE
+                } else {
+                    theme::LANE_ALT
+                };
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    CornerRadius::same(2),
+                    if starts { color } else { lane },
+                );
+                // A held step is a bar from the hit before it.
+                if on && !starts {
+                    let bar = Rect::from_min_max(
+                        rect.left_center() - vec2(CELL_GAP, 2.0),
+                        rect.right_center() + vec2(0.0, 2.0),
+                    );
+                    painter.rect_filled(bar, CornerRadius::ZERO, color.gamma_multiply(0.7));
+                }
+                if playing == Some(step) {
+                    painter.rect_stroke(
+                        rect,
+                        CornerRadius::same(2),
+                        Stroke::new(1.5, theme::ACCENT),
+                        StrokeKind::Inside,
+                    );
+                } else if resp.hovered() {
+                    painter.rect_stroke(
+                        rect,
+                        CornerRadius::same(2),
+                        Stroke::new(1.0, theme::TEXT_WEAK),
+                        StrokeKind::Inside,
+                    );
+                }
+                if resp.clicked() {
+                    let mut g = grid.clone();
+                    g.rows[ri].toggle(step);
+                    changed = Some(g);
+                }
+            }
+            if ui
+                .small_button("×")
+                .on_hover_text("Remove this row")
+                .clicked()
+            {
+                let mut g = grid.clone();
+                g.rows.remove(ri);
+                changed = Some(g);
+            }
+        });
+    }
+    if grid.rows.is_empty() {
+        note(ui, "Add a row to start a beat");
+    }
+    if let Some(g) = changed {
+        let text = live_pattern::grid_text(&g);
+        app.pattern.grid_steps = Some(g.steps);
+        // Removing an empty row leaves the text as it is.
+        if text != live_pattern::grid_text(&grid) {
+            let r = actions::set_pattern(&app.session, clip.id, &text, seed, cycle, None);
+            if app.report(r).is_some() {
+                app.pattern.text = text.clone();
+                app.pattern.synced = Some((text, seed, cycle));
+            }
+        }
+        // Rows stay on the grid when their last hit goes, or an undo takes
+        // it back, though the text has no place for them; × removes them.
+        let rows = &mut app.pattern.grid_rows;
+        rows.retain(|(id, n)| *id != clip.id || g.rows.iter().any(|r| r.name == *n));
+        for r in &g.rows {
+            if r.hits.iter().all(Option::is_none)
+                && !rows.iter().any(|(id, n)| *id == clip.id && *n == r.name)
+            {
+                rows.push((clip.id, r.name.clone()));
+            }
+        }
+    }
 }
 
 /// A number as a pattern writes it: at most three decimals, no trailing
@@ -525,8 +963,9 @@ fn groove_ui(
     }
 }
 
-/// A strip showing the events of the first few cycles.
-fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64) {
+/// A strip showing the events of the first few cycles, and the playhead
+/// while it is in them.
+fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64, at: Option<f64>) {
     let Ok(pattern) = sky_pattern::parse(text) else {
         return;
     };
@@ -536,7 +975,7 @@ fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::same(3), theme::LANE);
     let cw = rect.width() / cycles as f32;
-    let mut notes: Vec<(f32, f32, u8, String)> = Vec::new();
+    let mut notes: Vec<(f32, f32, u8, String, bool)> = Vec::new();
     for c in 0..cycles {
         let x0 = rect.left() + c as f32 * cw;
         if c > 0 {
@@ -561,11 +1000,15 @@ fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64) {
                 sky_pattern::Value::Note(n) => sky_core::music::note_name(*n),
                 sky_pattern::Value::Number(_) => format_number(e.value.number().unwrap_or(0.0)),
             };
+            let sounding = at.is_some_and(|a| {
+                live_pattern::cycles(e.begin) <= a && a < live_pattern::cycles(e.end)
+            });
             notes.push((
                 x0 + b * cw,
                 x0 + en.min(1.0) * cw,
                 e.value.midi_note().unwrap_or(60),
                 label,
+                sounding,
             ));
         }
     }
@@ -578,14 +1021,19 @@ fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64) {
     let rows = lanes.len().max(1) as f32;
     let top = rect.top() + 16.0;
     let h = ((rect.bottom() - 3.0 - top) / rows).max(2.0);
-    for (x0, x1, note, label) in notes {
+    for (x0, x1, note, label, sounding) in notes {
         let row = lanes.iter().position(|n| *n == note).unwrap_or(0) as f32;
         let y = rect.bottom() - 3.0 - (row + 1.0) * h;
         let r = egui::Rect::from_min_max(
             egui::pos2(x0 + 1.0, y + 1.0),
             egui::pos2((x1 - 1.0).max(x0 + 3.0), y + h - 1.0),
         );
-        painter.rect_filled(r, CornerRadius::same(2), theme::ACCENT.gamma_multiply(0.8));
+        let fill = if sounding {
+            theme::lighten(theme::ACCENT, 0.45)
+        } else {
+            theme::ACCENT.gamma_multiply(0.8)
+        };
+        painter.rect_filled(r, CornerRadius::same(2), fill);
         if r.width() > 22.0 && h >= 9.0 {
             painter.with_clip_rect(r).text(
                 egui::pos2(r.left() + 2.0, r.center().y),
@@ -595,6 +1043,10 @@ fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64) {
                 Color32::BLACK,
             );
         }
+    }
+    if let Some(a) = at.filter(|a| *a < cycles as f64) {
+        let x = rect.left() + a as f32 * cw;
+        painter.vline(x, rect.y_range(), Stroke::new(1.5, theme::TEXT));
     }
 }
 
