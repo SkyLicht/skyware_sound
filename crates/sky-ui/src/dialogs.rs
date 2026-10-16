@@ -36,6 +36,8 @@ pub enum PathPurpose {
     GameFolder,
     /// A folder of samples for the browser.
     BrowseFolder,
+    /// Where Help > Keyboard shortcuts saves its web page.
+    ShortcutsPage,
 }
 
 impl PathPurpose {
@@ -49,6 +51,7 @@ impl PathPurpose {
             PathPurpose::SoundPack => "Sound pack folder",
             PathPurpose::GameFolder => "Game export folder",
             PathPurpose::BrowseFolder => "Add a folder to the browser",
+            PathPurpose::ShortcutsPage => "Save the keyboard shortcuts",
         }
     }
 
@@ -64,6 +67,7 @@ impl PathPurpose {
             PathPurpose::SoundPack => "A folder with a strudel.json sample map in it",
             PathPurpose::GameFolder => "Your game's audio folder, such as assets/audio",
             PathPurpose::BrowseFolder => "A folder of WAV, FLAC, OGG or MP3 samples",
+            PathPurpose::ShortcutsPage => "A web page ending in .html",
         }
     }
 }
@@ -234,7 +238,7 @@ fn existing_dir(path: &Path) -> PathBuf {
 
 fn native_pick(purpose: PathPurpose, default: &Path) -> Option<PathBuf> {
     let (dir, name) = match purpose {
-        PathPurpose::SaveAs | PathPurpose::ExportWavFile => (
+        PathPurpose::SaveAs | PathPurpose::ExportWavFile | PathPurpose::ShortcutsPage => (
             existing_dir(default.parent().unwrap_or(default)),
             default
                 .file_name()
@@ -259,6 +263,7 @@ fn native_pick(purpose: PathPurpose, default: &Path) -> Option<PathBuf> {
             .add_filter("Audio", &["wav", "flac", "ogg", "mp3"])
             .pick_file(),
         PathPurpose::ExportWavFile => d.add_filter("WAV", &["wav"]).save_file(),
+        PathPurpose::ShortcutsPage => d.add_filter("Web page", &["html"]).save_file(),
     }
 }
 
@@ -299,6 +304,7 @@ impl App {
                 .last()
                 .and_then(|p| p.parent().map(Path::to_path_buf))
                 .unwrap_or_else(default_dir),
+            PathPurpose::ShortcutsPage => default_dir().join("Skyware Sound shortcuts.html"),
         }
     }
 
@@ -464,6 +470,19 @@ impl App {
                 if !self.browser.add_folder(path.clone()) {
                     self.info(format!("{} is in the browser already", path.display()));
                 }
+            }
+            PathPurpose::ShortcutsPage => {
+                let path = with_extension(path, "html");
+                let written = path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&path, crate::keys::html()));
+                if let Err(e) = written {
+                    let msg = format!("Could not save {}: {e}", path.display());
+                    self.error(msg.clone());
+                    return Some(msg);
+                }
+                self.info(format!("Saved the shortcuts to {}", path.display()));
             }
         }
         None

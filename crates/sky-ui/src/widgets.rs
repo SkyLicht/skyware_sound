@@ -5,11 +5,50 @@
 use std::collections::HashMap;
 
 use egui::{
-    Color32, CornerRadius, Id, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
-    pos2, vec2,
+    Color32, CornerRadius, Id, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui,
+    Vec2, pos2, vec2,
 };
 
 use crate::theme;
+
+/// A rectangle dragged out over empty space to select what it touches.
+#[derive(Clone, Debug)]
+pub struct Marquee<T> {
+    /// Where the drag began and where the pointer is now, on screen.
+    pub from: Pos2,
+    pub to: Pos2,
+    /// What was selected before, back again if Escape cancels.
+    pub before: Vec<T>,
+    /// What stays selected: the same, when Shift or Ctrl was held.
+    pub kept: Vec<T>,
+}
+
+impl<T: Clone> Marquee<T> {
+    pub fn new(from: Pos2, before: Vec<T>, adding: bool) -> Self {
+        let kept = if adding { before.clone() } else { Vec::new() };
+        Self {
+            from,
+            to: from,
+            before,
+            kept,
+        }
+    }
+
+    pub fn rect(&self) -> Rect {
+        Rect::from_two_pos(self.from, self.to)
+    }
+
+    pub fn paint(&self, painter: &Painter) {
+        let r = self.rect();
+        painter.rect_filled(r, CornerRadius::ZERO, theme::ACCENT.gamma_multiply(0.12));
+        painter.rect_stroke(
+            r,
+            CornerRadius::ZERO,
+            Stroke::new(1.0, theme::ACCENT),
+            StrokeKind::Inside,
+        );
+    }
+}
 
 /// Coalescing keys for gestures.
 ///

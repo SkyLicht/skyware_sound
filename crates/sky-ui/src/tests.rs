@@ -23,9 +23,10 @@ use crate::actions::{self, NewTrack};
 use crate::app::{Action, App, Tab};
 use crate::audition::{ButtonState, PreviewKey};
 use crate::dialogs::PathPurpose;
+use crate::edit::Copied;
 use crate::waveform::Peaks;
 use crate::widgets::Gestures;
-use crate::{UiConfig, arrange, game, menu, palette, pattern_editor, sounds, theme};
+use crate::{UiConfig, arrange, game, keys, menu, palette, pattern_editor, sounds, theme};
 
 /// The app in a bare egui context, fed with synthetic input.
 struct Harness {
@@ -44,6 +45,8 @@ struct Harness {
     /// Labelled widgets and where they were drawn last frame, once
     /// [`accessible`](Self::accessible) is on.
     access: Vec<(String, Rect, Role)>,
+    /// The text last put on the system clipboard.
+    copied: Option<String>,
 }
 
 impl Harness {
@@ -72,6 +75,7 @@ impl Harness {
             dropped: Vec::new(),
             hovered: Vec::new(),
             access: Vec::new(),
+            copied: None,
         };
         h.frames(3);
         h
@@ -122,6 +126,11 @@ impl Harness {
         let mut out = self.ctx.run_ui(input, |ui| app.frame(ui));
         // No renderer here to take the font atlas.
         out.textures_delta.clear();
+        for command in &out.platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = command {
+                self.copied = Some(text.clone());
+            }
+        }
         if let Some(tree) = out.platform_output.accesskit_update.take() {
             self.access = tree
                 .nodes
@@ -478,10 +487,8 @@ fn actions_change_the_project_and_undo_restores_it() {
     assert_eq!(h.clip(clip).length, bar);
     assert_eq!(h.app.sel.clip, Some(clip));
 
-    // Move it two bars right.
-    let r = actions::move_clip(&h.app.session, clip, track, bar * 2);
-    assert!(r.is_ok(), "{r:?}");
-    h.frames(2);
+    // Move it two bars right, as Shift+Right twice does.
+    h.run(Action::NudgeBars(2));
     assert_eq!(h.clip(clip).start, bar * 2);
 
     // Set a parameter.
@@ -1592,8 +1599,10 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("audition.rs"),
         include_str!("browser.rs"),
         include_str!("dialogs.rs"),
+        include_str!("edit.rs"),
         include_str!("game.rs"),
         include_str!("jobs.rs"),
+        include_str!("keys.rs"),
         include_str!("lib.rs"),
         include_str!("menu.rs"),
         include_str!("mixer.rs"),
@@ -2728,4 +2737,469 @@ fn the_menu_bar_opens_and_runs_what_it_lists() {
     }
     h.ctx.set_zoom_factor(1.0);
     h.every_tab();
+}
+
+fn tick_x(h: &Harness, tick: i64) -> f32 {
+    h.app.arrange.x_of(tick as f64)
+}
+
+fn lane_rect(h: &Harness, track: sky_core::TrackId) -> Rect {
+    h.app
+        .arrange
+        .lanes
+        .iter()
+        .find(|(id, _)| *id == track)
+        .map(|(_, r)| *r)
+        .expect("lane visible")
+}
+
+#[test]
+fn a_marquee_selects_clips_that_then_move_and_delete_together() {
+    let mut h = Harness::demo();
+    h.show_bars(12);
+    let bar = h.project().ticks_per_bar();
+    let bar_px = h.app.arrange.px_per_tick * bar as f32;
+    let drums = h.track_named("Drums").clips[0].id;
+    let bass = h.track_named("Bass");
+    let pad = h.track_named("Pad");
+    let (b, p) = (bass.clips[0].id, pad.clips[0].id);
+
+    // From empty space at bar 7 on the pad lane, up and left into the bass
+    // clip: both clips are picked, the drums above are not.
+    let from = pos2(tick_x(&h, bar * 6), lane_rect(&h, pad.id).center().y);
+    let to = pos2(tick_x(&h, bar * 2), lane_rect(&h, bass.id).center().y);
+    h.drag(from, to);
+    assert!(h.app.arrange.marquee.is_none());
+    assert_eq!(h.app.sel.clips.len(), 2);
+    assert!(h.app.sel.clips.contains(&b) && h.app.sel.clips.contains(&p));
+    assert!(h.app.sel.clip.is_some_and(|c| c == b || c == p));
+
+    // Dragging one moves both, as one undo step.
+    let history = h.history_len();
+    let r = arrange::clip_screen_rect(&h.app, b).expect("clip visible");
+    let from = pos2(r.left() + 40.0, r.center().y);
+    h.drag(from, from + vec2(bar_px, 0.0));
+    assert_eq!(h.clip(b).start, bar);
+    assert_eq!(h.clip(p).start, bar);
+    assert_eq!(h.clip(drums).start, 0);
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Move 2 clips"));
+
+    // Shift-click takes one out, and Ctrl-click puts it back.
+    let r = arrange::clip_screen_rect(&h.app, p).expect("clip visible");
+    h.set_modifiers(Modifiers::SHIFT);
+    h.click(r.center());
+    assert_eq!(h.app.sel.clips, [b]);
+    h.set_modifiers(COMMAND);
+    h.click(r.center());
+    h.set_modifiers(Modifiers::NONE);
+    h.frame();
+    assert_eq!(h.app.sel.clips.len(), 2);
+
+    // Ctrl+A takes every clip; Delete removes them in one step.
+    h.key(Key::A, COMMAND);
+    assert_eq!(h.app.sel.clips.len(), 3);
+    h.key(Key::Delete, Modifiers::NONE);
+    assert!(h.project().tracks.iter().all(|t| t.clips.is_empty()));
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Delete 3 clips"));
+    h.key(Key::Z, COMMAND);
+    assert_eq!(h.project().content_end(), bar * 5);
+
+    // Escape selects nothing, and so does a click on an empty lane.
+    h.key(Key::A, COMMAND);
+    h.key(Key::Escape, Modifiers::NONE);
+    assert!(h.app.sel.clips.is_empty());
+    h.key(Key::A, COMMAND);
+    h.click(pos2(tick_x(&h, bar * 8), lane_rect(&h, pad.id).center().y));
+    assert!(h.app.sel.clips.is_empty());
+
+    // Escape during a marquee puts the selection back as it was.
+    let r = arrange::clip_screen_rect(&h.app, b).expect("clip visible");
+    h.click(r.center());
+    let from = pos2(tick_x(&h, bar * 7), lane_rect(&h, pad.id).center().y);
+    h.move_to(from);
+    h.pointer(from, true);
+    h.frame();
+    for step in 1..=5 {
+        h.move_to(from.lerp(
+            pos2(tick_x(&h, 0), lane_rect(&h, bass.id).top()),
+            step as f32 / 5.0,
+        ));
+    }
+    assert_eq!(h.app.sel.clips.len(), 2, "the marquee picks as it goes");
+    h.key(Key::Escape, Modifiers::NONE);
+    assert_eq!(h.app.sel.clips, [b]);
+    h.pointer(from, false);
+    h.frames(2);
+    assert_eq!(h.app.sel.clips, [b]);
+}
+
+#[test]
+fn clips_are_duplicated_copied_cut_and_pasted_at_the_playhead() {
+    let mut h = Harness::with_engine(demo_project());
+    h.show_bars(24);
+    let bar = h.project().ticks_per_bar();
+    let bass = h.track_named("Bass");
+    let clip = bass.clips[0].id;
+    let r = arrange::clip_screen_rect(&h.app, clip).expect("clip visible");
+    h.click(r.center());
+    assert_eq!(h.app.sel.clips, [clip]);
+
+    // Ctrl+D puts a copy right after, with notes of its own, and selects it.
+    h.key(Key::D, COMMAND);
+    let bass = h.track_named("Bass");
+    assert_eq!(bass.clips.len(), 2);
+    let dup = bass.clips.iter().find(|c| c.id != clip).expect("a copy");
+    assert_eq!(dup.start, bar * 4);
+    assert_eq!(h.app.sel.clips, [dup.id]);
+    let (ClipContent::Midi { notes: a }, ClipContent::Midi { notes: b }) =
+        (&h.clip(clip).content, &dup.content)
+    else {
+        panic!("MIDI clips");
+    };
+    assert_eq!(a.len(), b.len());
+    assert!(a.iter().all(|n| b.iter().all(|m| m.id != n.id)));
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Duplicate clip"));
+
+    // Copy puts JSON on the system clipboard as well.
+    h.key(Key::C, COMMAND);
+    let text = h.copied.clone().expect("copied to the system clipboard");
+    let Some(Copied::Clips { clips, .. }) = Copied::from_json(&text) else {
+        panic!("clips in {text}");
+    };
+    assert_eq!(clips.len(), 1);
+
+    // Paste goes at the playhead; again without moving it, right after.
+    arrange::seek(&mut h.app, bar * 8);
+    h.heard();
+    h.frames(2);
+    assert_eq!(h.app.transport.position_ticks.round() as i64, bar * 8);
+    h.key(Key::V, COMMAND);
+    h.key(Key::V, COMMAND);
+    let starts: Vec<i64> = h
+        .track_named("Bass")
+        .clips
+        .iter()
+        .map(|c| c.start)
+        .collect();
+    assert_eq!(starts, [0, bar * 4, bar * 8, bar * 12]);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Paste clip"));
+
+    // The system's Cut, as Ctrl+X arrives from the window, removes it.
+    h.events.push(Event::Cut);
+    h.frame();
+    let starts: Vec<i64> = h
+        .track_named("Bass")
+        .clips
+        .iter()
+        .map(|c| c.start)
+        .collect();
+    assert_eq!(starts, [0, bar * 4, bar * 8]);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Cut clip"));
+
+    // Clipboard text from another window pastes too, onto the selected
+    // track; an audio track cannot take a MIDI clip, so it goes back to
+    // the bass.
+    let pad = h.track_named("Pad");
+    h.app.sel.select_track(pad.id);
+    arrange::seek(&mut h.app, bar * 16);
+    h.heard();
+    h.frames(2);
+    h.app.edit.clipboard = None;
+    h.events.push(Event::Paste(text.clone()));
+    h.frame();
+    assert!(
+        h.track_named("Pad")
+            .clips
+            .iter()
+            .any(|c| c.start == bar * 16)
+    );
+    h.run(Action::AddTrack(NewTrack::Audio));
+    arrange::seek(&mut h.app, bar * 20);
+    h.heard();
+    h.frames(2);
+    h.events.push(Event::Paste(text));
+    h.frame();
+    assert!(
+        h.track_named("Bass")
+            .clips
+            .iter()
+            .any(|c| c.start == bar * 20)
+    );
+
+    // Other text pastes the app's own clipboard, which is empty here.
+    h.events.push(Event::Paste("hello".into()));
+    h.frame();
+    let notice = h.app.notice.as_ref().map(|n| n.text.clone());
+    assert_eq!(
+        notice.as_deref(),
+        Some("Nothing to paste yet: copy clips or notes first")
+    );
+
+    // Arrows nudge by the grid or a bar, and move clips between tracks.
+    let r = arrange::clip_screen_rect(&h.app, clip).expect("clip visible");
+    h.click(r.center());
+    h.key(Key::ArrowRight, Modifiers::NONE);
+    assert_eq!(h.clip(clip).start, PPQ);
+    h.key(Key::ArrowRight, Modifiers::SHIFT);
+    assert_eq!(h.clip(clip).start, PPQ + bar);
+    h.key(Key::ArrowLeft, Modifiers::SHIFT);
+    h.key(Key::ArrowLeft, Modifiers::SHIFT);
+    assert_eq!(h.clip(clip).start, 0, "not before the start");
+    h.key(Key::ArrowDown, Modifiers::NONE);
+    assert_eq!(h.project().find_clip(clip).expect("clip").0.id, pad.id);
+    h.key(Key::ArrowDown, Modifiers::NONE);
+    assert_eq!(h.project().find_clip(clip).expect("clip").0.id, pad.id);
+    let notice = h
+        .app
+        .notice
+        .as_ref()
+        .map(|n| n.text.clone())
+        .unwrap_or_default();
+    assert!(notice.contains("cannot hold"), "{notice}");
+    h.key(Key::ArrowUp, Modifiers::NONE);
+    assert_eq!(h.project().find_clip(clip).expect("clip").0.id, bass.id);
+}
+
+#[test]
+fn notes_are_selected_nudged_transposed_and_copied_in_the_piano_roll() {
+    let mut h = Harness::demo();
+    let pad = h.track_named("Pad");
+    let clip = pad.clips[0].id;
+    let bar = h.project().ticks_per_bar();
+    h.app.sel.select_clip(pad.id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    h.app.piano.top_pitch = 72.0;
+    h.frames(2);
+    let notes = |h: &Harness| match &h.clip(clip).content {
+        ClipContent::Midi { notes } => notes.clone(),
+        _ => panic!("a MIDI clip"),
+    };
+    let first: Vec<Note> = notes(&h).into_iter().filter(|n| n.start == 0).collect();
+    assert_eq!(first.len(), 3);
+    let total = notes(&h).len();
+    let rect = |h: &Harness, n: &Note| h.rect_of(Id::new(("note", clip, n.id)));
+
+    // A marquee from empty space above the notes takes the first chord.
+    let top = first
+        .iter()
+        .map(|n| rect(&h, n).top())
+        .fold(f32::MAX, f32::min);
+    let bottom = first
+        .iter()
+        .map(|n| rect(&h, n).bottom())
+        .fold(0.0, f32::max);
+    let right = rect(&h, &first[0]).right();
+    let from = pos2(right - 20.0, top - 30.0);
+    h.drag(from, pos2(right - 60.0, bottom + 2.0));
+    let mut chosen = h.app.sel.notes.clone();
+    chosen.sort();
+    let mut want: Vec<_> = first.iter().map(|n| n.id).collect();
+    want.sort();
+    assert_eq!(chosen, want);
+    assert_eq!(h.app.edit_focus(), crate::app::Focus::Editor);
+
+    let chord = |h: &Harness| -> Vec<Note> {
+        notes(h)
+            .into_iter()
+            .filter(|n| want.contains(&n.id))
+            .collect()
+    };
+    // Right nudges by the grid, Left brings it back, not past the start.
+    h.key(Key::ArrowRight, Modifiers::NONE);
+    assert!(chord(&h).iter().all(|n| n.start == PPQ / 4));
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Nudge notes"));
+    h.key(Key::ArrowLeft, Modifiers::NONE);
+    h.key(Key::ArrowLeft, Modifiers::NONE);
+    assert!(chord(&h).iter().all(|n| n.start == 0));
+
+    // Up and Down transpose; Shift moves by octaves.
+    let pitches = |h: &Harness| -> Vec<u8> {
+        let mut p: Vec<u8> = chord(h).iter().map(|n| n.pitch).collect();
+        p.sort_unstable();
+        p
+    };
+    let before = pitches(&h);
+    h.key(Key::ArrowUp, Modifiers::NONE);
+    h.key(Key::ArrowUp, Modifiers::SHIFT);
+    h.key(Key::ArrowDown, Modifiers::NONE);
+    let up: Vec<u8> = before.iter().map(|p| p + 12).collect();
+    assert_eq!(pitches(&h), up);
+    h.key(Key::ArrowDown, Modifiers::SHIFT);
+    assert_eq!(pitches(&h), before);
+
+    // Ctrl+D copies the chord to just after itself and selects the copy.
+    h.key(Key::D, COMMAND);
+    assert_eq!(notes(&h).len(), total + 3);
+    let copies: Vec<Note> = notes(&h)
+        .into_iter()
+        .filter(|n| h.app.sel.notes.contains(&n.id))
+        .collect();
+    assert_eq!(copies.len(), 3);
+    let length = first[0].length;
+    assert!(copies.iter().all(|n| n.start == length));
+    h.key(Key::Z, COMMAND);
+
+    // Ctrl+A and Escape.
+    h.key(Key::A, COMMAND);
+    assert_eq!(h.app.sel.notes.len(), total);
+    h.key(Key::Escape, Modifiers::NONE);
+    assert!(h.app.sel.notes.is_empty());
+
+    // Copy the chord and paste it at the playhead (the start here), then
+    // again right after.
+    h.app.sel.notes = want.clone();
+    h.key(Key::C, COMMAND);
+    h.key(Key::V, COMMAND);
+    h.key(Key::V, COMMAND);
+    let all = notes(&h);
+    assert_eq!(all.len(), total + 6);
+    assert_eq!(all.iter().filter(|n| n.start == 0).count(), 6);
+    assert_eq!(all.iter().filter(|n| n.start == length).count(), 3 + 3);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Paste 3 notes"));
+
+    // Cut takes them out; Delete is one step too.
+    h.key(Key::X, COMMAND);
+    assert_eq!(notes(&h).len(), total + 3);
+    h.key(Key::A, COMMAND);
+    h.key(Key::Delete, Modifiers::NONE);
+    assert!(notes(&h).is_empty());
+    h.key(Key::Z, COMMAND);
+    assert_eq!(notes(&h).len(), total + 3);
+
+    // Notes paste into another MIDI clip too, and the arrangement keys
+    // act on clips once it is clicked again.
+    let bass = h.track_named("Bass");
+    h.app.sel.select_clip(bass.id, bass.clips[0].id);
+    h.app.sel.focus = crate::app::Focus::Editor;
+    h.frames(2);
+    let before = bass.clips[0].clone();
+    h.key(Key::V, COMMAND);
+    let ClipContent::Midi { notes: after } = h.clip(before.id).content else {
+        panic!("MIDI");
+    };
+    let ClipContent::Midi { notes: was } = &before.content else {
+        panic!("MIDI");
+    };
+    assert_eq!(after.len(), was.len() + 3);
+    assert!(bar > 0);
+}
+
+#[test]
+fn one_key_command_table_drives_shortcuts_menus_palette_and_the_printed_list() {
+    use crate::keys::Scope;
+
+    // No key does two things in the same place.
+    let table = keys::table();
+    for (i, a) in table.iter().enumerate() {
+        for b in &table[i + 1..] {
+            let shared = a.keys.iter().any(|k| b.keys.contains(k));
+            let apart = matches!(
+                (a.scope, b.scope),
+                (Scope::Arrange, Scope::Editor) | (Scope::Editor, Scope::Arrange)
+            );
+            assert!(!shared || apart, "{} and {} share a key", a.label, b.label);
+        }
+        assert!(keys::GROUPS.contains(&a.group), "{}", a.group);
+    }
+
+    // Menus and the palette show the table's keys, and every key command
+    // can be found in one of them.
+    let h = Harness::demo();
+    let menus = menu::menus(&h.app);
+    let edit = menu_entries(&menus, "Edit");
+    let shortcut = |entries: &[menu::Entry], label: &str| {
+        entries
+            .iter()
+            .find_map(|e| match e {
+                menu::Entry::Item(it) if it.label == label => Some(it.shortcut.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no item {label}"))
+    };
+    assert_eq!(shortcut(edit, "Duplicate"), "Ctrl+D");
+    assert_eq!(shortcut(edit, "Redo"), "Ctrl+Shift+Z");
+    assert_eq!(
+        shortcut(submenu(edit, "Move the selection"), "Notes up an octave"),
+        "Shift+Up"
+    );
+    assert_eq!(shortcut(menu_entries(&menus, "View"), "Browser"), "Ctrl+B");
+    let palette = palette::entries(&h.app);
+    let copy = palette.iter().find(|e| e.label == "Copy").expect("Copy");
+    assert_eq!(copy.shortcut, "Ctrl+C");
+    fn actions(entries: &[menu::Entry], out: &mut Vec<Action>) {
+        for e in entries {
+            match e {
+                menu::Entry::Item(it) => out.push(it.action.clone()),
+                menu::Entry::Sub(_, list) => actions(list, out),
+                _ => {}
+            }
+        }
+    }
+    let mut offered: Vec<Action> = palette.into_iter().map(|e| e.action).collect();
+    for m in &menus {
+        actions(&m.entries, &mut offered);
+    }
+    for c in &table {
+        assert!(offered.contains(&c.action), "{} is in no menu", c.label);
+    }
+
+    // docs/keyboard-shortcuts.md is the table, printed.
+    let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/keyboard-shortcuts.md");
+    if std::env::var_os("UPDATE_SHORTCUTS").is_some() {
+        std::fs::write(&doc, keys::markdown()).expect("write the shortcuts");
+    }
+    let written = std::fs::read_to_string(&doc).unwrap_or_default();
+    assert_eq!(
+        written.replace("\r\n", "\n"),
+        keys::markdown(),
+        "docs/keyboard-shortcuts.md is out of date; run UPDATE_SHORTCUTS=1 cargo test -p sky-ui"
+    );
+
+    // Keys run what the table says: Ctrl+L loops, Plus zooms the timeline,
+    // Ctrl+Plus makes everything bigger, Ctrl+/ lists the shortcuts.
+    let mut h = Harness::demo();
+    let looping = h.project().loop_enabled;
+    h.key(Key::L, COMMAND);
+    assert_ne!(h.project().loop_enabled, looping);
+    let ppt = h.app.arrange.px_per_tick;
+    h.key(Key::Plus, Modifiers::NONE);
+    assert!(h.app.arrange.px_per_tick > ppt);
+    h.key(Key::F, Modifiers::NONE);
+    h.key(Key::Plus, COMMAND);
+    assert!(h.ctx.zoom_factor() > 1.0);
+    h.key(Key::Num0, COMMAND);
+    assert_eq!(h.ctx.zoom_factor(), 1.0);
+    h.accessible();
+    h.key(Key::Slash, COMMAND);
+    assert!(h.app.shortcuts_open);
+    h.frames(2);
+    assert!(h.find("Duplicate right after").is_some());
+    assert!(h.find("Ctrl+Shift+Z or Ctrl+Y").is_some());
+    h.click_label("Copy the list");
+    assert_eq!(h.copied.as_deref(), Some(keys::markdown().as_str()));
+
+    // Saved as a web page to print.
+    h.click_label("Save as a web page…");
+    assert!(h.app.dialogs.path_prompt.is_some());
+    h.app.dialogs.path_prompt = None;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ctx = h.ctx();
+    let failed = h
+        .app
+        .path_chosen(&ctx, PathPurpose::ShortcutsPage, dir.path().join("keys"));
+    assert!(failed.is_none(), "{failed:?}");
+    let page = std::fs::read_to_string(dir.path().join("keys.html")).expect("page saved");
+    assert!(page.contains("<td>Ctrl+D</td><td>Duplicate right after</td>"));
+
+    // Arrows leave a focused widget alone.
+    h.app.shortcuts_open = false;
+    h.click(pos2(5.0, 5.0));
+    let bass = h.track_named("Bass");
+    h.app.sel.select_clip(bass.id, bass.clips[0].id);
+    h.ctx
+        .memory_mut(|m| m.request_focus(Id::new("some widget")));
+    h.key(Key::ArrowRight, Modifiers::NONE);
+    assert_eq!(h.clip(bass.clips[0].id).start, 0);
 }

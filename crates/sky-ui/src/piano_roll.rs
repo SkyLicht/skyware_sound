@@ -12,6 +12,7 @@ use sky_model::{Clip, Note, Project, Track};
 use crate::app::{App, Focus};
 use crate::arrange::{snap_floor, snap_round};
 use crate::theme;
+use crate::widgets::Marquee;
 use crate::{actions, audition};
 
 const KEYS_W: f32 = 46.0;
@@ -95,6 +96,15 @@ pub struct PianoState {
     /// Velocity for new notes.
     pub velocity: u8,
     pub drag: Option<NoteDrag>,
+    /// A rectangle being dragged over empty grid to select notes.
+    pub marquee: Option<Marquee<NoteId>>,
+}
+
+impl PianoState {
+    /// Zooms in time, keeping the left edge in place.
+    pub fn zoom(&mut self, factor: f32) {
+        self.px_per_tick = (self.px_per_tick * factor).clamp(0.005, 4.0);
+    }
 }
 
 impl Default for PianoState {
@@ -108,6 +118,7 @@ impl Default for PianoState {
             grid: NoteGrid::default(),
             velocity: 100,
             drag: None,
+            marquee: None,
         }
     }
 }
@@ -234,8 +245,8 @@ pub fn show(
         );
         ui.label(
             RichText::new(
-                "Click to add · drag to move · drag the end to resize · right-click deletes \
-                 · press the keys to hear them",
+                "Click to add · drag a note to move it, its end to resize · drag empty space \
+                 to select · arrow keys nudge and transpose · right-click deletes",
             )
             .small()
             .color(theme::TEXT_DIM),
@@ -252,6 +263,7 @@ pub fn show(
         fit(&mut app.piano, clip, notes, grid_rect.width(), rows);
         app.piano.clip = Some(clip.id);
         app.piano.drag = None;
+        app.piano.marquee = None;
     }
     input(
         app,
@@ -270,6 +282,7 @@ pub fn show(
         row_h: app.piano.row_h,
     };
     update_drag(app, ui.ctx(), &view, project, track, clip);
+    update_marquee(app, ui.ctx(), &view, notes);
 
     // The keys play the track's instrument while pressed; dragging along
     // them plays each key passed.
@@ -300,7 +313,18 @@ pub fn show(
     draw_background(&painter, &view, project, clip);
 
     // Background interaction first so notes on top take precedence.
-    let bg = ui.interact(grid_rect, Id::new(("piano_bg", clip.id)), Sense::click());
+    let bg = ui.interact(
+        grid_rect,
+        Id::new(("piano_bg", clip.id)),
+        Sense::click_and_drag(),
+    );
+    if bg.drag_started()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+    {
+        app.sel.focus = Focus::Editor;
+        let adding = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+        app.piano.marquee = Some(Marquee::new(origin, app.sel.notes.clone(), adding));
+    }
     if bg.clicked()
         && let Some(p) = bg.interact_pointer_pos()
     {
@@ -369,8 +393,8 @@ pub fn show(
         }
         if body.clicked() {
             app.sel.focus = Focus::Editor;
-            let shift = ui.input(|i| i.modifiers.shift);
-            if shift {
+            let adding = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+            if adding {
                 if let Some(i) = app.sel.notes.iter().position(|id| *id == n.id) {
                     app.sel.notes.remove(i);
                 } else {
@@ -408,6 +432,10 @@ pub fn show(
                 heard: 0,
             });
         }
+    }
+
+    if let Some(m) = &app.piano.marquee {
+        m.paint(&note_painter);
     }
 
     // Playhead inside the clip.
@@ -456,6 +484,38 @@ fn input(app: &mut App, ui: &mut Ui, area: Rect, grid: Rect, rows: f32) {
         st.top_pitch = (st.top_pitch + delta.y / st.row_h).clamp(rows.min(128.0), 128.0);
         st.scroll = (st.scroll - (delta.x / st.px_per_tick) as f64).max(0.0);
         ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+    }
+}
+
+/// Selects the notes a marquee touches, as it is dragged.
+fn update_marquee(app: &mut App, ctx: &Context, view: &View, notes: &[Note]) {
+    let Some(mut m) = app.piano.marquee.take() else {
+        return;
+    };
+    let (pos, down, escape) = ctx.input(|i| {
+        (
+            i.pointer.latest_pos(),
+            i.pointer.primary_down(),
+            i.key_pressed(Key::Escape),
+        )
+    });
+    if escape {
+        app.sel.notes = m.before;
+        return;
+    }
+    if let Some(p) = pos {
+        m.to = p;
+    }
+    let rect = m.rect();
+    let mut chosen = m.kept.clone();
+    for n in notes {
+        if view.note_rect(n).intersects(rect) && !chosen.contains(&n.id) {
+            chosen.push(n.id);
+        }
+    }
+    app.sel.notes = chosen;
+    if down {
+        app.piano.marquee = Some(m);
     }
 }
 

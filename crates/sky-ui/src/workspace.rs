@@ -152,7 +152,6 @@ impl Workspace {
     }
 
     /// Whether the panel is open and in front of its tab group.
-    #[cfg(test)]
     pub fn is_front(&self, tab: Tab) -> bool {
         self.front.contains(&tab)
     }
