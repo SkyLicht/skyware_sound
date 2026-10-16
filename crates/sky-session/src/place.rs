@@ -93,6 +93,7 @@ pub fn audio_clip(project: &Project, entry: &PoolEntry, start: Ticks) -> Clip {
         name: entry.name.clone(),
         start,
         length: (end - start).max(1),
+        muted: false,
         content: ClipContent::Audio {
             source: entry.id,
             offset: 0,

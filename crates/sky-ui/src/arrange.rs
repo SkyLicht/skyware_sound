@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The arrangement: bar ruler with the loop region and playhead, the game
-//! asset lane under it, and one lane of clips per track next to its header.
+//! The arrangement: bar ruler with the loop region and playhead, the
+//! marker, tempo and game asset lanes under it, and one lane of clips per
+//! track next to its header. The tools and clip handles are in
+//! [`crate::clip_tools`].
 
 use std::collections::HashMap;
 
@@ -16,6 +18,8 @@ use sky_pattern::{Pattern, Time};
 use crate::actions::{self, NewTrack};
 use crate::app::{Action, App, Focus, Tab};
 use crate::asset_lane::{self, AssetDrag};
+use crate::clip_tools::{self, ClipEdit, EditKind, Paint, Sweep, Tool};
+use crate::ruler_lanes::{self, MARKER_H, RulerLanes, TEMPO_H};
 use crate::widgets::Marquee;
 use crate::{keys, theme};
 
@@ -28,7 +32,7 @@ const HBAR_H: f32 = 12.0;
 const MIN_PX_PER_TICK: f32 = 4.0 / 3840.0;
 const MAX_PX_PER_TICK: f32 = 1.0;
 const DEFAULT_PX_PER_TICK: f32 = 150.0 / 3840.0;
-const CLIP_HEAD: f32 = 15.0;
+pub(crate) const CLIP_HEAD: f32 = 15.0;
 
 /// What clip starts and ends snap to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -91,6 +95,8 @@ pub fn snap_floor(tick: f64, grid: Option<Ticks>) -> Ticks {
 pub enum ClipDragKind {
     Move,
     Resize,
+    /// The left edge: the start moves and the end stays.
+    Trim,
 }
 
 /// Where a clip sits.
@@ -168,6 +174,15 @@ pub struct ArrangeState {
     pub loop_drag: Option<LoopDrag>,
     /// A game asset region being moved or changed in the asset lane.
     pub asset_drag: Option<AssetDrag>,
+    pub tool: Tool,
+    /// A slip, fade or gain drag on one clip.
+    pub clip_edit: Option<ClipEdit>,
+    /// Mute or Erase dragged across clips.
+    pub sweep: Option<Sweep>,
+    /// A clip being painted with the Draw tool.
+    pub paint: Option<Paint>,
+    /// The marker and tempo lanes.
+    pub ruler: RulerLanes,
     /// The game asset last clicked in the asset lane.
     pub asset: Option<AssetId>,
     pub scrubbing: bool,
@@ -195,6 +210,11 @@ impl Default for ArrangeState {
             marquee: None,
             loop_drag: None,
             asset_drag: None,
+            tool: Tool::default(),
+            clip_edit: None,
+            sweep: None,
+            paint: None,
+            ruler: RulerLanes::default(),
             asset: None,
             scrubbing: false,
             lanes: Vec::new(),
@@ -228,6 +248,10 @@ impl ArrangeState {
         self.marquee = None;
         self.loop_drag = None;
         self.asset_drag = None;
+        self.clip_edit = None;
+        self.sweep = None;
+        self.paint = None;
+        self.ruler = RulerLanes::default();
         self.asset = None;
         self.scrubbing = false;
         self.renaming = None;
@@ -239,6 +263,20 @@ impl ArrangeState {
         let ticks = ticks.max(PPQ * 4) as f32;
         self.px_per_tick = (self.lane_width * 0.95 / ticks).clamp(MIN_PX_PER_TICK, MAX_PX_PER_TICK);
         self.scroll = 0.0;
+    }
+
+    /// Whether a drag, marquee, sweep or paint is under way: Escape ends it
+    /// rather than deselecting.
+    pub fn gesture(&self) -> bool {
+        self.drag.is_some()
+            || self.marquee.is_some()
+            || self.loop_drag.is_some()
+            || self.asset_drag.is_some()
+            || self.clip_edit.is_some()
+            || self.sweep.is_some()
+            || self.paint.is_some()
+            || self.ruler.marker_drag.is_some()
+            || self.ruler.tempo_drag.is_some()
     }
 
     pub fn zoom_at(&mut self, factor: f32, x: f32) {
@@ -263,11 +301,25 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         pos2(full.right(), full.top() + RULER_H),
     );
     let corner = Rect::from_min_max(full.min, pos2(lane_left, ruler.bottom()));
-    let assets_h = asset_lane::height(project).min(full.height() - RULER_H - 30.0);
-    let assets = Rect::from_min_max(
-        pos2(lane_left, ruler.bottom()),
-        pos2(full.right(), ruler.bottom() + assets_h),
-    );
+    // The marker and tempo lanes, then the game assets, under the ruler.
+    let lanes = app.workspace.lanes;
+    let mut y = ruler.bottom();
+    let mut lane_below = |on: bool, h: f32| {
+        on.then(|| {
+            let r = Rect::from_min_max(pos2(lane_left, y), pos2(full.right(), y + h));
+            y += h;
+            (
+                Rect::from_min_max(pos2(full.left(), r.top()), pos2(lane_left, r.bottom())),
+                r,
+            )
+        })
+    };
+    let markers = lane_below(lanes.markers, MARKER_H);
+    let tempo = lane_below(lanes.tempo, TEMPO_H);
+    let assets_h = asset_lane::height(project)
+        .min(full.bottom() - y - 30.0)
+        .max(0.0);
+    let assets = Rect::from_min_max(pos2(lane_left, y), pos2(full.right(), y + assets_h));
     let assets_corner = Rect::from_min_max(
         pos2(full.left(), assets.top()),
         pos2(lane_left, assets.bottom()),
@@ -290,9 +342,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     update_marquee(app, ui.ctx(), project);
     update_loop_drag(app, ui.ctx(), project);
     asset_lane::update_drag(app, ui.ctx(), project);
+    ruler_lanes::update_marker_drag(app, ui.ctx(), project);
+    ruler_lanes::update_tempo_drag(app, ui.ctx(), project);
+    clip_tools::update_edit(app, ui.ctx(), project);
+    clip_tools::update_sweep(app, ui.ctx(), project);
+    clip_tools::update_paint(app, ui.ctx(), project);
 
     corner_ui(app, ui, corner, project);
     ruler_ui(app, ui, ruler, project);
+    if let Some((corner, rect)) = markers {
+        ruler_lanes::markers_ui(app, ui, corner, rect, project);
+    }
+    if let Some((corner, rect)) = tempo {
+        ruler_lanes::tempo_ui(app, ui, corner, rect, project);
+    }
     asset_lane::show(app, ui, assets_corner, assets, project);
     rows(app, ui, body, project);
     if let Some(m) = &app.arrange.marquee {
@@ -316,6 +379,14 @@ fn toolbar(app: &mut App, ui: &mut Ui, project: &Project) {
                     .clicked()
                 {
                     app.workspace.toggle(Tab::Browser);
+                }
+                ui.separator();
+                for tool in Tool::ALL {
+                    let on = app.arrange.tool == tool;
+                    let tip = format!("{} ({})", tool.tip(), keys::shortcut_for(&Action::Tool(tool)));
+                    if ui.selectable_label(on, tool.label()).on_hover_text(tip).clicked() {
+                        app.set_tool(tool);
+                    }
                 }
                 ui.separator();
                 ui.label(RichText::new("Add track").color(theme::TEXT_WEAK));
@@ -513,10 +584,35 @@ fn update_clip_drag(app: &mut App, ctx: &Context, project: &Project) {
                     })
                     .collect();
             }
+            ClipDragKind::Trim => {
+                // Every clip's start moves by the same amount, as far as
+                // the one with the least room allows.
+                let min_len = grid.unwrap_or(PPQ / 16).max(1);
+                let start = snap_round(anchor.start as f64 + (tick - drag.grab_tick), grid);
+                let (lo, hi) = drag
+                    .orig
+                    .iter()
+                    .fold((Ticks::MIN, Ticks::MAX), |(lo, hi), p| {
+                        let earliest = project
+                            .find_clip(p.clip)
+                            .map_or(0, |(_, c)| clip_tools::earliest_start(project, c));
+                        (lo.max(earliest - p.start), hi.min(p.length - min_len))
+                    });
+                let dt = (start - anchor.start).clamp(lo.min(0), hi.max(0));
+                drag.preview = drag
+                    .orig
+                    .iter()
+                    .map(|p| Placed {
+                        start: p.start + dt,
+                        length: p.length - dt,
+                        ..*p
+                    })
+                    .collect();
+            }
         }
         ctx.set_cursor_icon(match drag.kind {
             ClipDragKind::Move => CursorIcon::Grabbing,
-            ClipDragKind::Resize => CursorIcon::ResizeHorizontal,
+            ClipDragKind::Resize | ClipDragKind::Trim => CursorIcon::ResizeHorizontal,
         });
     }
     if down {
@@ -559,6 +655,24 @@ pub fn commit_clip_drag(app: &mut App, drag: &ClipDrag) {
                     })
                     .collect(),
             ),
+            ClipDragKind::Trim => {
+                let project = app.view.project.clone();
+                (
+                    "Trim",
+                    changed
+                        .iter()
+                        .filter_map(|p| project.find_clip(p.clip).ok())
+                        .flat_map(|(t, c)| {
+                            let start = drag
+                                .preview
+                                .iter()
+                                .find(|p| p.clip == c.id)
+                                .map_or(c.start, |p| p.start);
+                            clip_tools::changes(c, &clip_tools::trimmed(&project, c, start), t.id)
+                        })
+                        .collect(),
+                )
+            }
         };
         let label = match changed.len() {
             1 => format!("{verb} clip"),
@@ -982,7 +1096,7 @@ fn row(app: &mut App, ui: &mut Ui, project: &Project, track: &Track, index: usiz
     app.arrange.lanes.push((track.id, lane));
 }
 
-fn clip_rect(st: &ArrangeState, lane: Rect, start: Ticks, length: Ticks) -> Rect {
+pub(crate) fn clip_rect(st: &ArrangeState, lane: Rect, start: Ticks, length: Ticks) -> Rect {
     let x0 = st.x_of(start as f64);
     let x1 = st.x_of((start + length.max(0)) as f64).max(x0 + 3.0);
     Rect::from_min_max(pos2(x0, lane.top() + 3.0), pos2(x1, lane.bottom() - 3.0))
@@ -1008,6 +1122,7 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
         painter.rect_filled(lr, CornerRadius::ZERO, theme::LOOP_FILL);
     }
     draw_grid(&painter, &app.arrange, rect, project);
+    ruler_lanes::marker_lines(app, &painter, rect, project);
     painter.hline(
         rect.x_range(),
         rect.bottom() - 0.5,
@@ -1015,8 +1130,10 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
     );
 
     let resp = ui.interact(rect, Id::new(("lane", track.id)), Sense::click_and_drag());
+    let origin = ui.input(|i| i.pointer.press_origin());
+    let taken = clip_tools::lane_gesture(app, &resp, origin, track);
     let adding = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-    if resp.clicked() {
+    if resp.clicked() && !taken {
         app.sel.select_track(track.id);
         if !adding {
             app.sel.clips.clear();
@@ -1024,12 +1141,14 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
         }
     }
     if resp.drag_started()
-        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        && !taken
+        && let Some(origin) = origin
     {
         app.arrange.marquee = Some(Marquee::new(origin, app.sel.clips.clone(), adding));
         app.sel.focus = Focus::Arrange;
     }
     if resp.double_clicked()
+        && !taken
         && track.kind == TrackKind::Instrument
         && let Some(p) = resp.interact_pointer_pos()
     {
@@ -1045,6 +1164,7 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
     resp.context_menu(|ui| lane_menu(app, ui, project, track));
 
     let drag = app.arrange.drag.clone();
+    let edited = app.arrange.clip_edit.as_ref().map(|e| e.preview.clone());
     for clip in &track.clips {
         if drag
             .as_ref()
@@ -1052,8 +1172,10 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
         {
             continue;
         }
+        let clip = edited.as_ref().filter(|e| e.id == clip.id).unwrap_or(clip);
         clip_ui(app, ui, &painter, rect, project, track, clip);
     }
+    let trim = drag.as_ref().is_some_and(|d| d.kind == ClipDragKind::Trim);
     for p in drag.iter().flat_map(|d| &d.preview) {
         if p.track != track.id {
             continue;
@@ -1061,13 +1183,20 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
         let Ok((_, clip)) = project.find_clip(p.clip) else {
             continue;
         };
-        let mut ghost = clip.clone();
-        ghost.start = p.start;
-        ghost.length = p.length;
+        let ghost = if trim {
+            clip_tools::trimmed(project, clip, p.start)
+        } else {
+            Clip {
+                start: p.start,
+                length: p.length,
+                ..clip.clone()
+            }
+        };
         let r = clip_rect(&app.arrange, rect, ghost.start, ghost.length);
         let ctx = ui.ctx().clone();
         draw_clip(app, &ctx, &painter, r, &ghost, track, true, project);
     }
+    clip_tools::draw_paint(app, ui.ctx(), &painter, rect, project, track);
 
     let px = app.arrange.x_of(app.transport.position_ticks);
     if rect.x_range().contains(px) {
@@ -1201,17 +1330,31 @@ fn clip_ui(
     }
     let id = Id::new(("clip", clip.id));
     let body = ui.interact(r.intersect(lane), id, Sense::click_and_drag());
-    let edge_rect = Rect::from_min_max(
+    let selected = app.sel.clips.contains(&clip.id);
+    let ctx = ui.ctx().clone();
+    draw_clip(app, &ctx, painter, r, clip, track, selected, project);
+    if clip_tools::clip_gesture(app, ui, &body, painter, r, track, clip) {
+        clip_menu(app, &body, track, clip);
+        return;
+    }
+
+    // Select and Draw: the right edge resizes, the left edge trims, and
+    // the handles of audio clips change their fades and gain.
+    let edge_w = if r.width() < 14.0 { 0.0 } else { 6.0 };
+    let right = Rect::from_min_max(
         pos2((r.right() - 6.0).max(r.left() + 2.0), r.top()),
         pos2(r.right() + 2.0, r.bottom()),
     )
     .intersect(lane);
-    let edge = ui.interact(edge_rect, id.with("edge"), Sense::drag());
-    let selected = app.sel.clips.contains(&clip.id);
-    let ctx = ui.ctx().clone();
-    draw_clip(app, &ctx, painter, r, clip, track, selected, project);
-
-    if edge.hovered() {
+    let left = Rect::from_min_max(
+        pos2(r.left() - 2.0, r.top()),
+        pos2(r.left() + edge_w, r.bottom()),
+    )
+    .intersect(lane);
+    let left_edge = (edge_w > 0.0).then(|| ui.interact(left, id.with("start"), Sense::drag()));
+    let edge = ui.interact(right, id.with("edge"), Sense::drag());
+    let left_hovered = left_edge.as_ref().is_some_and(|e| e.hovered());
+    if edge.hovered() || left_hovered {
         ctx.set_cursor_icon(CursorIcon::ResizeHorizontal);
     } else if body.hovered() {
         ctx.set_cursor_icon(CursorIcon::Grab);
@@ -1223,22 +1366,35 @@ fn clip_ui(
             app.sel.select_clip(track.id, clip.id);
         }
     }
-    // The menu acts on the selection, so a clip outside it becomes it.
-    if body.secondary_clicked() && !selected {
-        app.sel.select_clip(track.id, clip.id);
-    }
     // Its first click already chose what is selected.
     if body.double_clicked() {
         app.sel.open_clip(track.id, clip.id);
         app.workspace.show(Tab::Editor);
     }
     let origin = ui.input(|i| i.pointer.press_origin());
+    let slip = ui.input(|i| i.modifiers.command && i.modifiers.alt);
     if edge.drag_started() {
         let x = origin.map_or(r.right(), |p| p.x);
         begin_clip_drag(app, track, clip, ClipDragKind::Resize, x);
+    } else if left_edge.as_ref().is_some_and(|e| e.drag_started()) {
+        let x = origin.map_or(r.left(), |p| p.x);
+        begin_clip_drag(app, track, clip, ClipDragKind::Trim, x);
+    } else if body.drag_started() && slip && clip_tools::can_slip(clip) {
+        let grab = origin.unwrap_or(r.center());
+        clip_tools::begin_edit(app, track.id, clip, EditKind::Slip, grab);
     } else if body.drag_started() {
         let x = origin.map_or(r.left(), |p| p.x);
         begin_clip_drag(app, track, clip, ClipDragKind::Move, x);
+    }
+    clip_tools::handles_ui(app, ui, painter, lane, r, track, clip, selected);
+    clip_menu(app, &body, track, clip);
+}
+
+/// A clip's right-click menu, acting on the selection, so a clip outside it
+/// becomes it.
+fn clip_menu(app: &mut App, body: &egui::Response, track: &Track, clip: &Clip) {
+    if body.secondary_clicked() && !app.sel.clips.contains(&clip.id) {
+        app.sel.select_clip(track.id, clip.id);
     }
     body.context_menu(|ui| {
         if ui.button("Open in editor").clicked() {
@@ -1246,11 +1402,17 @@ fn clip_ui(
             app.workspace.show(Tab::Editor);
         }
         ui.separator();
+        let mute = if clip.muted { "Unmute" } else { "Mute" };
         let delete = RichText::new("Delete").color(theme::ERROR);
         for (text, action) in [
             (RichText::new("Cut"), Action::Cut),
             (RichText::new("Copy"), Action::Copy),
             (RichText::new("Duplicate"), Action::Duplicate),
+            (
+                RichText::new("Split at the playhead"),
+                Action::SplitAtPlayhead,
+            ),
+            (RichText::new(mute), Action::MuteClips),
             (delete, Action::DeleteSelection),
         ] {
             let button = Button::new(text).shortcut_text(keys::shortcut_for(&action));
@@ -1279,7 +1441,15 @@ fn draw_clip(
         return;
     }
     let p = painter.with_clip_rect(vis.expand(1.0));
-    let color = theme::track_color(track.color);
+    let (muted, erasing) = match clip_tools::swept(app, clip) {
+        Some((Tool::Erase, _)) => (clip.muted, true),
+        Some((_, muted)) => (muted, false),
+        None => (clip.muted, false),
+    };
+    let mut color = theme::track_color(track.color);
+    if muted {
+        color = theme::muted(color);
+    }
     p.rect_filled(r, CornerRadius::same(3), theme::darken(color, 0.64));
     let head = Rect::from_min_max(
         r.min,
@@ -1301,13 +1471,30 @@ fn draw_clip(
     } else {
         clip.name.as_str()
     };
+    let name = if muted {
+        format!("{name} · muted")
+    } else {
+        name.to_string()
+    };
     p.text(
         pos2(text_left + 4.0, head.center().y),
         Align2::LEFT_CENTER,
         name,
         theme::small(),
-        Color32::from_gray(245),
+        Color32::from_gray(if muted { 170 } else { 245 }),
     );
+    if let ClipContent::Audio { gain_db, .. } = &clip.content
+        && *gain_db != 0.0
+        && r.width() > 120.0
+    {
+        p.text(
+            pos2(r.right().min(vis.right()) - 4.0, head.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{gain_db:+.1} dB"),
+            theme::small(),
+            Color32::from_gray(225),
+        );
+    }
     let body = Rect::from_min_max(
         pos2(r.left(), head.bottom() + 1.0),
         pos2(r.right(), r.bottom() - 2.0),
@@ -1376,7 +1563,10 @@ fn draw_clip(
             }
         }
     }
-    let stroke = if selected {
+    let stroke = if erasing {
+        p.rect_filled(r, CornerRadius::same(3), theme::ERROR.gamma_multiply(0.35));
+        Stroke::new(2.0, theme::ERROR)
+    } else if selected {
         Stroke::new(2.0, theme::ACCENT)
     } else {
         Stroke::new(1.0, theme::darken(color, 0.1))

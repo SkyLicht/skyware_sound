@@ -10,6 +10,7 @@ use egui_dock::{DockArea, DockState, NodeIndex, TabViewer, Translations};
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
+use crate::ruler_lanes::Lanes;
 use crate::theme;
 
 /// The panels of the workspace.
@@ -85,6 +86,8 @@ pub struct Workspace {
     front: Vec<Tab>,
     /// Projects opened or saved, newest first.
     pub recent: Vec<PathBuf>,
+    /// The lanes shown under the ruler.
+    pub lanes: Lanes,
 }
 
 impl Default for Workspace {
@@ -95,6 +98,7 @@ impl Default for Workspace {
             open: Vec::new(),
             front: Vec::new(),
             recent: Vec::new(),
+            lanes: Lanes::default(),
         };
         w.apply();
         w
@@ -132,6 +136,7 @@ fn usable(dock: &DockState<Tab>) -> bool {
 struct SavedRef<'a> {
     dock: &'a DockState<Tab>,
     recent: &'a [PathBuf],
+    lanes: Lanes,
 }
 
 impl Workspace {
@@ -257,12 +262,14 @@ impl Workspace {
         self.recent.retain(|p| p != path);
     }
 
-    /// The layout and the recent projects, for eframe's storage.
+    /// The layout, the lanes shown and the recent projects, for eframe's
+    /// storage.
     pub fn saved_json(&mut self) -> String {
         self.apply();
         let saved = SavedRef {
             dock: &self.dock,
             recent: &self.recent,
+            lanes: self.lanes,
         };
         serde_json::to_string(&saved).unwrap_or_default()
     }
@@ -281,6 +288,12 @@ impl Workspace {
         {
             self.recent = recent;
             self.recent.truncate(MAX_RECENT);
+        }
+        if let Some(lanes) = value
+            .get("lanes")
+            .and_then(|l| serde_json::from_value::<Lanes>(l.clone()).ok())
+        {
+            self.lanes = lanes;
         }
         match value
             .get("dock")

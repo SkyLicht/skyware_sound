@@ -468,6 +468,9 @@ pub struct Clip {
     pub name: String,
     pub start: Ticks,
     pub length: Ticks,
+    /// A muted clip stays on its track but plays nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
     pub content: ClipContent,
 }
 

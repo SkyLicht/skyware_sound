@@ -24,6 +24,8 @@ Ctrl is Cmd on a Mac. Keys marked Arrangement or Piano roll work in whichever of
 | Ctrl+V | Paste at the playhead | Anywhere |
 | Ctrl+D | Duplicate right after | Anywhere |
 | Del or Backspace | Delete | Anywhere |
+| Ctrl+E | Split clips at the playhead | Arrangement |
+| Shift+M | Mute or unmute clips | Arrangement |
 | Ctrl+A | Select all | Anywhere |
 | Esc | Select nothing | Anywhere |
 
@@ -42,12 +44,24 @@ Ctrl is Cmd on a Mac. Keys marked Arrangement or Piano roll work in whichever of
 | Shift+Up | Notes up an octave | Piano roll |
 | Shift+Down | Notes down an octave | Piano roll |
 
+## Tools
+
+| Keys | Does | Where |
+| --- | --- | --- |
+| 1 | The Select tool | Arrangement |
+| 2 | The Draw tool | Arrangement |
+| 3 | The Split tool | Arrangement |
+| 4 | The Slip tool | Arrangement |
+| 5 | The Mute tool | Arrangement |
+| 6 | The Erase tool | Arrangement |
+
 ## Transport
 
 | Keys | Does | Where |
 | --- | --- | --- |
 | Space | Play or pause | Anywhere |
 | Ctrl+L | Loop on or off | Anywhere |
+| M | Add a marker at the playhead | Anywhere |
 
 ## View
 

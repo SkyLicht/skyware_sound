@@ -1823,6 +1823,7 @@ impl SkywareMcp {
             name: a.name.clone().unwrap_or(default_name),
             start,
             length,
+            muted: false,
             content,
         };
         let id = clip.id;
@@ -2111,6 +2112,7 @@ impl SkywareMcp {
                     name: a.name.clone().unwrap_or_else(|| "Steps".into()),
                     start: bar_tick(&project, a.start_bar.unwrap_or(1.0))?,
                     length: bars_len(&project, a.length_bars.unwrap_or(1.0))?,
+                    muted: false,
                     content: ClipContent::Steps(steps),
                 };
                 let id = clip.id;

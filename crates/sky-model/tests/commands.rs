@@ -131,6 +131,7 @@ fn every_command_undoes_exactly() {
                 name: "x".into(),
                 start: 0,
                 length: PPQ * 4,
+                muted: false,
                 content: ClipContent::Midi { notes: vec![] },
             }),
         },
@@ -141,6 +142,7 @@ fn every_command_undoes_exactly() {
                 name: "steps".into(),
                 start: PPQ * 4,
                 length: PPQ * 4,
+                muted: false,
                 content: ClipContent::Steps(StepClip::new(
                     16,
                     vec![StepLane::parse(36, "x . x/ c3!").unwrap()],
@@ -169,6 +171,10 @@ fn every_command_undoes_exactly() {
         Command::SetClipName {
             id: bass_clip,
             name: "Moved".into(),
+        },
+        Command::SetClipMuted {
+            id: bass_clip,
+            muted: true,
         },
         Command::AddNotes {
             clip: bass_clip,
@@ -626,6 +632,7 @@ fn step_clips_are_checked() {
         name: "s".into(),
         start: 0,
         length: PPQ * 4,
+        muted: false,
         content: ClipContent::Steps(steps),
     };
     let good = StepClip::new(16, vec![StepLane::parse(36, "x . . .").unwrap()]);

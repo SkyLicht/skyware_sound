@@ -205,7 +205,12 @@ pub fn bar(app: &mut App, ui: &mut Ui) {
                     .max_decimals(2)
                     .suffix(" BPM"),
             )
-            .on_hover_text("Tempo: drag, or double-click to type");
+            .on_hover_text(if project.tempo.points().len() > 1 {
+                "Tempo at the start of the song: drag, or double-click to type. \
+                 The tempo lane holds the changes after it."
+            } else {
+                "Tempo: drag, or double-click to type"
+            });
         if resp.changed() && (bpm - project.tempo.initial_bpm()).abs() > 1e-9 {
             let key = app.gestures.key(resp.id);
             let r = actions::set_tempo(&app.session, bpm, Some(key));

@@ -11,6 +11,8 @@ use sky_model::ChannelRef;
 
 use crate::actions::NewTrack;
 use crate::app::{Action, App, Tab};
+use crate::clip_tools::Tool;
+use crate::ruler_lanes::Lane;
 use crate::{keys, theme};
 
 pub struct Menu {
@@ -157,6 +159,10 @@ fn edit_menu(app: &App) -> Vec<Entry> {
         None => "Redo".to_string(),
     };
     let some = app.has_selection();
+    let tools = Tool::ALL
+        .into_iter()
+        .map(|t| check(app.arrange.tool == t, t.label(), Action::Tool(t)))
+        .collect();
     let moves = vec![
         item("Nudge left", Action::Nudge(-1)),
         item("Nudge right", Action::Nudge(1)),
@@ -180,6 +186,14 @@ fn edit_menu(app: &App) -> Vec<Entry> {
         item_if(app.edit.clipboard.is_some(), "Paste", Action::Paste),
         item_if(some, "Duplicate", Action::Duplicate),
         item_if(some, "Delete", Action::DeleteSelection),
+        Entry::Separator,
+        item("Split at the playhead", Action::SplitAtPlayhead),
+        item_if(
+            !app.sel.clips.is_empty(),
+            "Mute or unmute clips",
+            Action::MuteClips,
+        ),
+        Entry::Sub("Tool".into(), tools),
         Entry::Separator,
         item("Select all", Action::SelectAll),
         item("Select nothing", Action::SelectNone),
@@ -231,6 +245,7 @@ fn transport_menu(app: &App) -> Vec<Entry> {
         check(app.view.project.loop_enabled, "Loop", Action::ToggleLoop),
         Entry::Separator,
         item("Set tempo…", Action::PromptTempo),
+        item("Add a marker at the playhead", Action::AddMarker),
     ]
 }
 
@@ -246,6 +261,14 @@ fn view_menu(app: &App) -> Vec<Entry> {
             )
         })
         .collect();
+    out.push(Entry::Separator);
+    for lane in [Lane::Markers, Lane::Tempo] {
+        out.push(check(
+            app.workspace.lanes.shows(lane),
+            lane.label(),
+            Action::ToggleLane(lane),
+        ));
+    }
     out.extend([
         Entry::Separator,
         item("Reset the panel layout", Action::ResetLayout),

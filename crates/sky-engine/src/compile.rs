@@ -533,7 +533,7 @@ fn track_node(
     let source = match track.kind {
         TrackKind::Audio => {
             let mut clips = Vec::new();
-            for clip in &track.clips {
+            for clip in track.clips.iter().filter(|c| !c.muted) {
                 let ClipContent::Audio {
                     source,
                     offset,
@@ -580,7 +580,7 @@ fn track_node(
             };
             let mut notes = Vec::new();
             let mut locks = Locks::new(track);
-            for clip in &track.clips {
+            for clip in track.clips.iter().filter(|c| !c.muted) {
                 match &clip.content {
                     ClipContent::Midi { notes: clip_notes } => {
                         for n in clip_notes.iter().filter(|n| n.start < clip.length) {

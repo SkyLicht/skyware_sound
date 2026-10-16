@@ -62,6 +62,7 @@ fn processing_never_allocates() {
         name: "p".into(),
         start: 0,
         length: project.ticks_per_bar(),
+        muted: false,
         content: ClipContent::pattern("bd*16", 0, project.ticks_per_bar()),
     });
     let bank_id = bank.id;
@@ -86,6 +87,7 @@ fn processing_never_allocates() {
         name: "s".into(),
         start: 0,
         length: bar,
+        muted: false,
         content: ClipContent::Steps(sky_model::StepClip::new(16, vec![beat])),
     });
     let mut acid = Track::new_instrument("Acid", InstrumentType::Acid);
@@ -96,6 +98,7 @@ fn processing_never_allocates() {
         name: "a".into(),
         start: 0,
         length: bar,
+        muted: false,
         content: ClipContent::Steps(sky_model::StepClip::new(16, vec![line])),
     });
     project.tracks.push(acid);
