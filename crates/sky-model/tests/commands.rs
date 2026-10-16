@@ -52,6 +52,10 @@ fn every_command_undoes_exactly() {
             numerator: 7,
             denominator: 8,
         },
+        Command::SetScale {
+            scale: Some(Scale::new(2, ScaleMode::Dorian).unwrap()),
+        },
+        Command::SetScale { scale: None },
         Command::SetLoopRegion {
             start: PPQ,
             end: PPQ * 9,
@@ -391,6 +395,50 @@ fn game_settings_round_trip_and_stay_out_of_plain_projects() {
     assert!(json.contains("\"tailSeconds\""), "{json}");
     let back = sky_model::file::project_from_json(&json).unwrap();
     assert_eq!(back, project);
+}
+
+#[test]
+fn the_song_key_is_checked_saved_and_summarized() {
+    let mut project = demo_project();
+    let mut history = History::new();
+    assert_eq!(
+        summary::project_summary(&project)["scale"],
+        serde_json::json!("A minor")
+    );
+    let bad = Command::SetScale {
+        scale: Some(Scale {
+            root: 12,
+            mode: ScaleMode::Major,
+        }),
+    };
+    assert!(try_apply(&mut history, &mut project, bad).is_err());
+    let phrygian = Scale::new(6, ScaleMode::Phrygian).unwrap();
+    try_apply(
+        &mut history,
+        &mut project,
+        Command::SetScale {
+            scale: Some(phrygian),
+        },
+    )
+    .unwrap();
+    assert_eq!(phrygian.label(), "F# Phrygian");
+    let json = serde_json::to_value(&project).unwrap();
+    assert_eq!(
+        json["scale"],
+        serde_json::json!({"root": 6, "mode": "phrygian"})
+    );
+    try_apply(
+        &mut history,
+        &mut project,
+        Command::SetScale { scale: None },
+    )
+    .unwrap();
+    // No key: none in the file or the summary, and older files load.
+    let json = serde_json::to_value(&project).unwrap();
+    assert!(json.get("scale").is_none());
+    assert!(summary::project_summary(&project).get("scale").is_none());
+    let back: Project = serde_json::from_value(json).unwrap();
+    assert_eq!(back.scale, None);
 }
 
 #[test]

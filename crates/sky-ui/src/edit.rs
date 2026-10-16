@@ -10,7 +10,7 @@ use sky_model::{Clip, ClipContent, Command, Note, Project, Track, Transaction};
 
 use crate::actions;
 use crate::app::{App, Focus};
-use crate::arrange::{clip_fits, snap_floor};
+use crate::arrange::{clip_fits, snap_floor, snap_round};
 use crate::audition;
 
 /// What Copy took. Paste uses it, and it also goes on the system clipboard
@@ -131,6 +131,35 @@ fn chosen_notes(notes: &[Note], ids: &[NoteId]) -> Vec<Note> {
         .iter()
         .filter(|n| ids.contains(&n.id))
         .copied()
+        .collect()
+}
+
+/// The notes moved to the nearest grid line, keeping those that start
+/// inside a clip `length` long there. With `ends`, each note's end goes to
+/// its nearest grid line too, at least one step past its start. Only the
+/// notes that change are returned.
+pub fn quantized(notes: &[Note], step: Ticks, length: Ticks, ends: bool) -> Vec<Note> {
+    let step = step.max(1);
+    notes
+        .iter()
+        .filter_map(|n| {
+            let mut start = snap_round(n.start as f64, Some(step));
+            if start >= length {
+                start = snap_floor(n.start as f64, Some(step));
+            }
+            let end = if ends {
+                let end = snap_round((n.start + n.length) as f64, Some(step));
+                end.max(start + step).min(length.max(n.start + n.length))
+            } else {
+                start + n.length
+            };
+            let moved = Note {
+                start,
+                length: (end - start).max(1),
+                ..*n
+            };
+            (moved != *n).then_some(moved)
+        })
         .collect()
 }
 
@@ -678,6 +707,38 @@ impl App {
         }
     }
 
+    /// Whether the piano roll has a MIDI clip open to quantize.
+    pub fn can_quantize(&self) -> bool {
+        self.sel
+            .clip
+            .is_some_and(|id| midi_notes(&self.view.project, id).is_some())
+    }
+
+    /// Moves the piano roll's selected notes, or all its notes when none are
+    /// selected, to the grid. With `ends`, their ends move to it too.
+    pub fn quantize_notes(&mut self, ends: bool) {
+        let view = self.view.clone();
+        let Some((_, clip, notes)) = self.sel.clip.and_then(|id| midi_notes(&view.project, id))
+        else {
+            self.info("Open a MIDI clip in the piano roll to quantize its notes");
+            return;
+        };
+        let chosen = chosen_notes(notes, &self.sel.notes);
+        let chosen = if chosen.is_empty() {
+            notes.to_vec()
+        } else {
+            chosen
+        };
+        let moved = quantized(&chosen, self.piano.grid.ticks(), clip.length, ends);
+        if moved.is_empty() {
+            self.info("Those notes are on the grid already");
+            return;
+        }
+        let label = label("Quantize", moved.len(), "note");
+        let r = actions::update_notes(&self.session, clip.id, moved, &label, None);
+        self.report(r);
+    }
+
     /// Moves the selected clips to the track `rows` below, or above when
     /// negative.
     pub fn move_to_track(&mut self, rows: i32) {
@@ -739,5 +800,36 @@ impl App {
             Focus::Editor => self.piano.clip = None,
             Focus::Arrange => self.arrange.fit(self.view.project.content_end()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantize_moves_notes_to_the_grid() {
+        let step = PPQ / 4;
+        let notes = [
+            Note::new(10, 100, 60, 90),
+            Note::new(step * 2, step, 62, 90),
+            Note::new(step - 10, step + 30, 64, 90),
+            // Rounding up would start it at the clip's end.
+            Note::new(step * 8 - 20, 15, 65, 90),
+        ];
+        let length = step * 8;
+        let moved = quantized(&notes, step, length, false);
+        // The note already on the grid is left out.
+        assert_eq!(moved.len(), 3);
+        assert_eq!((moved[0].start, moved[0].length), (0, 100));
+        assert_eq!((moved[1].start, moved[1].length), (step, step + 30));
+        assert_eq!(moved[2].start, step * 7);
+        assert!(moved.iter().all(|m| notes.iter().any(|n| n.id == m.id)));
+
+        let moved = quantized(&notes, step, length, true);
+        // A note shorter than half a step still lasts one step.
+        assert_eq!((moved[0].start, moved[0].length), (0, step));
+        assert_eq!((moved[1].start, moved[1].length), (step, step));
+        assert_eq!((moved[2].start, moved[2].length), (step * 7, step));
     }
 }

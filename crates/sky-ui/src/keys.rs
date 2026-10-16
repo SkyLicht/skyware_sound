@@ -227,6 +227,20 @@ pub fn table() -> Vec<KeyCommand> {
             A::Transpose(-12),
         )
         .only(Editor),
+        k(
+            "Selection",
+            "Quantize notes to the grid",
+            &[plain(Q)],
+            A::Quantize(false),
+        )
+        .only(Editor),
+        k(
+            "Selection",
+            "Quantize note starts and ends",
+            &[shift(Q)],
+            A::Quantize(true),
+        )
+        .only(Editor),
         k("Transport", "Play or pause", &[plain(Space)], A::PlayStop),
         k("Transport", "Loop on or off", &[ctrl(L)], A::ToggleLoop),
         k(

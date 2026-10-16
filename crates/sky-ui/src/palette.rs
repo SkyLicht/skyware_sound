@@ -149,6 +149,8 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Delete the selection", Action::DeleteSelection),
         entry("Split clips at the playhead", Action::SplitAtPlayhead),
         entry("Mute or unmute the selected clips", Action::MuteClips),
+        entry("Quantize notes to the grid", Action::Quantize(false)),
+        entry("Quantize note starts and ends", Action::Quantize(true)),
         entry("Add a marker at the playhead", Action::AddMarker),
         entry("Select all", Action::SelectAll),
         entry("Select nothing", Action::SelectNone),

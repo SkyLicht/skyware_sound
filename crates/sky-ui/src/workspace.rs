@@ -10,6 +10,7 @@ use egui_dock::{DockArea, DockState, NodeIndex, TabViewer, Translations};
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
+use crate::piano_roll::{PianoPrefs, ROW_MAX, ROW_MIN};
 use crate::ruler_lanes::Lanes;
 use crate::theme;
 
@@ -88,6 +89,8 @@ pub struct Workspace {
     pub recent: Vec<PathBuf>,
     /// The lanes shown under the ruler.
     pub lanes: Lanes,
+    /// How the piano roll looks.
+    pub piano: PianoPrefs,
 }
 
 impl Default for Workspace {
@@ -99,6 +102,7 @@ impl Default for Workspace {
             front: Vec::new(),
             recent: Vec::new(),
             lanes: Lanes::default(),
+            piano: PianoPrefs::default(),
         };
         w.apply();
         w
@@ -137,6 +141,7 @@ struct SavedRef<'a> {
     dock: &'a DockState<Tab>,
     recent: &'a [PathBuf],
     lanes: Lanes,
+    piano: PianoPrefs,
 }
 
 impl Workspace {
@@ -262,14 +267,15 @@ impl Workspace {
         self.recent.retain(|p| p != path);
     }
 
-    /// The layout, the lanes shown and the recent projects, for eframe's
-    /// storage.
+    /// The layout, the lanes shown, the piano roll's look and the recent
+    /// projects, for eframe's storage.
     pub fn saved_json(&mut self) -> String {
         self.apply();
         let saved = SavedRef {
             dock: &self.dock,
             recent: &self.recent,
             lanes: self.lanes,
+            piano: self.piano,
         };
         serde_json::to_string(&saved).unwrap_or_default()
     }
@@ -294,6 +300,13 @@ impl Workspace {
             .and_then(|l| serde_json::from_value::<Lanes>(l.clone()).ok())
         {
             self.lanes = lanes;
+        }
+        if let Some(mut piano) = value
+            .get("piano")
+            .and_then(|p| serde_json::from_value::<PianoPrefs>(p.clone()).ok())
+        {
+            piano.row_h = piano.row_h.clamp(ROW_MIN, ROW_MAX);
+            self.piano = piano;
         }
         match value
             .get("dock")

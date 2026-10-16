@@ -278,6 +278,9 @@ pub fn project_summary(project: &Project) -> Value {
         })).collect::<Vec<_>>(),
         "game": game_json(project),
     });
+    if let Some(scale) = project.scale {
+        v["scale"] = json!(scale.label());
+    }
     let changes = project.tempo.points().get(1..).unwrap_or_default();
     if !changes.is_empty() {
         v["tempoChanges"] = json!(

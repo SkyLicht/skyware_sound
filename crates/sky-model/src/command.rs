@@ -44,6 +44,10 @@ pub enum Command {
         numerator: u32,
         denominator: u32,
     },
+    /// Sets the key the piano roll highlights, or none.
+    SetScale {
+        scale: Option<Scale>,
+    },
     SetLoopRegion {
         start: Ticks,
         end: Ticks,
@@ -631,6 +635,7 @@ impl Command {
             Command::SetProjectName { .. } => "Rename project",
             Command::SetTempo { .. } | Command::SetTempoMap { .. } => "Change tempo",
             Command::SetTimeSignature { .. } => "Change time signature",
+            Command::SetScale { .. } => "Change scale",
             Command::SetLoopRegion { .. } => "Set loop region",
             Command::SetLoopEnabled { .. } => "Toggle loop",
             Command::AddMarker { .. } => "Add marker",
@@ -698,6 +703,13 @@ impl Command {
                     numerator: old.numerator,
                     denominator: old.denominator,
                 }
+            }
+            Command::SetScale { scale } => {
+                if let Some(s) = scale {
+                    Scale::new(s.root, s.mode)?;
+                }
+                let old = std::mem::replace(&mut project.scale, scale);
+                Command::SetScale { scale: old }
             }
             Command::SetLoopRegion { start, end } => {
                 let range = TimeRange::new(start, end)?;

@@ -43,6 +43,8 @@ Ctrl is Cmd on a Mac. Keys marked Arrangement or Piano roll work in whichever of
 | Down | Notes down a semitone | Piano roll |
 | Shift+Up | Notes up an octave | Piano roll |
 | Shift+Down | Notes down an octave | Piano roll |
+| Q | Quantize notes to the grid | Piano roll |
+| Shift+Q | Quantize note starts and ends | Piano roll |
 
 ## Tools
 

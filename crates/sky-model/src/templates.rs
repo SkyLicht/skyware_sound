@@ -18,6 +18,10 @@ pub fn empty_project(name: &str) -> Project {
 /// line and pad chords from MIDI clips. Used for first runs and tests.
 pub fn demo_project() -> Project {
     let mut p = Project::new("Demo loop");
+    p.scale = Some(Scale {
+        root: 9,
+        mode: ScaleMode::Minor,
+    });
     let bar = p.ticks_per_bar();
     let bars = 4;
 
