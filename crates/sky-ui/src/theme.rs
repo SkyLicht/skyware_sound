@@ -28,6 +28,10 @@ pub const WARN: Color32 = Color32::from_rgb(232, 182, 72);
 pub const OK: Color32 = Color32::from_rgb(110, 196, 120);
 pub const MUTE: Color32 = Color32::from_rgb(196, 150, 60);
 
+/// Game assets on the timeline: loops and SFX sets.
+pub const GAME_LOOP: Color32 = Color32::from_rgb(72, 196, 172);
+pub const GAME_SFX: Color32 = Color32::from_rgb(222, 188, 86);
+
 /// A track's stored color.
 pub fn track_color(rgb: [u8; 3]) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])

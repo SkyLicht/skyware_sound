@@ -21,6 +21,7 @@ use crate::app::App;
 use crate::audition::{ButtonState, PreviewKey, preview_button};
 use crate::dialogs::{CATEGORIES, PathPurpose, bits_choice};
 use crate::jobs::JobOutput;
+use crate::loop_inspector::Target;
 use crate::sounds::license_report_ui;
 use crate::theme;
 
@@ -277,7 +278,7 @@ fn export(session: &Session) -> Result<GameSummary, String> {
 }
 
 /// The bars a range covers, as "bar 1 to 5".
-fn bars(project: &Project, range: TimeRange) -> String {
+pub(crate) fn bars(project: &Project, range: TimeRange) -> String {
     let b = |t: Ticks| {
         let bar = project.ticks_to_bar(t);
         if bar.fract().abs() < 1e-9 {
@@ -300,6 +301,7 @@ struct Wanted {
     export: bool,
     preview: Option<PreviewKey>,
     trigger: Option<AssetId>,
+    inspect: Option<AssetId>,
 }
 
 /// What the assets' Play, Join and Trigger buttons show, read before the
@@ -495,6 +497,9 @@ pub fn window(app: &mut App, ctx: &Context) {
     if let Some(asset) = w.trigger {
         app.trigger_sfx(ctx, asset);
     }
+    if let Some(asset) = w.inspect {
+        app.inspect(Target::Asset(asset));
+    }
     app.refresh();
 }
 
@@ -608,6 +613,13 @@ fn asset_row(
                             asset: id,
                             join: false,
                         };
+                        if ui
+                            .button("Inspect")
+                            .on_hover_text("Show its seam in the Loop inspector")
+                            .clicked()
+                        {
+                            w.inspect = Some(id);
+                        }
                         if preview_button(
                             ui,
                             "Join",

@@ -25,6 +25,7 @@ use crate::dialogs::{Confirm, Dialogs, PathPurpose};
 use crate::edit::EditState;
 use crate::jobs::{JobOutput, Jobs};
 use crate::keys;
+use crate::loop_inspector::InspectorState;
 use crate::mixer::MixerState;
 use crate::palette::PaletteState;
 use crate::pattern_editor::PatternState;
@@ -220,6 +221,8 @@ pub struct App {
     pub mixer: MixerState,
     pub ai: AiState,
     pub audition: Audition,
+    /// The Loop inspector's pick and its last render.
+    pub inspector: InspectorState,
     pub browser: BrowserState,
     pub palette: PaletteState,
     pub dialogs: Dialogs,
@@ -268,6 +271,7 @@ impl App {
             mixer: MixerState::default(),
             ai: AiState::new(&view),
             audition: Audition::default(),
+            inspector: InspectorState::default(),
             browser: BrowserState::new(config.browser_store),
             palette: PaletteState::default(),
             dialogs: Dialogs::default(),
@@ -414,6 +418,7 @@ impl App {
             self.project_id = project.id;
             self.stop_preview();
             self.audition.reset();
+            self.inspector.reset();
             self.sel = Selection::default();
             self.arrange.reset_for_new_project();
             self.piano = PianoState::default();
@@ -452,6 +457,7 @@ impl App {
         let fast = self.transport.playing
             || self.arrange.drag.is_some()
             || self.arrange.marquee.is_some()
+            || self.arrange.asset_drag.is_some()
             || self.piano.marquee.is_some()
             || self.mixer.any_active()
             || self.ai.flashing(self.now)
@@ -505,6 +511,7 @@ impl App {
         // Escape cancels a drag or closes a menu before it deselects.
         let escape_taken = self.arrange.drag.is_some()
             || self.arrange.marquee.is_some()
+            || self.arrange.asset_drag.is_some()
             || self.piano.drag.is_some()
             || self.piano.marquee.is_some()
             || egui::Popup::is_any_open(ctx);
@@ -805,6 +812,11 @@ impl App {
             JobOutput::PackListed { map, result } => self.pack_listed(map, result),
             JobOutput::BankLoaded(result) => self.bank_loaded(result),
             JobOutput::Previewed { key, result } => self.preview_ready(key, result),
+            JobOutput::SeamChecked {
+                target,
+                revision,
+                result,
+            } => self.seam_checked(target, revision, result),
         }
     }
 

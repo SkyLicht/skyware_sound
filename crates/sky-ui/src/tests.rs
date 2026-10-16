@@ -24,9 +24,12 @@ use crate::app::{Action, App, Tab};
 use crate::audition::{ButtonState, PreviewKey};
 use crate::dialogs::PathPurpose;
 use crate::edit::Copied;
+use crate::loop_inspector::Target;
 use crate::waveform::Peaks;
 use crate::widgets::Gestures;
-use crate::{UiConfig, arrange, game, keys, menu, palette, pattern_editor, sounds, theme};
+use crate::{
+    UiConfig, arrange, asset_lane, game, keys, menu, palette, pattern_editor, sounds, theme,
+};
 
 /// The app in a bare egui context, fed with synthetic input.
 struct Harness {
@@ -195,6 +198,20 @@ impl Harness {
         self.frame();
     }
 
+    fn right_click(&mut self, pos: Pos2) {
+        self.move_to(pos);
+        for pressed in [true, false] {
+            self.events.push(Event::PointerButton {
+                pos,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: self.modifiers,
+            });
+            self.frame();
+        }
+        self.frames(2);
+    }
+
     fn double_click(&mut self, pos: Pos2) {
         self.move_to(pos);
         for _ in 0..2 {
@@ -258,6 +275,19 @@ impl Harness {
             .filter(|(_, _, r)| role.is_none_or(|role| *r == role))
             .find(|(l, _, _)| l == label || l.starts_with(&with_shortcut))
             .map(|(_, r, _)| *r)
+    }
+
+    /// Clicks the widget with this label inside a panel, for labels that
+    /// other panels use too.
+    fn click_in(&mut self, tab: Tab, label: &str) {
+        let area = self.panel_rect(tab);
+        let rect = self
+            .access
+            .iter()
+            .find(|(l, r, _)| l == label && area.contains(r.center()))
+            .map(|(_, r, _)| *r)
+            .unwrap_or_else(|| panic!("no {label:?} in {tab:?}"));
+        self.click(rect.center());
     }
 
     fn click_label(&mut self, label: &str) {
@@ -1595,6 +1625,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("ai_panel.rs"),
         include_str!("app.rs"),
         include_str!("arrange.rs"),
+        include_str!("asset_lane.rs"),
         include_str!("audio.rs"),
         include_str!("audition.rs"),
         include_str!("browser.rs"),
@@ -1604,6 +1635,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("jobs.rs"),
         include_str!("keys.rs"),
         include_str!("lib.rs"),
+        include_str!("loop_inspector.rs"),
         include_str!("menu.rs"),
         include_str!("mixer.rs"),
         include_str!("palette.rs"),
@@ -3202,4 +3234,242 @@ fn one_key_command_table_drives_shortcuts_menus_palette_and_the_printed_list() {
         .memory_mut(|m| m.request_focus(Id::new("some widget")));
     h.key(Key::ArrowRight, Modifiers::NONE);
     assert_eq!(h.clip(bass.clips[0].id).start, 0);
+}
+
+/// The demo project's loop and its SFX set.
+fn demo_assets(h: &Harness) -> (sky_core::AssetId, sky_core::AssetId) {
+    let p = h.project();
+    let id = |name: &str| p.game.find(name).expect("demo asset").id;
+    (id("demo_music"), id("demo_hits"))
+}
+
+fn asset(h: &Harness, id: sky_core::AssetId) -> sky_model::GameAsset {
+    h.project().game.asset(id).cloned().expect("asset")
+}
+
+#[test]
+fn game_assets_are_regions_under_the_ruler_that_drag_to_edit() {
+    use sky_model::{GameAssetKind, TimeRange};
+    let mut h = Harness::demo();
+    h.accessible();
+    let (music, hits) = demo_assets(&h);
+    let bar = h.project().ticks_per_bar();
+    let beat = bar / 4;
+
+    // The loop and the hits overlap, so they take a row each, and the
+    // tracks start below them. A project without assets has no lane.
+    assert_eq!(asset_lane::rows(&h.project()), vec![(music, 0), (hits, 1)]);
+    assert_eq!(asset_lane::height(&empty_project("None")), 0.0);
+    let loop_rect = h.rect_of(asset_lane::region_id(music));
+    let hits_rect = h.rect_of(asset_lane::region_id(hits));
+    assert!(hits_rect.top() >= loop_rect.bottom());
+    let drums = h.track_named("Drums");
+    assert!(lane_rect(&h, drums.id).top() >= hits_rect.bottom());
+    assert!((loop_rect.right() - tick_x(&h, 4 * bar)).abs() < 1.0);
+
+    // Dragging the loop's right edge, its seam, shortens the body by a bar
+    // in one undo step.
+    let before = h.history_len();
+    let y = loop_rect.center().y;
+    h.drag(
+        pos2(loop_rect.right() - 2.0, y),
+        pos2(tick_x(&h, 3 * bar), y),
+    );
+    let range = |h: &Harness| match asset(h, music).kind {
+        GameAssetKind::Loop { range, intro_start } => (range, intro_start),
+        GameAssetKind::Sfx { .. } => unreachable!(),
+    };
+    assert_eq!(
+        range(&h).0,
+        TimeRange {
+            start: 0,
+            end: 3 * bar
+        }
+    );
+    assert_eq!(h.history_len(), before + 1);
+    assert_eq!(h.app.arrange.asset, Some(music), "it is selected");
+    h.run(Action::Undo);
+    assert_eq!(range(&h).0.end, 4 * bar);
+
+    // Dragging from the middle moves it, snapped to the grid.
+    let loop_rect = h.rect_of(asset_lane::region_id(music));
+    let from = pos2(tick_x(&h, 2 * bar), y);
+    h.drag(from, pos2(tick_x(&h, 3 * bar) + 8.0, y));
+    assert_eq!(
+        range(&h).0,
+        TimeRange {
+            start: bar,
+            end: 5 * bar
+        }
+    );
+    assert!(h.rect_of(asset_lane::region_id(music)).left() > loop_rect.left());
+
+    // Now it can have an intro, from its menu; dragging the intro's start
+    // onto the body takes it away again.
+    h.right_click(pos2(tick_x(&h, 2 * bar), y));
+    h.click_label("Add a bar of intro");
+    assert_eq!(range(&h).1, Some(0));
+    h.drag(pos2(tick_x(&h, 0) + 2.0, y), pos2(tick_x(&h, bar) + 3.0, y));
+    assert_eq!(
+        range(&h),
+        (
+            TimeRange {
+                start: bar,
+                end: 5 * bar
+            },
+            None
+        )
+    );
+
+    // The edge between two hits moves both; the others stay.
+    h.app.arrange.snap = arrange::Snap::Sixteenth;
+    let hy = h.rect_of(asset_lane::region_id(hits)).center().y;
+    h.drag(
+        pos2(tick_x(&h, beat), hy),
+        pos2(tick_x(&h, beat + beat / 2), hy),
+    );
+    let variations = |h: &Harness| match asset(h, hits).kind {
+        GameAssetKind::Sfx { variations, .. } => variations,
+        GameAssetKind::Loop { .. } => unreachable!(),
+    };
+    let v = variations(&h);
+    assert_eq!(
+        v[0],
+        TimeRange {
+            start: 0,
+            end: beat + beat / 2
+        }
+    );
+    assert_eq!(
+        v[1],
+        TimeRange {
+            start: beat + beat / 2,
+            end: 2 * beat
+        }
+    );
+    assert_eq!(
+        v[2],
+        TimeRange {
+            start: 2 * beat,
+            end: 3 * beat
+        }
+    );
+
+    // Escape drops a drag; nothing changes.
+    let before = h.history_len();
+    let start = pos2(tick_x(&h, 3 * bar), y);
+    h.move_to(start);
+    h.pointer(start, true);
+    h.frame();
+    for step in 1..=5 {
+        h.move_to(start + vec2(step as f32 * 20.0, 0.0));
+    }
+    assert!(h.app.arrange.asset_drag.is_some());
+    h.key(Key::Escape, Modifiers::NONE);
+    h.pointer(start + vec2(100.0, 0.0), false);
+    h.frames(2);
+    assert!(h.app.arrange.asset_drag.is_none());
+    assert_eq!(h.history_len(), before);
+    assert_eq!(range(&h).0.start, bar);
+
+    // The corner opens the Game assets window; double-clicking an SFX set
+    // does too.
+    h.click_label("Game assets…");
+    assert!(h.app.dialogs.game.is_some());
+    h.app.dialogs.game = None;
+    h.frames(2);
+    // Long enough after the last click that egui does not count a triple.
+    h.frames(40);
+    h.double_click(pos2(tick_x(&h, 2 * beat) + 10.0, hy));
+    assert!(h.app.dialogs.game.is_some());
+}
+
+#[test]
+fn the_loop_inspector_shows_the_seam_and_plays_it() {
+    let mut h = Harness::with_engine(demo_project());
+    h.accessible();
+    let (music, _) = demo_assets(&h);
+    let bar = h.project().ticks_per_bar();
+    assert!(
+        !h.app.workspace.is_front(Tab::Loop),
+        "behind the editor at first"
+    );
+    assert!(
+        !h.app.inspector.is_rendering(),
+        "nothing renders out of view"
+    );
+    let history = h.history_len();
+
+    // Double-clicking a loop on the timeline shows it in the inspector,
+    // which renders it as it exports and checks its seam.
+    let y = h.rect_of(asset_lane::region_id(music)).center().y;
+    h.double_click(pos2(tick_x(&h, bar), y));
+    assert!(h.app.workspace.is_front(Tab::Loop));
+    assert_eq!(h.app.inspected(), Target::Asset(music));
+    h.frames(2);
+    h.wait_jobs();
+    let checked = h.app.inspector.checked.clone().expect("rendered");
+    assert_eq!(checked.target, Target::Asset(music));
+    assert_eq!(checked.revision, h.app.view.revision);
+    let rate = f64::from(checked.audio.sample_rate);
+    let seconds = checked.audio.frames() as f64 / rate;
+    assert!(
+        (seconds - 8.0).abs() < 0.1,
+        "four bars at 120 BPM: {seconds}"
+    );
+    assert!(
+        h.find("Seamless").is_some() || h.find("A click at the seam").is_some(),
+        "the verdict shows"
+    );
+    assert!(h.find("End of the loop").is_none(), "painted, not a widget");
+
+    // Play loops it; Join starts just before the seam.
+    h.click_in(Tab::Loop, "Play");
+    h.heard();
+    let play = PreviewKey::Inspected { join: false };
+    assert_eq!(h.app.preview_state(&play), ButtonState::Playing);
+    assert!(h.heard() > 0.001);
+    h.click_in(Tab::Loop, "Join");
+    h.heard();
+    assert_eq!(
+        h.app.preview_state(&PreviewKey::Inspected { join: true }),
+        ButtonState::Playing
+    );
+    assert_eq!(h.history_len(), history, "inspecting changes nothing");
+
+    // Shortening the loop on the timeline renders it again.
+    let right = h.rect_of(asset_lane::region_id(music)).right();
+    h.drag(pos2(right - 2.0, y), pos2(tick_x(&h, 2 * bar), y));
+    h.frames(2);
+    h.wait_jobs();
+    let checked = h.app.inspector.checked.clone().expect("rendered");
+    assert_eq!(checked.revision, h.app.view.revision);
+    let seconds = checked.audio.frames() as f64 / rate;
+    assert!((seconds - 4.0).abs() < 0.1, "{seconds}");
+
+    // The loop region can be inspected too; it has no intro.
+    h.app.inspector.target = Some(Target::Region);
+    h.frames(2);
+    h.wait_jobs();
+    let checked = h.app.inspector.checked.clone().expect("rendered");
+    assert_eq!(checked.target, Target::Region);
+    assert_eq!(checked.loop_start, 0);
+
+    // Putting another tab in front stops what the inspector played.
+    h.click_in(Tab::Loop, "Play");
+    h.heard();
+    assert!(h.app.session.previewing().is_some());
+    h.app.workspace.show(Tab::Editor);
+    h.frames(2);
+    h.heard();
+    h.heard();
+    assert_eq!(h.app.session.previewing(), None);
+
+    // The Game assets window sends a loop to the inspector.
+    h.run(Action::GameAssets);
+    h.frames(2);
+    h.click_label("Inspect");
+    h.frames(2);
+    assert!(h.app.workspace.is_front(Tab::Loop));
+    assert_eq!(h.app.inspected(), Target::Asset(music));
 }

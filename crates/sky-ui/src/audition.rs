@@ -20,7 +20,7 @@ use sky_dsp::{AudioData, InstrumentType};
 use sky_model::{GameAssetKind, Track};
 use sky_session::{PreviewOptions, SessionError};
 
-use crate::app::App;
+use crate::app::{App, Tab};
 use crate::browser::Item;
 use crate::jobs::JobOutput;
 use crate::theme;
@@ -47,6 +47,8 @@ pub enum PreviewKey {
     GameSfx(AssetId),
     /// The loop region as Export loop renders it.
     LoopRegion { join: bool },
+    /// What the Loop inspector shows, as it last rendered it.
+    Inspected { join: bool },
     /// A sound of the pack in the Load sounds dialog.
     PackSound(String),
     /// Something in the browser.
@@ -337,6 +339,21 @@ impl App {
                     })
                 })
             }
+            PreviewKey::Inspected { .. } => {
+                let Some(c) = self.inspector.checked.clone() else {
+                    self.error("The loop inspector has nothing rendered yet");
+                    return;
+                };
+                // Already rendered for the inspector: no need for a job.
+                let rendered = Rendered {
+                    audio: vec![c.audio.clone()],
+                    loop_start: Some(c.loop_start),
+                    revision: c.revision,
+                };
+                self.audition.pending = Some(key.clone());
+                self.preview_ready(key, Ok(rendered));
+                return;
+            }
             PreviewKey::LoopRegion { .. } => Box::new(move || {
                 let audio = session.render_loop(None).map_err(|e| e.to_string())?;
                 Ok(Rendered {
@@ -503,7 +520,9 @@ impl App {
         let frames = audio.frames();
         let join = matches!(
             key,
-            PreviewKey::GameLoop { join: true, .. } | PreviewKey::LoopRegion { join: true }
+            PreviewKey::GameLoop { join: true, .. }
+                | PreviewKey::LoopRegion { join: true }
+                | PreviewKey::Inspected { join: true }
         );
         let start = match rendered.loop_start {
             Some(body) if join => {
@@ -532,6 +551,7 @@ impl App {
         let owner_open = |key: &PreviewKey| match key {
             PreviewKey::GameLoop { .. } | PreviewKey::GameSfx(_) => self.dialogs.game.is_some(),
             PreviewKey::LoopRegion { .. } => self.dialogs.export_loop.is_some(),
+            PreviewKey::Inspected { .. } => self.workspace.is_front(Tab::Loop),
             PreviewKey::PackSound(_) => self.dialogs.load_sounds.is_some(),
             PreviewKey::Browser(_) => self.browser.open,
         };
