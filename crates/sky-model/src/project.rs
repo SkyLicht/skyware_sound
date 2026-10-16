@@ -40,6 +40,10 @@ pub struct Project {
     /// The loops and SFX sets this project exports for a game, and where to.
     #[serde(default, skip_serializing_if = "GameSettings::is_empty")]
     pub game: GameSettings,
+    /// The key the song is in, which the piano roll highlights. Nothing
+    /// plays differently with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Scale>,
 }
 
 /// What a project exports for a game, and where to.
@@ -234,6 +238,120 @@ pub struct Marker {
     pub id: MarkerId,
     pub tick: Ticks,
     pub name: String,
+}
+
+/// A key: a root note and the scale built on it, such as A minor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Scale {
+    /// The root as a pitch class, 0 for C up to 11 for B.
+    pub root: u8,
+    pub mode: ScaleMode,
+}
+
+impl Scale {
+    pub fn new(root: u8, mode: ScaleMode) -> Result<Self, ModelError> {
+        if root > 11 {
+            return Err(ModelError::InvalidValue(format!(
+                "a scale's root is a pitch class from 0 (C) to 11 (B), got {root}"
+            )));
+        }
+        Ok(Self { root, mode })
+    }
+
+    /// Whether a MIDI note is in the scale.
+    pub fn contains(&self, pitch: u8) -> bool {
+        let degree = (pitch % 12 + 12 - self.root % 12) % 12;
+        self.mode.intervals().contains(&degree)
+    }
+
+    /// Whether a MIDI note is the root.
+    pub fn is_root(&self, pitch: u8) -> bool {
+        pitch % 12 == self.root % 12
+    }
+
+    /// Such as `A minor` or `F# Phrygian`.
+    pub fn label(&self) -> String {
+        format!(
+            "{} {}",
+            sky_core::music::pitch_class_name(self.root),
+            self.mode.label()
+        )
+    }
+}
+
+/// The scales a song can be in, as steps from the root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScaleMode {
+    Major,
+    Minor,
+    HarmonicMinor,
+    MelodicMinor,
+    Dorian,
+    Phrygian,
+    PhrygianDominant,
+    Lydian,
+    Mixolydian,
+    Locrian,
+    MajorPentatonic,
+    MinorPentatonic,
+    Blues,
+}
+
+impl ScaleMode {
+    pub const ALL: [ScaleMode; 13] = [
+        ScaleMode::Major,
+        ScaleMode::Minor,
+        ScaleMode::HarmonicMinor,
+        ScaleMode::MelodicMinor,
+        ScaleMode::Dorian,
+        ScaleMode::Phrygian,
+        ScaleMode::PhrygianDominant,
+        ScaleMode::Lydian,
+        ScaleMode::Mixolydian,
+        ScaleMode::Locrian,
+        ScaleMode::MajorPentatonic,
+        ScaleMode::MinorPentatonic,
+        ScaleMode::Blues,
+    ];
+
+    /// Semitones above the root.
+    pub fn intervals(self) -> &'static [u8] {
+        match self {
+            ScaleMode::Major => &[0, 2, 4, 5, 7, 9, 11],
+            ScaleMode::Minor => &[0, 2, 3, 5, 7, 8, 10],
+            ScaleMode::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
+            ScaleMode::MelodicMinor => &[0, 2, 3, 5, 7, 9, 11],
+            ScaleMode::Dorian => &[0, 2, 3, 5, 7, 9, 10],
+            ScaleMode::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
+            ScaleMode::PhrygianDominant => &[0, 1, 4, 5, 7, 8, 10],
+            ScaleMode::Lydian => &[0, 2, 4, 6, 7, 9, 11],
+            ScaleMode::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
+            ScaleMode::Locrian => &[0, 1, 3, 5, 6, 8, 10],
+            ScaleMode::MajorPentatonic => &[0, 2, 4, 7, 9],
+            ScaleMode::MinorPentatonic => &[0, 3, 5, 7, 10],
+            ScaleMode::Blues => &[0, 3, 5, 6, 7, 10],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleMode::Major => "major",
+            ScaleMode::Minor => "minor",
+            ScaleMode::HarmonicMinor => "harmonic minor",
+            ScaleMode::MelodicMinor => "melodic minor",
+            ScaleMode::Dorian => "Dorian",
+            ScaleMode::Phrygian => "Phrygian",
+            ScaleMode::PhrygianDominant => "Phrygian dominant",
+            ScaleMode::Lydian => "Lydian",
+            ScaleMode::Mixolydian => "Mixolydian",
+            ScaleMode::Locrian => "Locrian",
+            ScaleMode::MajorPentatonic => "major pentatonic",
+            ScaleMode::MinorPentatonic => "minor pentatonic",
+            ScaleMode::Blues => "blues",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -783,6 +901,7 @@ impl Project {
             master: Channel::default(),
             audio_pool: Vec::new(),
             game: GameSettings::default(),
+            scale: None,
         }
     }
 
@@ -888,5 +1007,32 @@ impl Project {
 
     pub fn any_solo(&self) -> bool {
         self.tracks.iter().any(|t| t.channel.solo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scales_know_their_notes() {
+        let a_minor = Scale::new(9, ScaleMode::Minor).unwrap();
+        assert_eq!(a_minor.label(), "A minor");
+        // A B C D E F G, in any octave.
+        let in_scale: Vec<u8> = (57..69).filter(|p| a_minor.contains(*p)).collect();
+        assert_eq!(in_scale, [57, 59, 60, 62, 64, 65, 67]);
+        assert!(a_minor.is_root(45) && a_minor.is_root(69) && !a_minor.is_root(60));
+        let f_sharp = Scale::new(6, ScaleMode::Phrygian).unwrap();
+        assert_eq!(f_sharp.label(), "F# Phrygian");
+        assert!(f_sharp.contains(7) && !f_sharp.contains(8));
+        assert!(Scale::new(12, ScaleMode::Major).is_err());
+        for mode in ScaleMode::ALL {
+            let steps = mode.intervals();
+            assert_eq!(steps[0], 0, "{mode:?}");
+            assert!(
+                steps.windows(2).all(|w| w[0] < w[1] && w[1] < 12),
+                "{mode:?}"
+            );
+        }
     }
 }

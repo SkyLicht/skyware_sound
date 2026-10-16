@@ -37,6 +37,7 @@ mod step_editor;
 mod theme;
 mod tracks;
 mod transport;
+mod velocity_lane;
 mod waveform;
 mod widgets;
 mod workspace;

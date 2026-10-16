@@ -193,6 +193,16 @@ fn edit_menu(app: &App) -> Vec<Entry> {
             "Mute or unmute clips",
             Action::MuteClips,
         ),
+        item_if(
+            app.can_quantize(),
+            "Quantize notes",
+            Action::Quantize(false),
+        ),
+        item_if(
+            app.can_quantize(),
+            "Quantize note starts and ends",
+            Action::Quantize(true),
+        ),
         Entry::Sub("Tool".into(), tools),
         Entry::Separator,
         item("Select all", Action::SelectAll),

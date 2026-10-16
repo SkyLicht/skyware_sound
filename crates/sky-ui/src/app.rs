@@ -122,6 +122,9 @@ pub enum Action {
     AddMarker,
     /// Show or hide a lane under the ruler.
     ToggleLane(Lane),
+    /// Move the piano roll's notes onto the grid; `true` moves their ends
+    /// too.
+    Quantize(bool),
     Quit,
 }
 
@@ -468,7 +471,7 @@ impl App {
     fn end_frame(&mut self, ctx: &Context) {
         let fast = self.transport.playing
             || self.arrange.gesture()
-            || self.piano.marquee.is_some()
+            || self.piano.gesture()
             || self.mixer.any_active()
             || self.ai.flashing(self.now)
             || self.jobs.is_busy()
@@ -519,10 +522,8 @@ impl App {
         // Arrow keys move between widgets while one has the keyboard.
         let widget_focus = ctx.memory(|m| m.focused().is_some());
         // Escape cancels a drag or closes a menu before it deselects.
-        let escape_taken = self.arrange.gesture()
-            || self.piano.drag.is_some()
-            || self.piano.marquee.is_some()
-            || egui::Popup::is_any_open(ctx);
+        let escape_taken =
+            self.arrange.gesture() || self.piano.gesture() || egui::Popup::is_any_open(ctx);
         let label_selected = ctx
             .plugin::<egui::text_selection::LabelSelectionState>()
             .lock()
@@ -687,6 +688,7 @@ impl App {
             Action::MuteClips => self.mute_selection(),
             Action::AddMarker => self.add_marker_at_playhead(),
             Action::ToggleLane(lane) => self.workspace.lanes.toggle(lane),
+            Action::Quantize(ends) => self.quantize_notes(ends),
         }
         self.refresh();
     }

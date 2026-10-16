@@ -39,6 +39,11 @@ pub fn parse_note_name(text: &str) -> Result<u8, CoreError> {
         .ok_or_else(err)
 }
 
+/// The name of a pitch class with sharps, `C` for 0 to `B` for 11.
+pub fn pitch_class_name(pitch_class: u8) -> &'static str {
+    NAMES[(pitch_class % 12) as usize]
+}
+
 /// Formats a MIDI note number as a name with sharps, such as `C4` or `F#3`.
 pub fn note_name(midi: u8) -> String {
     let octave = midi as i32 / 12 - 1;

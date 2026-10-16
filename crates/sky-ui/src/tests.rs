@@ -15,22 +15,25 @@ use sky_dsp::{AudioData, InstrumentType};
 use sky_model::templates::{demo_project, empty_project};
 use sky_model::{
     BankSample, Clip, ClipContent, Command, License, Note, Origin, PoolEntry, Project, SampleBank,
-    Track, Transaction,
+    Scale, ScaleMode, Track, Transaction,
 };
 use sky_session::Session;
 
 use crate::actions::{self, NewTrack};
-use crate::app::{Action, App, Tab};
+use crate::app::{Action, App, Focus, Tab};
 use crate::audition::{ButtonState, PreviewKey};
 use crate::clip_tools::{EditKind, Tool};
 use crate::dialogs::PathPurpose;
 use crate::edit::Copied;
 use crate::loop_inspector::Target;
+use crate::piano_roll::Ghosts;
 use crate::ruler_lanes::Lane;
 use crate::waveform::Peaks;
 use crate::widgets::Gestures;
+use crate::workspace::Workspace;
 use crate::{
     UiConfig, arrange, asset_lane, game, keys, menu, palette, pattern_editor, sounds, theme,
+    velocity_lane,
 };
 
 /// The app in a bare egui context, fed with synthetic input.
@@ -1653,6 +1656,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("theme.rs"),
         include_str!("tracks.rs"),
         include_str!("transport.rs"),
+        include_str!("velocity_lane.rs"),
         include_str!("waveform.rs"),
         include_str!("widgets.rs"),
         include_str!("workspace.rs"),
@@ -3008,6 +3012,8 @@ fn notes_are_selected_nudged_transposed_and_copied_in_the_piano_roll() {
     let bar = h.project().ticks_per_bar();
     h.app.sel.select_clip(pad.id, clip);
     h.app.workspace.show(Tab::Editor);
+    // Room for the rows the chord is on.
+    h.app.workspace.piano.velocity_lane = false;
     h.frames(3);
     h.app.piano.top_pitch = 72.0;
     h.frames(2);
@@ -4096,4 +4102,304 @@ fn the_ruler_lanes_hide_and_come_back_next_run() {
     assert!(next.app.workspace.lanes.markers);
     assert_eq!(next.project().markers.len(), 1);
     assert!(next.ctx.read_response(Id::new("marker_lane")).is_some());
+}
+
+/// Opens the piano roll's drop-down showing `shown` and picks `item`, once
+/// the list has scrolled to what is chosen.
+fn pick(h: &mut Harness, shown: &str, item: &str) {
+    h.frames(40);
+    h.click_in(Tab::Editor, shown);
+    h.frames(30);
+    // Exactly this label: "Phrygian" is not "Phrygian dominant".
+    let rect = h
+        .access
+        .iter()
+        .rev()
+        .find(|(l, _, _)| l == item)
+        .map(|(_, r, _)| *r)
+        .unwrap_or_else(|| panic!("no {item:?} in the list"));
+    h.click(rect.center());
+    h.frames(2);
+}
+
+/// The demo's Pad chords open in the piano roll.
+fn pad_in_piano_roll() -> (Harness, ClipId) {
+    let mut h = Harness::demo();
+    let pad = h.track_named("Pad");
+    let clip = pad.clips[0].id;
+    h.app.sel.select_clip(pad.id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    (h, clip)
+}
+
+/// The Pad's velocities, one per chord, from the velocities of its notes.
+fn chord_velocities(h: &Harness, clip: ClipId) -> Vec<(i64, u8)> {
+    let mut v: Vec<(i64, u8)> = notes_of(&h.clip(clip))
+        .iter()
+        .map(|n| (n.start, n.velocity))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+#[test]
+fn velocities_are_drawn_in_the_lane_under_the_piano_roll() {
+    let (mut h, clip) = pad_in_piano_roll();
+    let lane = h.rect_of(Id::new(("velocity_lane", clip)));
+    let bar = h.project().ticks_per_bar();
+    let x = |h: &Harness, tick: i64| {
+        lane.left()
+            + ((tick as f64 - h.app.piano.scroll) * f64::from(h.app.piano.px_per_tick)) as f32
+    };
+    let y = |v: u8| velocity_lane::y_of(lane, v);
+    let chords = [0, bar, bar * 2, bar * 3];
+    assert_eq!(
+        chord_velocities(&h, clip),
+        chords.map(|t| (t, 80)),
+        "one velocity per chord"
+    );
+    let history = h.history_len();
+
+    // Dragging level across the lane sets every stem, as one undo step.
+    h.drag(
+        pos2(x(&h, 0) + 1.0, y(120)),
+        pos2(lane.right() - 2.0, y(120)),
+    );
+    assert_eq!(chord_velocities(&h, clip), chords.map(|t| (t, 120)));
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Change velocity"));
+    assert_eq!(h.app.edit_focus(), Focus::Editor);
+    h.key(Key::Z, COMMAND);
+    assert_eq!(chord_velocities(&h, clip), chords.map(|t| (t, 80)));
+
+    // With notes selected, only they change.
+    let first: Vec<_> = notes_of(&h.clip(clip))
+        .iter()
+        .filter(|n| n.start == 0)
+        .map(|n| n.id)
+        .collect();
+    h.app.sel.notes = first.clone();
+    h.drag(pos2(x(&h, 0) + 1.0, y(30)), pos2(lane.right() - 2.0, y(30)));
+    assert_eq!(
+        chord_velocities(&h, clip),
+        [(0, 30), (bar, 80), (bar * 2, 80), (bar * 3, 80)]
+    );
+    h.key(Key::Z, COMMAND);
+
+    // Escape drops a drag without changing anything, and keeps the
+    // selection.
+    let history = h.history_len();
+    let from = pos2(x(&h, 0) + 1.0, y(10));
+    h.move_to(from);
+    h.pointer(from, true);
+    h.frame();
+    for i in 1..=5 {
+        h.move_to(from + vec2(i as f32 * 20.0, 0.0));
+    }
+    h.key(Key::Escape, Modifiers::NONE);
+    h.move_to(from + vec2(150.0, 0.0));
+    h.pointer(from + vec2(150.0, 0.0), false);
+    h.frames(2);
+    assert_eq!(chord_velocities(&h, clip), chords.map(|t| (t, 80)));
+    assert_eq!(h.history_len(), history);
+    assert_eq!(h.app.sel.notes.len(), 3);
+    h.app.sel.notes.clear();
+
+    // Shift draws a straight ramp, here from the second chord to the last.
+    h.set_modifiers(Modifiers::SHIFT);
+    h.drag(
+        pos2(x(&h, bar) - 1.0, y(20)),
+        pos2(x(&h, bar * 3) + 1.0, y(120)),
+    );
+    h.set_modifiers(Modifiers::NONE);
+    let v: Vec<u8> = chord_velocities(&h, clip).iter().map(|(_, v)| *v).collect();
+    assert_eq!(v.len(), 4, "{v:?}");
+    assert_eq!(v[0], 80, "{v:?}");
+    assert!(v[1] < v[2] && v[2] < v[3], "{v:?}");
+    assert!(v[1] <= 25 && v[3] >= 115, "{v:?}");
+
+    // A click sets the stems under the pointer.
+    h.frames(40);
+    h.click(pos2(x(&h, bar * 2), y(64)));
+    assert_eq!(chord_velocities(&h, clip)[2], (bar * 2, 64));
+    assert_eq!(chord_velocities(&h, clip)[1].1, v[1]);
+
+    // The toolbar hides the lane.
+    h.accessible();
+    h.click_in(Tab::Editor, "Velocity lane");
+    h.frames(2);
+    assert!(!h.app.workspace.piano.velocity_lane);
+    assert!(
+        h.ctx
+            .read_response(Id::new(("velocity_lane", clip)))
+            .is_none()
+    );
+}
+
+#[test]
+fn piano_roll_rows_zoom_and_its_look_is_kept_next_run() {
+    let (mut h, clip) = pad_in_piano_roll();
+    h.accessible();
+    assert_eq!(h.app.workspace.piano.row_h, 13.0);
+    h.click_in(Tab::Editor, "+");
+    assert_eq!(h.app.workspace.piano.row_h, 15.0);
+    h.frames(40);
+    h.click_in(Tab::Editor, "\u{2212}");
+    h.frames(40);
+    h.click_in(Tab::Editor, "\u{2212}");
+    assert_eq!(h.app.workspace.piano.row_h, 11.0);
+
+    // Alt and the wheel make the rows taller around the pointer.
+    let grid = h.rect_of(Id::new(("piano_bg", clip)));
+    let at = pos2(grid.center().x, grid.top() + 60.0);
+    let pitch =
+        |h: &Harness| h.app.piano.top_pitch - (at.y - grid.top()) / h.app.workspace.piano.row_h;
+    let before = pitch(&h);
+    h.move_to(at);
+    h.set_modifiers(Modifiers::ALT);
+    h.events.push(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(0.0, 30.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: Modifiers::ALT,
+    });
+    h.frames(20);
+    h.set_modifiers(Modifiers::NONE);
+    h.frames(2);
+    let row_h = h.app.workspace.piano.row_h;
+    assert!(row_h > 11.5 && row_h <= 32.0, "{row_h}");
+    assert!(
+        (pitch(&h) - before).abs() < 0.05,
+        "{} vs {before}",
+        pitch(&h)
+    );
+
+    // Ghost notes can be turned off.
+    assert_eq!(h.app.workspace.piano.ghosts, Ghosts::All);
+    pick(&mut h, "All tracks", "Off");
+    assert_eq!(h.app.workspace.piano.ghosts, Ghosts::Off);
+
+    // The row height, lane and ghosts come back next run.
+    h.app.workspace.piano.velocity_lane = false;
+    let look = h.app.workspace.piano;
+    let mut storage = MemoryStorage::default();
+    eframe::App::save(&mut h.app, &mut storage);
+    let mut next = Harness::demo();
+    next.app.restore(&storage);
+    assert_eq!(next.app.workspace.piano, look);
+
+    // A saved height out of range is brought back into it.
+    let mut w = Workspace::default();
+    w.restore(r#"{"piano":{"rowH":500,"ghosts":"track"}}"#);
+    assert_eq!(w.piano.row_h, 32.0);
+    assert_eq!(w.piano.ghosts, Ghosts::Track);
+    assert!(w.piano.velocity_lane);
+}
+
+#[test]
+fn the_song_key_is_picked_in_the_piano_roll_and_undoes() {
+    let (mut h, _) = pad_in_piano_roll();
+    h.accessible();
+    let scale = |h: &Harness| h.project().scale;
+    assert_eq!(scale(&h), Scale::new(9, ScaleMode::Minor).ok());
+
+    pick(&mut h, "minor", "Phrygian");
+    assert_eq!(scale(&h), Scale::new(9, ScaleMode::Phrygian).ok());
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Change scale"));
+    pick(&mut h, "A", "D");
+    assert_eq!(scale(&h), Scale::new(2, ScaleMode::Phrygian).ok());
+
+    // No scale, then a root alone gives its major scale.
+    pick(&mut h, "Phrygian", "No scale");
+    assert_eq!(scale(&h), None);
+    pick(&mut h, "\u{2013}", "E");
+    assert_eq!(scale(&h), Scale::new(4, ScaleMode::Major).ok());
+
+    h.key(Key::Z, COMMAND);
+    assert_eq!(scale(&h), None);
+    h.key(Key::Z, COMMAND);
+    assert_eq!(scale(&h), Scale::new(2, ScaleMode::Phrygian).ok());
+}
+
+#[test]
+fn notes_quantize_to_the_grid() {
+    let (mut h, clip) = pad_in_piano_roll();
+    let step = h.app.piano.grid.ticks();
+    let written = notes_of(&h.clip(clip));
+    // Played a little late, and let go a little early.
+    let late: Vec<Note> = written
+        .iter()
+        .map(|n| Note {
+            start: n.start + step / 3,
+            length: n.length - step / 5,
+            ..*n
+        })
+        .collect();
+    let r = actions::update_notes(&h.app.session, clip, late.clone(), "Play late", None);
+    h.app.report(r);
+    h.frames(2);
+    let spans = |h: &Harness| -> Vec<(i64, i64)> {
+        let mut v: Vec<_> = notes_of(&h.clip(clip))
+            .iter()
+            .map(|n| (n.start, n.start + n.length))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    // Each note back on its grid line, as long as it was played.
+    let mut starts_on_grid: Vec<(i64, i64)> = late
+        .iter()
+        .map(|n| (n.start - step / 3, n.start - step / 3 + n.length))
+        .collect();
+    starts_on_grid.sort_unstable();
+
+    // Q moves every note's start to the grid, and keeps its length.
+    h.app.sel.focus = Focus::Editor;
+    h.key(Key::Q, Modifiers::NONE);
+    assert_eq!(spans(&h), starts_on_grid);
+    let label = format!("Quantize {} notes", late.len());
+    assert_eq!(h.app.view.undo_label.as_deref(), Some(label.as_str()));
+    h.key(Key::Z, COMMAND);
+
+    // Shift+Q moves the ends too, of the selected notes only.
+    let first: Vec<_> = late
+        .iter()
+        .filter(|n| n.start == step / 3)
+        .map(|n| n.id)
+        .collect();
+    assert_eq!(first.len(), 3);
+    h.app.sel.notes = first.clone();
+    h.key(Key::Q, Modifiers::SHIFT);
+    let mut expected: Vec<(i64, i64)> = written
+        .iter()
+        .zip(&late)
+        .map(|(w, l)| {
+            let n = if first.contains(&l.id) { w } else { l };
+            (n.start, n.start + n.length)
+        })
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(spans(&h), expected);
+    h.key(Key::Z, COMMAND);
+    h.app.sel.notes.clear();
+
+    // The toolbar button does what Q does; then nothing is left to move.
+    h.accessible();
+    h.click_in(Tab::Editor, "Quantize");
+    assert_eq!(spans(&h), starts_on_grid);
+    let history = h.history_len();
+    h.frames(40);
+    h.click_in(Tab::Editor, "Quantize");
+    assert_eq!(h.history_len(), history);
+
+    // Shift+Q then puts the ends back where they were written.
+    h.key(Key::Q, Modifiers::SHIFT);
+    let mut on_grid: Vec<_> = written
+        .iter()
+        .map(|n| (n.start, n.start + n.length))
+        .collect();
+    on_grid.sort_unstable();
+    assert_eq!(spans(&h), on_grid);
 }

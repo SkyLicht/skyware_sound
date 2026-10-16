@@ -1,23 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The piano roll for MIDI clips.
+//! The piano roll for MIDI clips, with its velocity lane, the song's scale
+//! marked on the rows, and the notes of other clips shown faintly behind.
 
 use egui::{
-    Align2, Color32, Context, CornerRadius, CursorIcon, DragValue, Id, Key, Painter, Rect,
-    RichText, Sense, Stroke, StrokeKind, Ui, pos2,
+    Align2, Color32, ComboBox, Context, CornerRadius, CursorIcon, DragValue, Id, Key, Label,
+    Painter, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2,
 };
-use sky_core::music::note_name;
+use serde::{Deserialize, Serialize};
+use sky_core::music::{note_name, pitch_class_name};
 use sky_core::{NoteId, PPQ, Ticks};
-use sky_model::{Clip, Note, Project, Track};
+use sky_model::{
+    Clip, ClipContent, Command, Note, Project, Scale, ScaleMode, Track, TrackKind, Transaction,
+};
 
-use crate::app::{App, Focus};
+use crate::app::{Action, App, Focus};
 use crate::arrange::{snap_floor, snap_round};
 use crate::theme;
+use crate::velocity_lane::{self, VEL_H, VelDrag};
 use crate::widgets::Marquee;
-use crate::{actions, audition};
+use crate::{actions, audition, keys};
 
 const KEYS_W: f32 = 46.0;
 const RULER_H: f32 = 16.0;
 const EDGE: f32 = 5.0;
+/// The shortest and tallest a pitch row can be.
+pub const ROW_MIN: f32 = 6.0;
+pub const ROW_MAX: f32 = 32.0;
 
 /// Note lengths for drawing and snapping.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,6 +72,50 @@ impl NoteGrid {
     }
 }
 
+/// Whose notes show faintly behind the clip being edited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Ghosts {
+    Off,
+    /// The track's other MIDI clips.
+    Track,
+    /// Every MIDI clip on every instrument track.
+    #[default]
+    All,
+}
+
+impl Ghosts {
+    pub const ALL: [Ghosts; 3] = [Ghosts::Off, Ghosts::Track, Ghosts::All];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Ghosts::Off => "Off",
+            Ghosts::Track => "This track",
+            Ghosts::All => "All tracks",
+        }
+    }
+}
+
+/// How the piano roll looks, kept with the panel layout between runs.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PianoPrefs {
+    /// The height of a pitch row.
+    pub row_h: f32,
+    pub velocity_lane: bool,
+    pub ghosts: Ghosts,
+}
+
+impl Default for PianoPrefs {
+    fn default() -> Self {
+        Self {
+            row_h: 13.0,
+            velocity_lane: true,
+            ghosts: Ghosts::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteDragKind {
     Move,
@@ -91,13 +143,14 @@ pub struct PianoState {
     pub scroll: f64,
     /// The pitch row at the top edge (fractional while scrolling).
     pub top_pitch: f32,
-    pub row_h: f32,
     pub grid: NoteGrid,
     /// Velocity for new notes.
     pub velocity: u8,
     pub drag: Option<NoteDrag>,
     /// A rectangle being dragged over empty grid to select notes.
     pub marquee: Option<Marquee<NoteId>>,
+    /// Velocities being drawn in the velocity lane.
+    pub vel_drag: Option<VelDrag>,
 }
 
 impl PianoState {
@@ -105,6 +158,20 @@ impl PianoState {
     pub fn zoom(&mut self, factor: f32) {
         self.px_per_tick = (self.px_per_tick * factor).clamp(0.005, 4.0);
     }
+
+    /// Whether a drag is under way in the piano roll.
+    pub fn gesture(&self) -> bool {
+        self.drag.is_some() || self.marquee.is_some() || self.vel_drag.is_some()
+    }
+}
+
+/// Changes the row height to `row_h`, keeping the pitch at `y` where it is.
+fn zoom_rows(st: &mut PianoState, prefs: &mut PianoPrefs, grid: Rect, y: f32, row_h: f32) {
+    let row_h = row_h.clamp(ROW_MIN, ROW_MAX);
+    let anchor = st.top_pitch - (y - grid.top()) / prefs.row_h;
+    prefs.row_h = row_h;
+    let rows = grid.height() / row_h;
+    st.top_pitch = (anchor + (y - grid.top()) / row_h).clamp(rows.min(128.0), 128.0);
 }
 
 impl Default for PianoState {
@@ -114,16 +181,17 @@ impl Default for PianoState {
             px_per_tick: 0.1,
             scroll: 0.0,
             top_pitch: 84.0,
-            row_h: 13.0,
             grid: NoteGrid::default(),
             velocity: 100,
             drag: None,
             marquee: None,
+            vel_drag: None,
         }
     }
 }
 
-struct View {
+/// Where things are in the piano roll this frame.
+pub struct View {
     grid: Rect,
     left: f32,
     scroll: f64,
@@ -133,7 +201,8 @@ struct View {
 }
 
 impl View {
-    fn x_of(&self, tick: f64) -> f32 {
+    /// The x of a tick from the clip's start.
+    pub fn x_of(&self, tick: f64) -> f32 {
         self.left + ((tick - self.scroll) * self.ppt as f64) as f32
     }
     fn tick_at(&self, x: f32) -> f64 {
@@ -182,9 +251,10 @@ pub fn show(
 ) {
     // Toolbar.
     let mut refit = app.piano.clip != Some(clip.id);
-    ui.horizontal(|ui| {
+    let mut taller = 0.0;
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Grid").color(theme::TEXT_WEAK));
-        egui::ComboBox::from_id_salt("piano_grid")
+        ComboBox::from_id_salt("piano_grid")
             .width(96.0)
             .selected_text(app.piano.grid.label())
             .show_ui(ui, |ui| {
@@ -192,6 +262,32 @@ pub fn show(
                     ui.selectable_value(&mut app.piano.grid, g, g.label());
                 }
             });
+        let quantize = ui.button("Quantize").on_hover_text(format!(
+            "Move the selected notes, or every note, to the grid ({}); {} moves their ends too",
+            keys::shortcut_for(&Action::Quantize(false)),
+            keys::shortcut_for(&Action::Quantize(true)),
+        ));
+        if quantize.clicked() {
+            app.sel.focus = Focus::Editor;
+            app.quantize_notes(false);
+        }
+        ui.separator();
+        scale_ui(app, ui, project);
+        ui.separator();
+        ui.label(RichText::new("Ghost notes").color(theme::TEXT_WEAK));
+        let prefs = &mut app.workspace.piano;
+        ComboBox::from_id_salt("piano_ghosts")
+            .width(84.0)
+            .selected_text(prefs.ghosts.label())
+            .show_ui(ui, |ui| {
+                for g in Ghosts::ALL {
+                    ui.selectable_value(&mut prefs.ghosts, g, g.label());
+                }
+            })
+            .response
+            .on_hover_text(
+                "Notes of the track's other clips, or of every track's, drawn faintly behind these",
+            );
         ui.separator();
         let selected: Vec<Note> = notes
             .iter()
@@ -224,6 +320,27 @@ pub fn show(
                 app.report(r);
             }
         }
+        ui.checkbox(&mut app.workspace.piano.velocity_lane, "Velocity lane")
+            .on_hover_text(
+                "A stem for each note under the grid: drag across them to set velocities, \
+                 Shift-drag to draw a ramp",
+            );
+        ui.separator();
+        ui.label(RichText::new("Rows").color(theme::TEXT_WEAK));
+        if ui
+            .button("−")
+            .on_hover_text("Shorter rows (Alt+wheel)")
+            .clicked()
+        {
+            taller = -2.0;
+        }
+        if ui
+            .button("+")
+            .on_hover_text("Taller rows (Alt+wheel)")
+            .clicked()
+        {
+            taller = 2.0;
+        }
         if ui
             .button("Fit")
             .on_hover_text("Show the whole clip")
@@ -233,23 +350,24 @@ pub fn show(
         }
         ui.checkbox(&mut app.audition.hear_notes, "Hear notes")
             .on_hover_text("Play notes as you add, press or move them");
-        ui.label(
-            RichText::new(format!(
-                "{} note{} · {} selected",
-                notes.len(),
-                if notes.len() == 1 { "" } else { "s" },
-                selected.len()
-            ))
-            .small()
-            .color(theme::TEXT_DIM),
-        );
-        ui.label(
-            RichText::new(
-                "Click to add · drag a note to move it, its end to resize · drag empty space \
-                 to select · arrow keys nudge and transpose · right-click deletes",
+        // Kept on one line when the toolbar wraps.
+        ui.add(
+            Label::new(
+                RichText::new(format!(
+                    "{} note{} · {} selected",
+                    notes.len(),
+                    if notes.len() == 1 { "" } else { "s" },
+                    selected.len()
+                ))
+                .small()
+                .color(theme::TEXT_DIM),
             )
-            .small()
-            .color(theme::TEXT_DIM),
+            .extend(),
+        )
+        .on_hover_text(
+            "Click to add a note · drag a note to move it, its end to resize · drag empty \
+             space to select · arrow keys nudge and transpose · right-click deletes · \
+             Ctrl+wheel zooms in time, Alt+wheel zooms the rows",
         );
     });
 
@@ -257,21 +375,36 @@ pub fn show(
     if full.width() < KEYS_W + 40.0 || full.height() < RULER_H + 30.0 {
         return;
     }
-    let grid_rect = Rect::from_min_max(pos2(full.left() + KEYS_W, full.top() + RULER_H), full.max);
-    let rows = grid_rect.height() / app.piano.row_h;
+    // The velocity lane gives way when there is no room for it.
+    let lane_h = if app.workspace.piano.velocity_lane && full.height() >= RULER_H + 60.0 + VEL_H {
+        VEL_H
+    } else {
+        0.0
+    };
+    let grid_rect = Rect::from_min_max(
+        pos2(full.left() + KEYS_W, full.top() + RULER_H),
+        pos2(full.right(), full.bottom() - lane_h),
+    );
+    if taller != 0.0 {
+        let row_h = app.workspace.piano.row_h + taller;
+        let y = grid_rect.center().y;
+        zoom_rows(
+            &mut app.piano,
+            &mut app.workspace.piano,
+            grid_rect,
+            y,
+            row_h,
+        );
+    }
+    let rows = grid_rect.height() / app.workspace.piano.row_h;
     if refit {
         fit(&mut app.piano, clip, notes, grid_rect.width(), rows);
         app.piano.clip = Some(clip.id);
         app.piano.drag = None;
         app.piano.marquee = None;
+        app.piano.vel_drag = None;
     }
-    input(
-        app,
-        ui,
-        Rect::from_min_max(pos2(full.left(), full.top()), full.max),
-        grid_rect,
-        rows,
-    );
+    input(app, ui, full, grid_rect);
 
     let view = View {
         grid: grid_rect,
@@ -279,7 +412,7 @@ pub fn show(
         scroll: app.piano.scroll,
         ppt: app.piano.px_per_tick,
         top_pitch: app.piano.top_pitch,
-        row_h: app.piano.row_h,
+        row_h: app.workspace.piano.row_h,
     };
     update_drag(app, ui.ctx(), &view, project, track, clip);
     update_marquee(app, ui.ctx(), &view, notes);
@@ -288,7 +421,7 @@ pub fn show(
     // them plays each key passed.
     let keys_rect = Rect::from_min_max(
         pos2(full.left(), grid_rect.top()),
-        pos2(grid_rect.left(), full.bottom()),
+        pos2(grid_rect.left(), grid_rect.bottom()),
     );
     let keys = ui
         .interact(
@@ -311,6 +444,17 @@ pub fn show(
 
     let painter = ui.painter_at(full);
     draw_background(&painter, &view, project, clip);
+    let note_painter = painter.with_clip_rect(grid_rect.intersect(painter.clip_rect()));
+    let (from, to) = (
+        view.tick_at(grid_rect.left()),
+        view.tick_at(grid_rect.right()),
+    );
+    for (n, c) in ghost_notes(project, track, clip, app.workspace.piano.ghosts, from, to) {
+        let r = view.note_rect(&n);
+        if r.intersects(grid_rect) {
+            draw_ghost(&note_painter, r, c);
+        }
+    }
 
     // Background interaction first so notes on top take precedence.
     let bg = ui.interact(
@@ -348,14 +492,22 @@ pub fn show(
             .collect(),
         None => notes.to_vec(),
     };
-    let note_painter = painter.with_clip_rect(grid_rect.intersect(painter.clip_rect()));
+    // Velocities being drawn show in the notes' brightness as well.
+    let drawing = app.piano.vel_drag.as_ref().map(|d| d.preview.clone());
     for n in &shown {
         let r = view.note_rect(n);
         if !r.intersects(grid_rect) {
             continue;
         }
         let selected = app.sel.notes.contains(&n.id);
-        draw_note(&note_painter, r, n, color, selected);
+        let look = drawing
+            .as_ref()
+            .and_then(|d| d.iter().find(|m| m.id == n.id))
+            .map_or(*n, |m| Note {
+                velocity: m.velocity,
+                ..*n
+            });
+        draw_note(&note_painter, r, &look, color, selected);
         if drag.is_some() {
             continue;
         }
@@ -446,7 +598,7 @@ pub fn show(
             painter.vline(x, grid_rect.y_range(), Stroke::new(1.0, theme::ACCENT));
         }
     }
-    draw_keys(&painter, &view, keys_rect, held);
+    draw_keys(&painter, &view, keys_rect, held, project.scale);
     draw_ruler(
         &painter,
         &view,
@@ -462,16 +614,129 @@ pub fn show(
         CornerRadius::ZERO,
         theme::HEADER,
     );
+    if lane_h > 0.0 {
+        let lane = Rect::from_min_max(pos2(grid_rect.left(), grid_rect.bottom()), full.max);
+        let corner = Rect::from_min_max(
+            pos2(full.left(), grid_rect.bottom()),
+            pos2(grid_rect.left(), full.bottom()),
+        );
+        velocity_lane::show(app, ui, &painter, &view, lane, corner, clip, &shown, color);
+    } else {
+        app.piano.vel_drag = None;
+    }
     ui.advance_cursor_after_rect(full);
 }
 
-fn input(app: &mut App, ui: &mut Ui, area: Rect, grid: Rect, rows: f32) {
+/// The song's key, which the rows light up. One undo step per change.
+fn scale_ui(app: &mut App, ui: &mut Ui, project: &Project) {
+    ui.label(RichText::new("Scale").color(theme::TEXT_WEAK));
+    let current = project.scale;
+    let mut chosen = current;
+    ComboBox::from_id_salt("piano_scale_root")
+        .width(40.0)
+        .selected_text(current.map_or("–", |s| pitch_class_name(s.root)))
+        .show_ui(ui, |ui| {
+            let mode = current.map_or(ScaleMode::Major, |s| s.mode);
+            for root in 0..12u8 {
+                let on = current.is_some_and(|s| s.root == root);
+                if ui.selectable_label(on, pitch_class_name(root)).clicked() {
+                    chosen = Some(Scale { root, mode });
+                }
+            }
+        })
+        .response
+        .on_hover_text("The scale's root note");
+    ComboBox::from_id_salt("piano_scale_mode")
+        .width(120.0)
+        .selected_text(current.map_or("No scale", |s| s.mode.label()))
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(current.is_none(), "No scale").clicked() {
+                chosen = None;
+            }
+            let root = current.map_or(0, |s| s.root);
+            for mode in ScaleMode::ALL {
+                let on = current.is_some_and(|s| s.mode == mode);
+                if ui.selectable_label(on, mode.label()).clicked() {
+                    chosen = Some(Scale { root, mode });
+                }
+            }
+        })
+        .response
+        .on_hover_text("The song's scale: its notes are lit in the piano roll, its root most");
+    if chosen != current {
+        let tx = Transaction::single(Command::SetScale { scale: chosen });
+        let r = actions::apply(&app.session, tx, None);
+        app.report(r);
+    }
+}
+
+/// The notes of other MIDI clips that sound between `from` and `to`,
+/// ticks from this clip's start, placed from that start, each with its
+/// track's color. Muted clips are left out.
+fn ghost_notes(
+    project: &Project,
+    track: &Track,
+    clip: &Clip,
+    ghosts: Ghosts,
+    from: f64,
+    to: f64,
+) -> Vec<(Note, Color32)> {
+    let mut out = Vec::new();
+    if ghosts == Ghosts::Off {
+        return out;
+    }
+    for t in &project.tracks {
+        if t.kind != TrackKind::Instrument || (ghosts == Ghosts::Track && t.id != track.id) {
+            continue;
+        }
+        let color = theme::track_color(t.color);
+        for c in t.clips.iter().filter(|c| c.id != clip.id && !c.muted) {
+            let ClipContent::Midi { notes } = &c.content else {
+                continue;
+            };
+            let offset = c.start - clip.start;
+            for n in notes.iter().filter(|n| n.start < c.length) {
+                let start = n.start + offset;
+                let end = (n.start + n.length).min(c.length) + offset;
+                if (end as f64) < from || (start as f64) > to {
+                    continue;
+                }
+                let ghost = Note {
+                    start,
+                    length: end - start,
+                    ..*n
+                };
+                out.push((ghost, color));
+            }
+        }
+    }
+    out
+}
+
+fn draw_ghost(p: &Painter, r: Rect, color: Color32) {
+    p.rect_filled(r, CornerRadius::same(2), color.gamma_multiply(0.16));
+    p.rect_stroke(
+        r,
+        CornerRadius::same(2),
+        Stroke::new(1.0, color.gamma_multiply(0.45)),
+        StrokeKind::Inside,
+    );
+}
+
+fn input(app: &mut App, ui: &mut Ui, area: Rect, grid: Rect) {
     if !ui.rect_contains_pointer(area) {
         return;
     }
-    let (pos, zoom, delta) =
-        ui.input(|i| (i.pointer.hover_pos(), i.zoom_delta(), i.smooth_scroll_delta));
+    let (pos, zoom, delta, alt) = ui.input(|i| {
+        (
+            i.pointer.hover_pos(),
+            i.zoom_delta(),
+            i.smooth_scroll_delta,
+            i.modifiers.alt,
+        )
+    });
     let st = &mut app.piano;
+    let prefs = &mut app.workspace.piano;
     if zoom != 1.0
         && let Some(p) = pos
     {
@@ -480,11 +745,20 @@ fn input(app: &mut App, ui: &mut Ui, area: Rect, grid: Rect, rows: f32) {
         st.px_per_tick = (st.px_per_tick * zoom).clamp(0.005, 4.0);
         st.scroll = (anchor - ((x - grid.left()) / st.px_per_tick) as f64).max(0.0);
     }
-    if delta != egui::Vec2::ZERO {
-        st.top_pitch = (st.top_pitch + delta.y / st.row_h).clamp(rows.min(128.0), 128.0);
-        st.scroll = (st.scroll - (delta.x / st.px_per_tick) as f64).max(0.0);
-        ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+    if delta == egui::Vec2::ZERO {
+        return;
     }
+    // Alt and the wheel make the rows taller or shorter.
+    if alt && let Some(p) = pos {
+        let by = delta.y + delta.x;
+        let y = p.y.clamp(grid.top(), grid.bottom());
+        zoom_rows(st, prefs, grid, y, prefs.row_h * (1.0 + by * 0.01));
+    } else {
+        let rows = grid.height() / prefs.row_h;
+        st.top_pitch = (st.top_pitch + delta.y / prefs.row_h).clamp(rows.min(128.0), 128.0);
+        st.scroll = (st.scroll - (delta.x / st.px_per_tick) as f64).max(0.0);
+    }
+    ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
 }
 
 /// Selects the notes a marquee touches, as it is dragged.
@@ -662,12 +936,21 @@ fn draw_background(p: &Painter, v: &View, project: &Project, clip: &Clip) {
     while pitch >= last {
         let pu = pitch as u8;
         let y = v.y_of(pu);
-        if is_black(pu) {
-            p.rect_filled(
-                Rect::from_min_max(pos2(g.left(), y), pos2(g.right(), y + v.row_h)),
-                CornerRadius::ZERO,
-                theme::darken(theme::LANE, 0.25),
-            );
+        let row = Rect::from_min_max(pos2(g.left(), y), pos2(g.right(), y + v.row_h));
+        // With a scale, its notes are lit and its root most; without one,
+        // the black keys are shaded.
+        let fill = match project.scale {
+            Some(s) if s.is_root(pu) => Some(theme::lighten(theme::LANE, 0.06)),
+            Some(s) if s.contains(pu) => Some(theme::lighten(theme::LANE, 0.03)),
+            Some(_) => Some(theme::darken(theme::LANE, 0.32)),
+            None if is_black(pu) => Some(theme::darken(theme::LANE, 0.25)),
+            None => None,
+        };
+        if let Some(fill) = fill {
+            p.rect_filled(row, CornerRadius::ZERO, fill);
+        }
+        if project.scale.is_some_and(|s| s.is_root(pu)) {
+            p.rect_filled(row, CornerRadius::ZERO, theme::ACCENT.gamma_multiply(0.08));
         }
         if pu.is_multiple_of(12) {
             p.hline(g.x_range(), y + v.row_h, Stroke::new(1.0, theme::GRID_BAR));
@@ -735,7 +1018,7 @@ fn draw_note(p: &Painter, r: Rect, n: &Note, color: Color32, selected: bool) {
     }
 }
 
-fn draw_keys(p: &Painter, v: &View, rect: Rect, held: Option<u8>) {
+fn draw_keys(p: &Painter, v: &View, rect: Rect, held: Option<u8>, scale: Option<Scale>) {
     let p = p.with_clip_rect(rect.intersect(p.clip_rect()));
     p.rect_filled(rect, CornerRadius::ZERO, Color32::from_gray(200));
     let first = (v.top_pitch.ceil() as i32 - 1).min(127);
@@ -763,9 +1046,23 @@ fn draw_keys(p: &Painter, v: &View, rect: Rect, held: Option<u8>) {
                 Stroke::new(1.0, Color32::from_gray(150)),
             );
         }
-        if pu.is_multiple_of(12) {
+        // The scale's notes get a mark at the keys' edge, its root a wider
+        // one and a name.
+        if let Some(s) = scale.filter(|s| s.contains(pu)) {
+            let w = if s.is_root(pu) { 4.0 } else { 2.0 };
+            p.rect_filled(
+                Rect::from_min_max(
+                    pos2(rect.right() - w - 1.0, row.top() + 1.0),
+                    pos2(rect.right() - 1.0, row.bottom() - 1.0),
+                ),
+                CornerRadius::ZERO,
+                theme::ACCENT,
+            );
+        }
+        let root = scale.is_some_and(|s| s.is_root(pu));
+        if (pu.is_multiple_of(12) || root) && v.row_h >= 8.0 {
             p.text(
-                pos2(rect.right() - 3.0, row.center().y),
+                pos2(rect.right() - 7.0, row.center().y),
                 Align2::RIGHT_CENTER,
                 note_name(pu),
                 egui::FontId::proportional(10.0),
@@ -817,5 +1114,57 @@ fn draw_ruler(p: &Painter, v: &View, rect: Rect, project: &Project, clip: &Clip)
         );
         t += step;
         n += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sky_core::ClipId;
+    use sky_model::templates::demo_project;
+
+    #[test]
+    fn ghost_notes_come_from_other_clips() {
+        let mut project = demo_project();
+        let bar = project.ticks_per_bar();
+        let pad = project.tracks.iter().position(|t| t.name == "Pad").unwrap();
+        let bass = project
+            .tracks
+            .iter()
+            .position(|t| t.name == "Bass")
+            .unwrap();
+        let mut later = project.tracks[pad].clips[0].clone();
+        later.id = ClipId::new();
+        later.start = bar * 2;
+        later.length = bar;
+        later.content = ClipContent::Midi {
+            notes: vec![Note::new(0, PPQ, 72, 90), Note::new(bar * 2, PPQ, 74, 90)],
+        };
+        project.tracks[pad].clips.push(later);
+        let track = project.tracks[pad].clone();
+        let clip = track.clips[0].clone();
+        let ghosts = |project: &Project, g: Ghosts, to: Ticks| -> Vec<Note> {
+            ghost_notes(project, &track, &clip, g, 0.0, to as f64)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        let end = bar * 8;
+        assert!(ghosts(&project, Ghosts::Off, end).is_empty());
+        // The track's other clip, placed from this clip's start; its note
+        // past that clip's end is left out.
+        let own = ghosts(&project, Ghosts::Track, end);
+        assert_eq!(own.len(), 1);
+        assert_eq!((own[0].start, own[0].pitch), (bar * 2, 72));
+        // Every instrument track's MIDI clips, but not drum patterns.
+        let bass_notes = match &project.tracks[bass].clips[0].content {
+            ClipContent::Midi { notes } => notes.len(),
+            _ => panic!("a MIDI clip"),
+        };
+        assert_eq!(ghosts(&project, Ghosts::All, end).len(), bass_notes + 1);
+        // Only what is in view, and not muted clips.
+        assert!(ghosts(&project, Ghosts::Track, bar).is_empty());
+        project.tracks[bass].clips[0].muted = true;
+        assert_eq!(ghosts(&project, Ghosts::All, end).len(), 1);
     }
 }
