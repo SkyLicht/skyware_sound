@@ -516,7 +516,7 @@ impl App {
             }
             (Some(t), None, Some((sound, variation))) => {
                 self.sel.select_track(t.id);
-                self.tab = Tab::Instrument;
+                self.workspace.show(Tab::Instrument);
                 if *variation == 0 {
                     format!("Added {name} to {} as {sound}", t.name)
                 } else {
@@ -525,7 +525,7 @@ impl App {
             }
             (Some(t), None, None) => {
                 self.sel.select_track(t.id);
-                self.tab = Tab::Instrument;
+                self.workspace.show(Tab::Instrument);
                 format!("Loaded {name} into {}", t.name)
             }
             (None, _, _) => format!("Imported {name}"),
@@ -552,7 +552,7 @@ impl App {
             return;
         };
         self.refresh();
-        self.browser.open = true;
+        self.workspace.show(Tab::Browser);
         self.browser.set_expanded("pool", true);
         let mut text = format!(
             "Imported {} files into the project's audio; drag them from the browser onto a track",
@@ -854,19 +854,22 @@ fn item_row(
 
 /// The browser panel.
 pub fn panel(app: &mut App, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Browser").strong().color(theme::TEXT));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.toggle_value(&mut app.browser.hear, "Hear")
-                .on_hover_text("Play an item when it is clicked");
-        });
-    });
-    let search = ui.add(
-        TextEdit::singleline(&mut app.browser.search)
-            .id(Id::new("browser_search"))
-            .hint_text("Search")
-            .desired_width(f32::INFINITY),
-    );
+    // The tab names the panel, so the search and Hear share the top row.
+    let search = ui
+        .horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.toggle_value(&mut app.browser.hear, "Hear")
+                    .on_hover_text("Play an item when it is clicked");
+                ui.add(
+                    TextEdit::singleline(&mut app.browser.search)
+                        .id(Id::new("browser_search"))
+                        .hint_text("Search")
+                        .desired_width(ui.available_width()),
+                )
+            })
+            .inner
+        })
+        .inner;
     if search.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.browser.search.clear();
     }

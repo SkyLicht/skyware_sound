@@ -28,6 +28,12 @@ pub fn browser_folders_file() -> Option<PathBuf> {
     ProjectDirs::from("", "", "Skyware Sound").map(|d| d.config_dir().join("browser-folders.txt"))
 }
 
+/// Where the window's size and place, the panel layout and the recent
+/// projects are kept.
+pub fn layout_file() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "Skyware Sound").map(|d| d.config_dir().join("workspace.ron"))
+}
+
 fn token_path() -> anyhow::Result<PathBuf> {
     Ok(dirs()?.config_dir().join("mcp-token"))
 }

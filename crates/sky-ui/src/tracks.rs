@@ -64,7 +64,7 @@ pub fn header(
     }
     if bg.double_clicked() && track.kind == TrackKind::Instrument {
         app.sel.select_track(track.id);
-        app.tab = Tab::Instrument;
+        app.workspace.show(Tab::Instrument);
     }
     bg.context_menu(|ui| header_menu(app, ui, project, track, index));
 
@@ -241,7 +241,7 @@ fn header_menu(app: &mut App, ui: &mut Ui, project: &Project, track: &Track, ind
     }
     if track.kind == TrackKind::Instrument && ui.button("Edit instrument").clicked() {
         app.sel.select_track(track.id);
-        app.tab = Tab::Instrument;
+        app.workspace.show(Tab::Instrument);
     }
     ui.separator();
     if ui

@@ -271,8 +271,14 @@ fn toolbar(app: &mut App, ui: &mut Ui, project: &Project) {
         .inner_margin(Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.toggle_value(&mut app.browser.open, "Browser")
-                    .on_hover_text("Show or hide the browser of audio and sample packs (Ctrl+B)");
+                let open = app.browser.open;
+                if ui
+                    .selectable_label(open, "Browser")
+                    .on_hover_text("Show or hide the browser of audio and sample packs (Ctrl+B)")
+                    .clicked()
+                {
+                    app.workspace.toggle(Tab::Browser);
+                }
                 ui.separator();
                 ui.label(RichText::new("Add track").color(theme::TEXT_WEAK));
                 for kind in NewTrack::ALL {
@@ -915,7 +921,7 @@ fn lane_menu(app: &mut App, ui: &mut Ui, project: &Project, track: &Track) {
                 if let Some(id) = app.report(r) {
                     app.refresh();
                     app.sel.select_clip(track.id, id);
-                    app.tab = Tab::Editor;
+                    app.workspace.show(Tab::Editor);
                 }
             }
             if ui.button("Add step clip here").clicked() {
@@ -924,7 +930,7 @@ fn lane_menu(app: &mut App, ui: &mut Ui, project: &Project, track: &Track) {
                 if let Some(id) = app.report(r) {
                     app.refresh();
                     app.sel.select_clip(track.id, id);
-                    app.tab = Tab::Editor;
+                    app.workspace.show(Tab::Editor);
                 }
             }
         }
@@ -965,7 +971,7 @@ pub fn create_clip_at(app: &mut App, track: TrackId, tick: f64) -> Option<ClipId
     let id = app.report(r)?;
     app.refresh();
     app.sel.select_clip(track, id);
-    app.tab = Tab::Editor;
+    app.workspace.show(Tab::Editor);
     Some(id)
 }
 
@@ -1020,7 +1026,7 @@ fn clip_ui(
     }
     if body.double_clicked() {
         app.sel.select_clip(track.id, clip.id);
-        app.tab = Tab::Editor;
+        app.workspace.show(Tab::Editor);
     }
     let origin = ui.input(|i| i.pointer.press_origin());
     if edge.drag_started() {
@@ -1033,7 +1039,7 @@ fn clip_ui(
     body.context_menu(|ui| {
         if ui.button("Open in editor").clicked() {
             app.sel.select_clip(track.id, clip.id);
-            app.tab = Tab::Editor;
+            app.workspace.show(Tab::Editor);
         }
         if ui.button("Duplicate").clicked() {
             duplicate_clip(app, track, clip);

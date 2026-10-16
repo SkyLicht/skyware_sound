@@ -20,6 +20,7 @@ mod browser;
 mod dialogs;
 mod game;
 mod jobs;
+mod menu;
 mod mixer;
 mod palette;
 mod params;
@@ -32,6 +33,7 @@ mod tracks;
 mod transport;
 mod waveform;
 mod widgets;
+mod workspace;
 
 #[cfg(test)]
 mod tests;
@@ -56,6 +58,10 @@ pub struct UiConfig {
     /// The file that keeps the browser's folders between runs; `None` keeps
     /// them only while the app runs.
     pub browser_store: Option<std::path::PathBuf>,
+    /// The file that keeps the window's size and place, the zoom, the panel
+    /// layout and the recent projects between runs; `None` uses eframe's
+    /// default place for it.
+    pub layout_store: Option<std::path::PathBuf>,
 }
 
 /// Opens the main window and runs until it is closed.
@@ -71,6 +77,7 @@ pub fn run(session: Session, config: UiConfig) -> anyhow::Result<()> {
             .with_min_inner_size([960.0, 600.0]),
         renderer: eframe::Renderer::Glow,
         centered: true,
+        persistence_path: config.layout_store.clone(),
         ..Default::default()
     };
     eframe::run_native(
@@ -79,6 +86,9 @@ pub fn run(session: Session, config: UiConfig) -> anyhow::Result<()> {
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             let mut app = app::App::new(session, config, true);
+            if let Some(storage) = cc.storage {
+                app.restore(storage);
+            }
             app.start_audio();
             Ok(Box::new(app))
         }),
