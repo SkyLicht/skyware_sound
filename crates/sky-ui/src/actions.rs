@@ -505,33 +505,6 @@ pub fn add_audio_clip(
     Ok(id)
 }
 
-pub fn delete_clip(session: &Session, id: ClipId) -> ActionResult<u64> {
-    single(session, Command::RemoveClip { id }, None)
-}
-
-pub fn move_clip(session: &Session, id: ClipId, track: TrackId, start: Ticks) -> ActionResult<u64> {
-    single(
-        session,
-        Command::MoveClip {
-            id,
-            track,
-            start: start.max(0),
-        },
-        None,
-    )
-}
-
-pub fn resize_clip(session: &Session, id: ClipId, length: Ticks) -> ActionResult<u64> {
-    single(
-        session,
-        Command::SetClipLength {
-            id,
-            length: length.max(1),
-        },
-        None,
-    )
-}
-
 pub fn rename_clip(session: &Session, id: ClipId, name: &str) -> ActionResult<u64> {
     single(
         session,

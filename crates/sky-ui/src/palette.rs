@@ -7,7 +7,7 @@ use sky_model::ChannelRef;
 
 use crate::actions::NewTrack;
 use crate::app::{Action, App, Tab};
-use crate::theme;
+use crate::{keys, theme};
 
 #[derive(Default)]
 pub struct PaletteState {
@@ -41,14 +41,15 @@ impl PaletteState {
 
 pub struct Entry {
     pub label: String,
-    pub shortcut: &'static str,
+    /// From the key command table; empty when the action has no key.
+    pub shortcut: String,
     pub action: Action,
 }
 
-fn entry(label: impl Into<String>, shortcut: &'static str, action: Action) -> Entry {
+fn entry(label: impl Into<String>, action: Action) -> Entry {
     Entry {
         label: label.into(),
-        shortcut,
+        shortcut: keys::shortcut_for(&action),
         action,
     }
 }
@@ -60,7 +61,6 @@ pub fn entries(app: &App) -> Vec<Entry> {
     for kind in NewTrack::ALL {
         out.push(entry(
             format!("Add {} track", kind.label().to_lowercase()),
-            "",
             Action::AddTrack(kind),
         ));
     }
@@ -73,7 +73,6 @@ pub fn entries(app: &App) -> Vec<Entry> {
         if let Some((id, name)) = &selected {
             out.push(entry(
                 format!("Add {} to {name}", kind.label()),
-                "",
                 Action::AddEffect {
                     channel: ChannelRef::Track(*id),
                     kind,
@@ -82,7 +81,6 @@ pub fn entries(app: &App) -> Vec<Entry> {
         }
         out.push(entry(
             format!("Add {} to master", kind.label()),
-            "",
             Action::AddEffect {
                 channel: ChannelRef::Master,
                 kind,
@@ -90,41 +88,38 @@ pub fn entries(app: &App) -> Vec<Entry> {
         ));
     }
     out.extend([
-        entry("Play / stop", "Space", Action::PlayStop),
+        entry("Play / stop", Action::PlayStop),
         entry(
             if project.loop_enabled {
                 "Turn loop off"
             } else {
                 "Turn loop on"
             },
-            "",
             Action::ToggleLoop,
         ),
-        entry("Undo", "Ctrl+Z", Action::Undo),
-        entry("Redo", "Ctrl+Shift+Z", Action::Redo),
-        entry("Set tempo…", "", Action::PromptTempo),
-        entry("New empty project", "", Action::NewEmpty),
-        entry("New demo project", "", Action::NewDemo),
-        entry("New techno loop", "", Action::NewTechno),
-        entry("New acid loop", "", Action::NewAcid),
-        entry("Open project…", "Ctrl+O", Action::Open),
-        entry("Save", "Ctrl+S", Action::Save),
-        entry("Save as…", "Ctrl+Shift+S", Action::SaveAs),
-        entry("Import audio…", "", Action::ImportAudio),
-        entry("Load sounds from a sample pack…", "", Action::LoadSounds),
+        entry("Undo", Action::Undo),
+        entry("Redo", Action::Redo),
+        entry("Set tempo…", Action::PromptTempo),
+        entry("New empty project", Action::NewEmpty),
+        entry("New demo project", Action::NewDemo),
+        entry("New techno loop", Action::NewTechno),
+        entry("New acid loop", Action::NewAcid),
+        entry("Open project…", Action::Open),
+        entry("Save", Action::Save),
+        entry("Save as…", Action::SaveAs),
+        entry("Import audio…", Action::ImportAudio),
+        entry("Load sounds from a sample pack…", Action::LoadSounds),
         entry(
             "Add a folder of samples to the browser…",
-            "",
             Action::AddBrowserFolder,
         ),
-        entry("Export loop for a game…", "", Action::ExportLoop),
+        entry("Export loop for a game…", Action::ExportLoop),
         entry(
             "Game assets: loops and SFX sets for a game…",
-            "",
             Action::GameAssets,
         ),
-        entry("Export WAV…", "", Action::ExportWav),
-        entry("Audio settings…", "", Action::OpenSettings),
+        entry("Export WAV…", Action::ExportWav),
+        entry("Audio settings…", Action::OpenSettings),
     ]);
     for tab in Tab::ALL {
         let name = match tab {
@@ -140,14 +135,22 @@ pub fn entries(app: &App) -> Vec<Entry> {
         } else {
             "Show"
         };
-        let shortcut = if tab == Tab::Browser { "Ctrl+B" } else { "" };
-        out.push(entry(
-            format!("{verb} {name}"),
-            shortcut,
-            Action::TogglePanel(tab),
-        ));
+        out.push(entry(format!("{verb} {name}"), Action::TogglePanel(tab)));
     }
-    out.push(entry("Reset the panel layout", "", Action::ResetLayout));
+    out.extend([
+        entry("Reset the panel layout", Action::ResetLayout),
+        entry("Cut", Action::Cut),
+        entry("Copy", Action::Copy),
+        entry("Paste at the playhead", Action::Paste),
+        entry("Duplicate the selection", Action::Duplicate),
+        entry("Delete the selection", Action::DeleteSelection),
+        entry("Select all", Action::SelectAll),
+        entry("Select nothing", Action::SelectNone),
+        entry("Zoom the timeline in", Action::TimelineZoom(1)),
+        entry("Zoom the timeline out", Action::TimelineZoom(-1)),
+        entry("Fit the timeline", Action::TimelineFit),
+        entry("Keyboard shortcuts", Action::Shortcuts),
+    ]);
     out
 }
 
@@ -170,7 +173,6 @@ pub fn filter(entries: Vec<Entry>, query: &str) -> Vec<Entry> {
     if let Some(bpm) = tempo_in(&q) {
         out.push(entry(
             format!("Set tempo to {bpm} BPM"),
-            "",
             Action::SetTempo(bpm),
         ));
     }
@@ -255,7 +257,7 @@ pub fn show(app: &mut App, ctx: &Context) {
                         selected,
                         RichText::new(&e.label).color(theme::TEXT),
                     )
-                    .right_text(RichText::new(e.shortcut).small().color(theme::TEXT_DIM))
+                    .right_text(RichText::new(&e.shortcut).small().color(theme::TEXT_DIM))
                     .min_size(vec2(ui.available_width(), 24.0));
                     let r = ui.add(button);
                     if selected && (down || up) {

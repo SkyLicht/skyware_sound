@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{
-    Align, CentralPanel, Context, Frame, Key, KeyboardShortcut, Layout, Margin, Modifiers, Panel,
-    RichText, Ui, ViewportCommand,
+    Align, CentralPanel, Context, Event, Frame, Key, Layout, Margin, Panel, RichText, Ui,
+    ViewportCommand,
 };
 use sky_core::{ClipId, NoteId, ProjectId, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
@@ -22,7 +22,9 @@ use crate::audio::AudioState;
 use crate::audition::Audition;
 use crate::browser::BrowserState;
 use crate::dialogs::{Confirm, Dialogs, PathPurpose};
+use crate::edit::EditState;
 use crate::jobs::{JobOutput, Jobs};
+use crate::keys;
 use crate::mixer::MixerState;
 use crate::palette::PaletteState;
 use crate::pattern_editor::PatternState;
@@ -84,11 +86,33 @@ pub enum Action {
     PromptTempo,
     OpenSettings,
     OpenPalette,
+    /// Help > Keyboard shortcuts.
+    Shortcuts,
+    Cut,
+    Copy,
+    /// Paste at the playhead.
+    Paste,
+    /// Copy the selection to just after itself.
+    Duplicate,
     DeleteSelection,
+    SelectAll,
+    SelectNone,
+    /// Move the selected clips or notes along by this many grid steps.
+    Nudge(i32),
+    /// Move the selected clips or notes along by this many bars.
+    NudgeBars(i32),
+    /// Move the selected notes up by this many semitones (down when negative).
+    Transpose(i32),
+    /// Move the selected clips this many tracks down (up when negative).
+    MoveToTrack(i32),
+    /// Zoom the arrangement or piano roll in (positive) or out.
+    TimelineZoom(i32),
+    /// Show the whole song, or the whole clip in the piano roll.
+    TimelineFit,
     Quit,
 }
 
-/// Which area the Delete key acts on.
+/// Which area the edit commands and arrow keys act on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Focus {
     #[default]
@@ -99,7 +123,10 @@ pub enum Focus {
 #[derive(Default)]
 pub struct Selection {
     pub track: Option<TrackId>,
+    /// The clip the editor shows.
     pub clip: Option<ClipId>,
+    /// The clips selected in the arrangement, usually `clip` among them.
+    pub clips: Vec<ClipId>,
     /// Selected notes of the selected MIDI clip.
     pub notes: Vec<NoteId>,
     pub focus: Focus,
@@ -109,19 +136,38 @@ impl Selection {
     pub fn select_track(&mut self, id: TrackId) {
         if self.track != Some(id) {
             self.clip = None;
+            self.clips.clear();
             self.notes.clear();
         }
         self.track = Some(id);
         self.focus = Focus::Arrange;
     }
 
+    /// Selects one clip and nothing else.
     pub fn select_clip(&mut self, track: TrackId, clip: ClipId) {
+        self.open_clip(track, clip);
+        self.clips = vec![clip];
+    }
+
+    /// Shows a clip in the editor, leaving the other selected clips selected.
+    pub fn open_clip(&mut self, track: TrackId, clip: ClipId) {
         if self.clip != Some(clip) {
             self.notes.clear();
         }
         self.track = Some(track);
         self.clip = Some(clip);
         self.focus = Focus::Arrange;
+    }
+
+    /// Adds a clip to the selection or takes it out, as Shift-click does.
+    pub fn toggle_clip(&mut self, track: TrackId, clip: ClipId) {
+        if let Some(i) = self.clips.iter().position(|c| *c == clip) {
+            self.clips.remove(i);
+            self.focus = Focus::Arrange;
+        } else {
+            self.open_clip(track, clip);
+            self.clips.push(clip);
+        }
     }
 
     /// Drops anything that no longer exists.
@@ -147,6 +193,7 @@ impl Selection {
                 }
             }
         }
+        self.clips.retain(|c| project.find_clip(*c).is_ok());
     }
 }
 
@@ -183,6 +230,10 @@ pub struct App {
     pub workspace: Workspace,
     /// Help > About is open.
     pub about: bool,
+    /// Help > Keyboard shortcuts is open.
+    pub shortcuts_open: bool,
+    /// The clipboard and what the last paste did.
+    pub edit: EditState,
     pub notice: Option<Notice>,
     /// Seconds since start, from egui.
     pub now: f64,
@@ -225,6 +276,8 @@ impl App {
             waveforms: WaveformCache::default(),
             workspace: Workspace::default(),
             about: false,
+            shortcuts_open: false,
+            edit: EditState::default(),
             notice: None,
             now: 0.0,
             project_id,
@@ -327,6 +380,7 @@ impl App {
 
         crate::mixer::effect_window(self, &ctx);
         crate::menu::about_window(self, &ctx);
+        keys::window(self, &ctx);
         crate::dialogs::show(self, &ctx);
         crate::palette::show(self, &ctx);
         crate::browser::overlays(self, &ctx);
@@ -335,6 +389,10 @@ impl App {
 
     fn begin_frame(&mut self, ctx: &Context) {
         self.now = ctx.input(|i| i.time);
+        // Ctrl+Plus and the like come from the key command table instead.
+        if ctx.options(|o| o.zoom_with_keyboard) {
+            ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        }
         self.gestures.begin_frame(ctx);
         for out in self.jobs.poll() {
             self.handle_job(ctx, out);
@@ -393,6 +451,8 @@ impl App {
     fn end_frame(&mut self, ctx: &Context) {
         let fast = self.transport.playing
             || self.arrange.drag.is_some()
+            || self.arrange.marquee.is_some()
+            || self.piano.marquee.is_some()
             || self.mixer.any_active()
             || self.ai.flashing(self.now)
             || self.jobs.is_busy()
@@ -424,46 +484,80 @@ impl App {
         }
     }
 
+    /// Where the edit commands and arrow keys act: the piano roll while it
+    /// was clicked last and is in view, otherwise the arrangement.
+    pub fn edit_focus(&self) -> Focus {
+        if self.sel.focus == Focus::Editor && self.workspace.is_front(Tab::Editor) {
+            Focus::Editor
+        } else {
+            Focus::Arrange
+        }
+    }
+
+    /// Runs the key commands pressed this frame, from [`keys::table`].
     fn shortcuts(&mut self, ctx: &Context) {
         if self.palette.open || self.dialogs.blocks_input() {
             return;
         }
-        let text_focus = ctx.text_edit_focused();
-        let cmd = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
-        let cmd_shift = |key| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, key);
+        let typing = ctx.text_edit_focused();
+        // Arrow keys move between widgets while one has the keyboard.
+        let widget_focus = ctx.memory(|m| m.focused().is_some());
+        // Escape cancels a drag or closes a menu before it deselects.
+        let escape_taken = self.arrange.drag.is_some()
+            || self.arrange.marquee.is_some()
+            || self.piano.drag.is_some()
+            || self.piano.marquee.is_some()
+            || egui::Popup::is_any_open(ctx);
+        let label_selected = ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection();
+        let focus = self.edit_focus();
+        let table = keys::table();
+        let mut bindings: Vec<_> = table
+            .iter()
+            .filter(|c| c.scope.applies(focus) && (c.while_typing || !typing))
+            .flat_map(|c| c.keys.iter().map(move |k| (k, c)))
+            .filter(|(k, _)| {
+                let arrow = matches!(
+                    k.logical_key,
+                    Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown
+                );
+                !(arrow && widget_focus) && !(k.logical_key == Key::Escape && escape_taken)
+            })
+            .collect();
+        bindings.sort_by_key(|(k, _)| std::cmp::Reverse(keys::modifier_count(k.modifiers)));
         let mut wanted = Vec::new();
+        let mut pasted = None;
         ctx.input_mut(|i| {
-            if i.consume_shortcut(&cmd(Key::K)) {
-                wanted.push(Action::OpenPalette);
+            if !typing {
+                // The system turns Ctrl+X, C and V into these, not key presses.
+                i.events.retain(|e| match e {
+                    Event::Cut if !label_selected => {
+                        wanted.push(Action::Cut);
+                        false
+                    }
+                    Event::Copy if !label_selected => {
+                        wanted.push(Action::Copy);
+                        false
+                    }
+                    Event::Paste(text) => {
+                        pasted = Some(text.clone());
+                        wanted.push(Action::Paste);
+                        false
+                    }
+                    _ => true,
+                });
             }
-            if i.consume_shortcut(&cmd_shift(Key::S)) {
-                wanted.push(Action::SaveAs);
-            } else if i.consume_shortcut(&cmd(Key::S)) {
-                wanted.push(Action::Save);
-            }
-            if i.consume_shortcut(&cmd(Key::O)) {
-                wanted.push(Action::Open);
-            }
-            if i.consume_shortcut(&cmd(Key::B)) {
-                wanted.push(Action::TogglePanel(Tab::Browser));
-            }
-            if text_focus {
-                return;
-            }
-            if i.consume_shortcut(&cmd_shift(Key::Z)) || i.consume_shortcut(&cmd(Key::Y)) {
-                wanted.push(Action::Redo);
-            } else if i.consume_shortcut(&cmd(Key::Z)) {
-                wanted.push(Action::Undo);
-            }
-            if i.consume_key(Modifiers::NONE, Key::Space) {
-                wanted.push(Action::PlayStop);
-            }
-            if i.consume_key(Modifiers::NONE, Key::Delete)
-                || i.consume_key(Modifiers::NONE, Key::Backspace)
-            {
-                wanted.push(Action::DeleteSelection);
+            for (key, command) in &bindings {
+                if i.consume_shortcut(key) {
+                    wanted.push(command.action.clone());
+                }
             }
         });
+        if pasted.is_some() {
+            self.edit.pasted = pasted;
+        }
         for action in wanted {
             self.run_action(ctx, action);
         }
@@ -557,7 +651,22 @@ impl App {
             Action::PromptTempo => self.palette.prompt_tempo(),
             Action::OpenSettings => self.open_settings(ctx),
             Action::OpenPalette => self.palette.show_palette(),
+            Action::Shortcuts => self.shortcuts_open = true,
+            Action::Cut => self.cut(ctx),
+            Action::Copy => {
+                self.copy(ctx);
+            }
+            Action::Paste => self.paste(),
+            Action::Duplicate => self.duplicate(),
             Action::DeleteSelection => self.delete_selection(),
+            Action::SelectAll => self.select_all(),
+            Action::SelectNone => self.select_none(),
+            Action::Nudge(steps) => self.nudge(steps, false),
+            Action::NudgeBars(bars) => self.nudge(bars, true),
+            Action::Transpose(semitones) => self.transpose(semitones),
+            Action::MoveToTrack(rows) => self.move_to_track(rows),
+            Action::TimelineZoom(dir) => self.timeline_zoom(dir),
+            Action::TimelineFit => self.timeline_fit(),
         }
         self.refresh();
     }
@@ -608,23 +717,6 @@ impl App {
         };
         if let Err(e) = result {
             self.error(format!("Cannot stop: {e}"));
-        }
-    }
-
-    pub fn delete_selection(&mut self) {
-        let Some(clip) = self.sel.clip else {
-            return;
-        };
-        if self.sel.focus == Focus::Editor && !self.sel.notes.is_empty() {
-            let ids = std::mem::take(&mut self.sel.notes);
-            let r = actions::remove_notes(&self.session, clip, ids);
-            self.report(r);
-            return;
-        }
-        let r = actions::delete_clip(&self.session, clip);
-        if self.report(r).is_some() {
-            self.sel.clip = None;
-            self.sel.notes.clear();
         }
     }
 

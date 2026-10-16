@@ -5,17 +5,18 @@
 use std::collections::HashMap;
 
 use egui::{
-    Align, Align2, Color32, Context, CornerRadius, CursorIcon, Frame, Id, Key, Layout, Margin,
-    Painter, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, pos2,
-    vec2,
+    Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, Frame, Id, Key, Layout,
+    Margin, Painter, Rect, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder,
+    pos2, vec2,
 };
-use sky_core::{ClipId, NoteId, PPQ, Ticks, TimeSignature, TrackId};
+use sky_core::{ClipId, PPQ, Ticks, TimeSignature, TrackId};
 use sky_model::{Clip, ClipContent, Command, Note, Project, Track, TrackKind, Transaction};
 use sky_pattern::{Pattern, Time};
 
 use crate::actions::{self, NewTrack};
-use crate::app::{Action, App, Tab};
-use crate::theme;
+use crate::app::{Action, App, Focus, Tab};
+use crate::widgets::Marquee;
+use crate::{keys, theme};
 
 /// Width of the track headers left of the lanes.
 pub const HEADER_W: f32 = 236.0;
@@ -91,19 +92,28 @@ pub enum ClipDragKind {
     Resize,
 }
 
-/// A clip being moved or resized. Shown as a preview and applied once, when
-/// the button is released, so the gesture is one undo step.
-#[derive(Clone, Debug)]
-pub struct ClipDrag {
+/// Where a clip sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed {
     pub clip: ClipId,
-    pub kind: ClipDragKind,
-    pub from_track: TrackId,
-    pub grab_tick: f64,
-    pub orig_start: Ticks,
-    pub orig_len: Ticks,
+    pub track: TrackId,
     pub start: Ticks,
     pub length: Ticks,
-    pub track: TrackId,
+}
+
+/// The selected clips being moved or resized together. Shown as a preview
+/// and applied once, when the button is released, so the gesture is one
+/// undo step.
+#[derive(Clone, Debug)]
+pub struct ClipDrag {
+    pub kind: ClipDragKind,
+    /// The clip under the pointer.
+    pub anchor: ClipId,
+    pub grab_tick: f64,
+    pub orig: Vec<Placed>,
+    pub preview: Vec<Placed>,
+    /// Tracks down (up when negative) the clips have moved.
+    pub rows: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +162,8 @@ pub struct ArrangeState {
     pub snap: Snap,
     pub follow: bool,
     pub drag: Option<ClipDrag>,
+    /// A rectangle being dragged over the lanes to select clips.
+    pub marquee: Option<Marquee<ClipId>>,
     pub loop_drag: Option<LoopDrag>,
     pub scrubbing: bool,
     /// Lane rects drawn this frame and the last, for finding drop targets.
@@ -175,6 +187,7 @@ impl Default for ArrangeState {
             snap: Snap::default(),
             follow: true,
             drag: None,
+            marquee: None,
             loop_drag: None,
             scrubbing: false,
             lanes: Vec::new(),
@@ -205,6 +218,7 @@ impl ArrangeState {
     pub fn reset_for_new_project(&mut self) {
         self.scroll = 0.0;
         self.drag = None;
+        self.marquee = None;
         self.loop_drag = None;
         self.scrubbing = false;
         self.renaming = None;
@@ -218,7 +232,7 @@ impl ArrangeState {
         self.scroll = 0.0;
     }
 
-    fn zoom_at(&mut self, factor: f32, x: f32) {
+    pub fn zoom_at(&mut self, factor: f32, x: f32) {
         let anchor = self.tick_at(x);
         self.px_per_tick = (self.px_per_tick * factor).clamp(MIN_PX_PER_TICK, MAX_PX_PER_TICK);
         self.scroll = (anchor - ((x - self.lane_left) / self.px_per_tick) as f64).max(0.0);
@@ -255,11 +269,15 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     timeline_input(app, ui, Rect::from_min_max(ruler.min, body.max));
     follow_playhead(app);
     update_clip_drag(app, ui.ctx(), project);
+    update_marquee(app, ui.ctx(), project);
     update_loop_drag(app, ui.ctx(), project);
 
     corner_ui(app, ui, corner, project);
     ruler_ui(app, ui, ruler, project);
     rows(app, ui, body, project);
+    if let Some(m) = &app.arrange.marquee {
+        m.paint(&ui.painter_at(body));
+    }
     crate::browser::arrange_drop(app, ui, body, project);
     hscrollbar(app, ui, hbar, project);
     ui.advance_cursor_after_rect(full);
@@ -326,7 +344,7 @@ fn toolbar(app: &mut App, ui: &mut Ui, project: &Project) {
                     }
                     ui.label(
                         RichText::new(
-                            "Double-click a lane for a clip · Shift+wheel scrolls · Ctrl+wheel zooms",
+                            "Double-click a lane for a clip · drag from an empty spot to select · Ctrl+wheel zooms",
                         )
                         .small()
                         .color(theme::TEXT_DIM),
@@ -372,7 +390,9 @@ fn follow_playhead(app: &mut App) {
     }
 }
 
-fn clip_fits(track: &Track, clip: &Clip) -> bool {
+/// Whether a track can hold a clip: audio on audio tracks, the rest on
+/// instrument tracks.
+pub fn clip_fits(track: &Track, clip: &Clip) -> bool {
     match clip.content {
         ClipContent::Audio { .. } => track.kind == TrackKind::Audio,
         ClipContent::Midi { .. } | ClipContent::Pattern { .. } | ClipContent::Steps(_) => {
@@ -381,11 +401,30 @@ fn clip_fits(track: &Track, clip: &Clip) -> bool {
     }
 }
 
+fn row_of(project: &Project, track: TrackId) -> Option<usize> {
+    project.tracks.iter().position(|t| t.id == track)
+}
+
+/// The tracks the clips land on when moved `rows` down, if every one fits.
+fn shifted_tracks(project: &Project, clips: &[Placed], rows: i64) -> Option<Vec<TrackId>> {
+    clips
+        .iter()
+        .map(|p| {
+            let row = row_of(project, p.track)? as i64 + rows;
+            let track = project.tracks.get(usize::try_from(row).ok()?)?;
+            let (_, clip) = project.find_clip(p.clip).ok()?;
+            clip_fits(track, clip).then_some(track.id)
+        })
+        .collect()
+}
+
 fn update_clip_drag(app: &mut App, ctx: &Context, project: &Project) {
     let Some(mut drag) = app.arrange.drag.clone() else {
         return;
     };
-    let Ok((_, clip)) = project.find_clip(drag.clip) else {
+    let anchor = drag.orig.iter().find(|p| p.clip == drag.anchor).copied();
+    let gone = drag.orig.iter().any(|p| project.find_clip(p.clip).is_err());
+    let Some(anchor) = anchor.filter(|_| !gone) else {
         app.arrange.drag = None;
         return;
     };
@@ -410,25 +449,49 @@ fn update_clip_drag(app: &mut App, ctx: &Context, project: &Project) {
         let tick = app.arrange.tick_at(pos.x);
         match drag.kind {
             ClipDragKind::Move => {
-                let raw = drag.orig_start as f64 + (tick - drag.grab_tick);
-                drag.start = snap_round(raw, grid).max(0);
-                let target = app
+                let raw = anchor.start as f64 + (tick - drag.grab_tick);
+                let first = drag.orig.iter().map(|p| p.start).min().unwrap_or(0);
+                let dt = (snap_round(raw, grid) - anchor.start).max(-first);
+                // The lane under the pointer takes the clip held, and the
+                // others keep their distance from it, when they all fit.
+                let hovered = app
                     .arrange
                     .prev_lanes
                     .iter()
                     .find(|(_, r)| r.y_range().contains(pos.y))
-                    .and_then(|(id, _)| project.track(*id).ok());
-                if let Some(t) = target
-                    && clip_fits(t, clip)
-                {
-                    drag.track = t.id;
+                    .and_then(|(id, _)| row_of(project, *id));
+                if let (Some(row), Some(from)) = (hovered, row_of(project, anchor.track)) {
+                    let rows = row as i64 - from as i64;
+                    if shifted_tracks(project, &drag.orig, rows).is_some() {
+                        drag.rows = rows;
+                    }
                 }
+                let tracks = shifted_tracks(project, &drag.orig, drag.rows)
+                    .unwrap_or_else(|| drag.orig.iter().map(|p| p.track).collect());
+                drag.preview = drag
+                    .orig
+                    .iter()
+                    .zip(tracks)
+                    .map(|(p, track)| Placed {
+                        track,
+                        start: p.start + dt,
+                        ..*p
+                    })
+                    .collect();
             }
             ClipDragKind::Resize => {
                 let min_len = grid.unwrap_or(PPQ / 16).max(1);
-                let end = drag.orig_start as f64 + drag.orig_len as f64 + (tick - drag.grab_tick);
+                let end = anchor.start as f64 + anchor.length as f64 + (tick - drag.grab_tick);
                 let end = snap_round(end, grid);
-                drag.length = (end - drag.orig_start).max(min_len);
+                let dl = (end - anchor.start).max(min_len) - anchor.length;
+                drag.preview = drag
+                    .orig
+                    .iter()
+                    .map(|p| Placed {
+                        length: (p.length + dl).max(min_len),
+                        ..*p
+                    })
+                    .collect();
             }
         }
         ctx.set_cursor_icon(match drag.kind {
@@ -446,20 +509,97 @@ fn update_clip_drag(app: &mut App, ctx: &Context, project: &Project) {
 
 /// Applies a finished clip drag as one change.
 pub fn commit_clip_drag(app: &mut App, drag: &ClipDrag) {
-    match drag.kind {
-        ClipDragKind::Move if drag.start != drag.orig_start || drag.track != drag.from_track => {
-            let r = actions::move_clip(&app.session, drag.clip, drag.track, drag.start);
-            if app.report(r).is_some() {
-                app.sel.select_clip(drag.track, drag.clip);
-            }
+    let changed: Vec<&Placed> = drag
+        .orig
+        .iter()
+        .zip(&drag.preview)
+        .filter(|(a, b)| a != b)
+        .map(|(_, b)| b)
+        .collect();
+    if !changed.is_empty() {
+        let (verb, commands): (&str, Vec<Command>) = match drag.kind {
+            ClipDragKind::Move => (
+                "Move",
+                changed
+                    .iter()
+                    .map(|p| Command::MoveClip {
+                        id: p.clip,
+                        track: p.track,
+                        start: p.start.max(0),
+                    })
+                    .collect(),
+            ),
+            ClipDragKind::Resize => (
+                "Resize",
+                changed
+                    .iter()
+                    .map(|p| Command::SetClipLength {
+                        id: p.clip,
+                        length: p.length.max(1),
+                    })
+                    .collect(),
+            ),
+        };
+        let label = match changed.len() {
+            1 => format!("{verb} clip"),
+            n => format!("{verb} {n} clips"),
+        };
+        let r = actions::apply(&app.session, Transaction::user(label, commands), None);
+        if app.report(r).is_some()
+            && let Some(p) = drag.preview.iter().find(|p| p.clip == drag.anchor)
+        {
+            app.sel.open_clip(p.track, p.clip);
         }
-        ClipDragKind::Resize if drag.length != drag.orig_len => {
-            let r = actions::resize_clip(&app.session, drag.clip, drag.length);
-            app.report(r);
-        }
-        _ => {}
     }
     app.refresh();
+}
+
+/// Selects the clips a marquee touches, as it is dragged.
+fn update_marquee(app: &mut App, ctx: &Context, project: &Project) {
+    let Some(mut m) = app.arrange.marquee.take() else {
+        return;
+    };
+    let (pos, down, escape) = ctx.input(|i| {
+        (
+            i.pointer.latest_pos(),
+            i.pointer.primary_down(),
+            i.key_pressed(Key::Escape),
+        )
+    });
+    if escape {
+        app.sel.clips = m.before;
+        return;
+    }
+    if let Some(p) = pos {
+        m.to = p;
+    }
+    let rect = m.rect();
+    let mut chosen = m.kept.clone();
+    for (id, lane) in &app.arrange.prev_lanes {
+        let Ok(track) = project.track(*id) else {
+            continue;
+        };
+        for c in &track.clips {
+            let r = clip_rect(&app.arrange, *lane, c.start, c.length);
+            if r.intersects(rect) && !chosen.contains(&c.id) {
+                chosen.push(c.id);
+            }
+        }
+    }
+    app.sel.clips = chosen;
+    if down {
+        app.arrange.marquee = Some(m);
+        return;
+    }
+    // Done: the editor shows the first clip picked, unless it shows one of
+    // them already.
+    let open = app.sel.clip.is_some_and(|c| app.sel.clips.contains(&c));
+    if !open
+        && let Some(&first) = app.sel.clips.first()
+        && let Ok((track, _)) = project.find_clip(first)
+    {
+        app.sel.open_clip(track.id, first);
+    }
 }
 
 fn update_loop_drag(app: &mut App, ctx: &Context, project: &Project) {
@@ -854,9 +994,19 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
         Stroke::new(1.0, theme::BG),
     );
 
-    let resp = ui.interact(rect, Id::new(("lane", track.id)), Sense::click());
+    let resp = ui.interact(rect, Id::new(("lane", track.id)), Sense::click_and_drag());
+    let adding = ui.input(|i| i.modifiers.shift || i.modifiers.command);
     if resp.clicked() {
         app.sel.select_track(track.id);
+        if !adding {
+            app.sel.clips.clear();
+        }
+    }
+    if resp.drag_started()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+    {
+        app.arrange.marquee = Some(Marquee::new(origin, app.sel.clips.clone(), adding));
+        app.sel.focus = Focus::Arrange;
     }
     if resp.double_clicked()
         && track.kind == TrackKind::Instrument
@@ -875,17 +1025,24 @@ fn lane_ui(app: &mut App, ui: &mut Ui, rect: Rect, project: &Project, track: &Tr
 
     let drag = app.arrange.drag.clone();
     for clip in &track.clips {
-        if drag.as_ref().is_some_and(|d| d.clip == clip.id) {
+        if drag
+            .as_ref()
+            .is_some_and(|d| d.orig.iter().any(|p| p.clip == clip.id))
+        {
             continue;
         }
         clip_ui(app, ui, &painter, rect, project, track, clip);
     }
-    if let Some(d) = drag.as_ref().filter(|d| d.track == track.id)
-        && let Ok((_, clip)) = project.find_clip(d.clip)
-    {
+    for p in drag.iter().flat_map(|d| &d.preview) {
+        if p.track != track.id {
+            continue;
+        }
+        let Ok((_, clip)) = project.find_clip(p.clip) else {
+            continue;
+        };
         let mut ghost = clip.clone();
-        ghost.start = d.start;
-        ghost.length = d.length;
+        ghost.start = p.start;
+        ghost.length = p.length;
         let r = clip_rect(&app.arrange, rect, ghost.start, ghost.length);
         let ctx = ui.ctx().clone();
         draw_clip(app, &ctx, &painter, r, &ghost, track, true, project);
@@ -975,19 +1132,36 @@ pub fn create_clip_at(app: &mut App, track: TrackId, tick: f64) -> Option<ClipId
     Some(id)
 }
 
-/// Starts dragging a clip, as if the pointer had pressed at `grab_x`.
+/// Starts dragging a clip, and the other selected clips with it if it is
+/// one of them, as if the pointer had pressed at `grab_x`.
 pub fn begin_clip_drag(app: &mut App, track: &Track, clip: &Clip, kind: ClipDragKind, grab_x: f32) {
-    app.sel.select_clip(track.id, clip.id);
+    if app.sel.clips.contains(&clip.id) {
+        app.sel.open_clip(track.id, clip.id);
+    } else {
+        app.sel.select_clip(track.id, clip.id);
+    }
+    let project = app.view.project.clone();
+    let orig: Vec<Placed> = app
+        .sel
+        .clips
+        .iter()
+        .filter_map(|id| {
+            let (t, c) = project.find_clip(*id).ok()?;
+            Some(Placed {
+                clip: c.id,
+                track: t.id,
+                start: c.start,
+                length: c.length,
+            })
+        })
+        .collect();
     app.arrange.drag = Some(ClipDrag {
-        clip: clip.id,
         kind,
-        from_track: track.id,
+        anchor: clip.id,
         grab_tick: app.arrange.tick_at(grab_x),
-        orig_start: clip.start,
-        orig_len: clip.length,
-        start: clip.start,
-        length: clip.length,
-        track: track.id,
+        preview: orig.clone(),
+        orig,
+        rows: 0,
     });
 }
 
@@ -1012,7 +1186,7 @@ fn clip_ui(
     )
     .intersect(lane);
     let edge = ui.interact(edge_rect, id.with("edge"), Sense::drag());
-    let selected = app.sel.clip == Some(clip.id);
+    let selected = app.sel.clips.contains(&clip.id);
     let ctx = ui.ctx().clone();
     draw_clip(app, &ctx, painter, r, clip, track, selected, project);
 
@@ -1022,10 +1196,19 @@ fn clip_ui(
         ctx.set_cursor_icon(CursorIcon::Grab);
     }
     if body.clicked() {
+        if ui.input(|i| i.modifiers.shift || i.modifiers.command) {
+            app.sel.toggle_clip(track.id, clip.id);
+        } else {
+            app.sel.select_clip(track.id, clip.id);
+        }
+    }
+    // The menu acts on the selection, so a clip outside it becomes it.
+    if body.secondary_clicked() && !selected {
         app.sel.select_clip(track.id, clip.id);
     }
+    // Its first click already chose what is selected.
     if body.double_clicked() {
-        app.sel.select_clip(track.id, clip.id);
+        app.sel.open_clip(track.id, clip.id);
         app.workspace.show(Tab::Editor);
     }
     let origin = ui.input(|i| i.pointer.press_origin());
@@ -1038,49 +1221,25 @@ fn clip_ui(
     }
     body.context_menu(|ui| {
         if ui.button("Open in editor").clicked() {
-            app.sel.select_clip(track.id, clip.id);
+            app.sel.open_clip(track.id, clip.id);
             app.workspace.show(Tab::Editor);
         }
-        if ui.button("Duplicate").clicked() {
-            duplicate_clip(app, track, clip);
-        }
         ui.separator();
-        if ui
-            .button(RichText::new("Delete clip").color(theme::ERROR))
-            .clicked()
-        {
-            let r = actions::delete_clip(&app.session, clip.id);
-            app.report(r);
+        let delete = RichText::new("Delete").color(theme::ERROR);
+        for (text, action) in [
+            (RichText::new("Cut"), Action::Cut),
+            (RichText::new("Copy"), Action::Copy),
+            (RichText::new("Duplicate"), Action::Duplicate),
+            (delete, Action::DeleteSelection),
+        ] {
+            let button = Button::new(text).shortcut_text(keys::shortcut_for(&action));
+            if ui.add(button).clicked() {
+                app.sel.focus = Focus::Arrange;
+                let ctx = ui.ctx().clone();
+                app.run_action(&ctx, action);
+            }
         }
     });
-}
-
-/// Copies a clip to just after itself.
-pub fn duplicate_clip(app: &mut App, track: &Track, clip: &Clip) {
-    let mut copy = clip.clone();
-    copy.id = ClipId::new();
-    copy.start = clip.end();
-    if let ClipContent::Midi { notes } = &mut copy.content {
-        for n in notes.iter_mut() {
-            n.id = NoteId::new();
-        }
-    }
-    let id = copy.id;
-    let r = actions::apply(
-        &app.session,
-        Transaction::user(
-            "Duplicate clip",
-            vec![Command::AddClip {
-                track: track.id,
-                clip: Box::new(copy),
-            }],
-        ),
-        None,
-    );
-    if app.report(r).is_some() {
-        app.refresh();
-        app.sel.select_clip(track.id, id);
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
