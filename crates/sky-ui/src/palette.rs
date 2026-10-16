@@ -7,6 +7,8 @@ use sky_model::ChannelRef;
 
 use crate::actions::NewTrack;
 use crate::app::{Action, App, Tab};
+use crate::clip_tools::Tool;
+use crate::ruler_lanes::Lane;
 use crate::{keys, theme};
 
 #[derive(Default)]
@@ -145,6 +147,9 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Paste at the playhead", Action::Paste),
         entry("Duplicate the selection", Action::Duplicate),
         entry("Delete the selection", Action::DeleteSelection),
+        entry("Split clips at the playhead", Action::SplitAtPlayhead),
+        entry("Mute or unmute the selected clips", Action::MuteClips),
+        entry("Add a marker at the playhead", Action::AddMarker),
         entry("Select all", Action::SelectAll),
         entry("Select nothing", Action::SelectNone),
         entry("Zoom the timeline in", Action::TimelineZoom(1)),
@@ -152,6 +157,21 @@ pub fn entries(app: &App) -> Vec<Entry> {
         entry("Fit the timeline", Action::TimelineFit),
         entry("Keyboard shortcuts", Action::Shortcuts),
     ]);
+    for tool in Tool::ALL {
+        out.push(entry(format!("{} tool", tool.label()), Action::Tool(tool)));
+    }
+    for lane in [Lane::Markers, Lane::Tempo] {
+        let verb = if app.workspace.lanes.shows(lane) {
+            "Hide"
+        } else {
+            "Show"
+        };
+        let name = lane.label().to_lowercase();
+        out.push(entry(
+            format!("{verb} the {name}"),
+            Action::ToggleLane(lane),
+        ));
+    }
     out
 }
 

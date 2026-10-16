@@ -33,6 +33,7 @@ fn clip(start: i64, length: i64, content: ClipContent) -> Clip {
         name: "c".into(),
         start,
         length,
+        muted: false,
         content,
     }
 }

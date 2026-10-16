@@ -20,6 +20,7 @@ fn steps_clip(bars: i64, steps: StepClip) -> Clip {
         name: "s".into(),
         start: 0,
         length: PPQ * 4 * bars,
+        muted: false,
         content: ClipContent::Steps(steps),
     }
 }

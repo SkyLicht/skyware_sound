@@ -42,6 +42,11 @@ pub fn darken(c: Color32, amount: f32) -> Color32 {
     c.lerp_to_gamma(Color32::BLACK, amount.clamp(0.0, 1.0))
 }
 
+/// A muted clip's color: the track's, mostly grey.
+pub fn muted(c: Color32) -> Color32 {
+    c.lerp_to_gamma(Color32::from_gray(96), 0.8)
+}
+
 /// A color lightened toward white by `amount` (0..1).
 pub fn lighten(c: Color32, amount: f32) -> Color32 {
     c.lerp_to_gamma(Color32::WHITE, amount.clamp(0.0, 1.0))

@@ -27,6 +27,7 @@ pub fn demo_project() -> Project {
         name: "Beat".into(),
         start: 0,
         length: bar * bars,
+        muted: false,
         content: ClipContent::pattern("bd*4, ~ sd ~ sd, hh*8", 1, bar),
     });
 
@@ -58,6 +59,7 @@ pub fn demo_project() -> Project {
         name: "Bass line".into(),
         start: 0,
         length: bar * bars,
+        muted: false,
         content: ClipContent::Midi {
             notes: parse_note_list(&line.join(", ")).unwrap_or_default(),
         },
@@ -81,6 +83,7 @@ pub fn demo_project() -> Project {
         name: "Chords".into(),
         start: 0,
         length: bar * bars,
+        muted: false,
         content: ClipContent::Midi {
             notes: parse_note_list(
                 "A3+C4+E4 1 v80, F3+A3+C4 1 v80, C3+E3+G3+C4 1 v80, G3+B3+D4 1 v80",
@@ -142,6 +145,7 @@ fn pattern_clip(
         name: name.into(),
         start: 0,
         length: bar * bars,
+        muted: false,
         content: ClipContent::Pattern {
             source: source.into(),
             seed: 1,
@@ -295,6 +299,7 @@ fn step_clip(name: &str, bars: i64, bar: i64, steps: StepClip) -> Clip {
         name: name.into(),
         start: 0,
         length: bar * bars,
+        muted: false,
         content: ClipContent::Steps(steps),
     }
 }

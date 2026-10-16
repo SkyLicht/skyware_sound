@@ -49,6 +49,9 @@ pub fn clip_json(project: &Project, clip: &Clip, detail: bool) -> Value {
         "startBar": round(project.ticks_to_bar(clip.start), 4),
         "lengthBars": round(clip.length as f64 / bar, 4),
     });
+    if clip.muted {
+        v["muted"] = json!(true);
+    }
     match &clip.content {
         ClipContent::Audio {
             source,
@@ -252,7 +255,7 @@ pub fn game_json(project: &Project) -> Value {
 /// The whole project in compact form.
 pub fn project_summary(project: &Project) -> Value {
     let ts = project.time_signature;
-    json!({
+    let mut v = json!({
         "name": project.name,
         "tempoBpm": project.tempo.initial_bpm(),
         "timeSignature": format!("{}/{}", ts.numerator, ts.denominator),
@@ -274,5 +277,24 @@ pub fn project_summary(project: &Project) -> Value {
             "license": e.source.as_ref().map(|s| s.license.id()),
         })).collect::<Vec<_>>(),
         "game": game_json(project),
-    })
+    });
+    let changes = project.tempo.points().get(1..).unwrap_or_default();
+    if !changes.is_empty() {
+        v["tempoChanges"] = json!(
+            changes
+                .iter()
+                .map(|p| json!({ "bar": round(project.ticks_to_bar(p.tick), 4), "bpm": p.bpm }))
+                .collect::<Vec<_>>()
+        );
+    }
+    if !project.markers.is_empty() {
+        v["markers"] = json!(
+            project
+                .markers
+                .iter()
+                .map(|m| json!({ "bar": round(project.ticks_to_bar(m.tick), 4), "name": m.name }))
+                .collect::<Vec<_>>()
+        );
+    }
+    v
 }

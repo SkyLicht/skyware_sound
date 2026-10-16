@@ -10,21 +10,23 @@ use egui::accesskit::Role;
 use egui::{
     Context, Event, FontId, Id, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2,
 };
-use sky_core::{AudioId, ClipId, PPQ};
+use sky_core::{AudioId, ClipId, MarkerId, PPQ};
 use sky_dsp::{AudioData, InstrumentType};
 use sky_model::templates::{demo_project, empty_project};
 use sky_model::{
-    BankSample, Clip, ClipContent, Command, License, Note, Origin, Project, SampleBank, Track,
-    Transaction,
+    BankSample, Clip, ClipContent, Command, License, Note, Origin, PoolEntry, Project, SampleBank,
+    Track, Transaction,
 };
 use sky_session::Session;
 
 use crate::actions::{self, NewTrack};
 use crate::app::{Action, App, Tab};
 use crate::audition::{ButtonState, PreviewKey};
+use crate::clip_tools::{EditKind, Tool};
 use crate::dialogs::PathPurpose;
 use crate::edit::Copied;
 use crate::loop_inspector::Target;
+use crate::ruler_lanes::Lane;
 use crate::waveform::Peaks;
 use crate::widgets::Gestures;
 use crate::{
@@ -446,6 +448,7 @@ fn empty_and_odd_projects_do_not_panic() {
         name: "Empty".into(),
         start: 0,
         length: 0,
+        muted: false,
         content: ClipContent::Midi {
             notes: vec![Note::new(0, 0, 60, 100)],
         },
@@ -455,6 +458,7 @@ fn empty_and_odd_projects_do_not_panic() {
         name: "Broken".into(),
         start: 3840,
         length: 3840,
+        muted: false,
         content: ClipContent::pattern("c4 [e4", 0, 0),
     });
     let mut audio = Track::new_audio("Odd audio");
@@ -463,6 +467,7 @@ fn empty_and_odd_projects_do_not_panic() {
         name: "Missing file".into(),
         start: 0,
         length: 3840,
+        muted: false,
         content: ClipContent::Audio {
             source: AudioId::new(),
             offset: 0,
@@ -1629,6 +1634,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("audio.rs"),
         include_str!("audition.rs"),
         include_str!("browser.rs"),
+        include_str!("clip_tools.rs"),
         include_str!("dialogs.rs"),
         include_str!("edit.rs"),
         include_str!("game.rs"),
@@ -1642,6 +1648,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("params.rs"),
         include_str!("pattern_editor.rs"),
         include_str!("piano_roll.rs"),
+        include_str!("ruler_lanes.rs"),
         include_str!("sounds.rs"),
         include_str!("theme.rs"),
         include_str!("tracks.rs"),
@@ -3472,4 +3479,621 @@ fn the_loop_inspector_shows_the_seam_and_plays_it() {
     h.frames(2);
     assert!(h.app.workspace.is_front(Tab::Loop));
     assert_eq!(h.app.inspected(), Target::Asset(music));
+}
+
+/// The demo with an audio track holding one clip of a four-second, 48 kHz
+/// file, from bar 2 for two bars. The file is not on disk, which only
+/// leaves the clip without a waveform.
+fn with_audio_clip() -> (Project, ClipId) {
+    let mut p = demo_project();
+    let entry = PoolEntry {
+        id: AudioId::new(),
+        name: "loop".into(),
+        file: "audio/loop.wav".into(),
+        channels: 1,
+        sample_rate: 48_000,
+        frames: 192_000,
+        source: None,
+    };
+    let bar = p.ticks_per_bar();
+    let mut track = Track::new_audio("Audio");
+    let clip = Clip {
+        id: ClipId::new(),
+        name: "loop".into(),
+        start: bar,
+        length: bar * 2,
+        muted: false,
+        content: ClipContent::Audio {
+            source: entry.id,
+            offset: 0,
+            gain_db: 0.0,
+            fade_in: 0,
+            fade_out: 0,
+        },
+    };
+    let id = clip.id;
+    track.clips.push(clip);
+    p.audio_pool.push(entry);
+    p.tracks.push(track);
+    (p, id)
+}
+
+/// An audio clip's offset into its file, gain and fades.
+fn audio_of(clip: &Clip) -> (i64, f32, i64, i64) {
+    match clip.content {
+        ClipContent::Audio {
+            offset,
+            gain_db,
+            fade_in,
+            fade_out,
+            ..
+        } => (offset, gain_db, fade_in, fade_out),
+        _ => panic!("an audio clip"),
+    }
+}
+
+fn notes_of(clip: &Clip) -> Vec<Note> {
+    match &clip.content {
+        ClipContent::Midi { notes } => notes.clone(),
+        _ => panic!("a MIDI clip"),
+    }
+}
+
+/// A point on a clip's left edge, where it trims.
+fn left_edge(h: &Harness, clip: ClipId) -> Pos2 {
+    let r = arrange::clip_screen_rect(&h.app, clip).expect("clip visible");
+    pos2(r.left() + 2.0, r.center().y)
+}
+
+#[test]
+fn trimming_a_clip_start_keeps_its_audio_and_notes_in_place() {
+    let (p, audio) = with_audio_clip();
+    let mut h = Harness::with_project(p);
+    h.show_bars(8);
+    let bar = h.project().ticks_per_bar();
+    let beat_px = h.app.arrange.px_per_tick * PPQ as f32;
+
+    // A beat later, the clip starts half a second into its file at 120 BPM
+    // and still ends where it did.
+    let from = left_edge(&h, audio);
+    h.drag(from, from + vec2(beat_px, 0.0));
+    let c = h.clip(audio);
+    assert_eq!((c.start, c.length), (bar + PPQ, bar * 2 - PPQ));
+    assert_eq!(audio_of(&c).0, 24_000);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Trim clip"));
+
+    // Back past where the file begins, it stops there.
+    let from = left_edge(&h, audio);
+    h.drag(from, from - vec2(beat_px * 3.0, 0.0));
+    let c = h.clip(audio);
+    assert_eq!((c.start, c.length), (bar, bar * 2));
+    assert_eq!(audio_of(&c).0, 0);
+
+    // A MIDI clip trimmed by a bar drops the notes before the cut, and the
+    // rest play when they did.
+    let bass = h.track_named("Bass").clips[0].clone();
+    let sounding = |start: i64, notes: &[Note]| -> Vec<(i64, u8)> {
+        notes.iter().map(|n| (start + n.start, n.pitch)).collect()
+    };
+    let kept: Vec<(i64, u8)> = sounding(bass.start, &notes_of(&bass))
+        .into_iter()
+        .filter(|(t, _)| *t >= bar)
+        .collect();
+    let from = left_edge(&h, bass.id);
+    h.drag(from, from + vec2(beat_px * 4.0, 0.0));
+    let c = h.clip(bass.id);
+    assert_eq!((c.start, c.length), (bar, bar * 3));
+    assert_eq!(sounding(c.start, &notes_of(&c)), kept);
+
+    // One undo puts it all back.
+    h.key(Key::Z, COMMAND);
+    assert_eq!(h.clip(bass.id), bass);
+}
+
+#[test]
+fn slipping_moves_what_a_clip_plays_and_not_the_clip() {
+    let (p, audio) = with_audio_clip();
+    let mut h = Harness::with_project(p);
+    h.show_bars(8);
+    let beat_px = h.app.arrange.px_per_tick * PPQ as f32;
+    let before = h.clip(audio);
+
+    // The Slip tool slides the audio a beat earlier: half a second further
+    // into the file, with the clip where it was.
+    h.key(Key::Num4, Modifiers::NONE);
+    assert_eq!(h.app.arrange.tool, Tool::Slip);
+    let r = arrange::clip_screen_rect(&h.app, audio).expect("clip visible");
+    h.drag(r.center(), r.center() - vec2(beat_px, 0.0));
+    let c = h.clip(audio);
+    assert_eq!((c.start, c.length), (before.start, before.length));
+    assert_eq!(audio_of(&c).0, 24_000);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Slip clip"));
+
+    // Later than the file's start, it stops there.
+    h.drag(r.center(), r.center() + vec2(beat_px * 3.0, 0.0));
+    assert_eq!(audio_of(&h.clip(audio)).0, 0);
+
+    // A pattern clip has nothing to slip, and says so.
+    let beat = h.track_named("Drums").clips[0].clone();
+    let r = arrange::clip_screen_rect(&h.app, beat.id).expect("clip visible");
+    h.drag(r.center(), r.center() + vec2(beat_px, 0.0));
+    assert_eq!(h.clip(beat.id), beat);
+    assert!(
+        h.app
+            .notice
+            .as_ref()
+            .is_some_and(|n| !n.error && n.text.contains("nothing to slip"))
+    );
+
+    // With the Select tool, Ctrl+Alt slips: notes a beat later, then two
+    // earlier, which stops with the first note at the clip's start.
+    h.key(Key::Num1, Modifiers::NONE);
+    let bass = h.track_named("Bass").clips[0].clone();
+    let r = arrange::clip_screen_rect(&h.app, bass.id).expect("clip visible");
+    let from = pos2(r.left() + 60.0, r.center().y);
+    h.set_modifiers(Modifiers {
+        alt: true,
+        ..COMMAND
+    });
+    h.drag(from, from + vec2(beat_px, 0.0));
+    let c = h.clip(bass.id);
+    assert_eq!((c.start, c.length), (bass.start, bass.length));
+    let moved: Vec<i64> = notes_of(&c).iter().map(|n| n.start).collect();
+    let orig: Vec<i64> = notes_of(&bass).iter().map(|n| n.start + PPQ).collect();
+    assert_eq!(moved, orig);
+    h.drag(from, from - vec2(beat_px * 2.0, 0.0));
+    h.set_modifiers(Modifiers::NONE);
+    h.frame();
+    assert_eq!(h.clip(bass.id), bass);
+}
+
+#[test]
+fn fade_and_gain_handles_edit_audio_clips() {
+    let (p, audio) = with_audio_clip();
+    let mut h = Harness::with_project(p);
+    h.show_bars(8);
+    let bar = h.project().ticks_per_bar();
+    let handle = |h: &Harness, kind: EditKind| {
+        h.rect_of(Id::new(("clip_handle", audio, kind as u8)))
+            .center()
+    };
+
+    // The handles show on a selected clip.
+    let r = arrange::clip_screen_rect(&h.app, audio).expect("clip visible");
+    h.click(pos2(r.left() + r.width() * 0.3, r.bottom() - 6.0));
+    assert_eq!(h.app.sel.clips, [audio]);
+
+    // Up 20 pixels is 5 dB, as one undo step; with Shift, 1 dB.
+    let history = h.history_len();
+    let from = handle(&h, EditKind::Gain);
+    h.drag(from, from - vec2(0.0, 20.0));
+    assert_eq!(audio_of(&h.clip(audio)).1, 5.0);
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Change clip gain"));
+    h.set_modifiers(Modifiers::SHIFT);
+    h.drag(from, from - vec2(0.0, 20.0));
+    h.set_modifiers(Modifiers::NONE);
+    assert_eq!(audio_of(&h.clip(audio)).1, 6.0);
+
+    // Escape during the drag leaves it as it was.
+    h.move_to(from);
+    h.pointer(from, true);
+    h.frame();
+    for step in 1..=5 {
+        h.move_to(from - vec2(0.0, 8.0 * step as f32));
+    }
+    h.key(Key::Escape, Modifiers::NONE);
+    h.pointer(from - vec2(0.0, 40.0), false);
+    h.frames(2);
+    assert_eq!(audio_of(&h.clip(audio)).1, 6.0);
+
+    // A double-click puts it back to 0 dB.
+    h.frames(40);
+    h.double_click(handle(&h, EditKind::Gain));
+    assert_eq!(audio_of(&h.clip(audio)).1, 0.0);
+
+    // The fades follow the pointer, and the fade in stops at the fade out.
+    let y = handle(&h, EditKind::FadeIn).y;
+    h.drag(handle(&h, EditKind::FadeIn), pos2(tick_x(&h, bar + PPQ), y));
+    assert_eq!(audio_of(&h.clip(audio)).2, PPQ);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Change fade in"));
+    h.drag(
+        handle(&h, EditKind::FadeOut),
+        pos2(tick_x(&h, bar * 3 - PPQ * 2), y),
+    );
+    assert_eq!(audio_of(&h.clip(audio)).3, PPQ * 2);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Change fade out"));
+    h.drag(handle(&h, EditKind::FadeIn), pos2(tick_x(&h, bar * 3), y));
+    assert_eq!(audio_of(&h.clip(audio)).2, bar * 2 - PPQ * 2);
+    assert_eq!(h.clip(audio).start, bar, "the clip did not move");
+}
+
+#[test]
+fn the_split_tool_and_ctrl_e_cut_clips_in_two() {
+    let mut h = Harness::with_engine(demo_project());
+    h.show_bars(8);
+    h.accessible();
+    let bar = h.project().ticks_per_bar();
+    let bass = h.track_named("Bass");
+    let notes = notes_of(&bass.clips[0]);
+
+    // A click with the Split tool cuts on the grid line under it; a note
+    // across the cut would be cut too, and these play as before.
+    h.click_in(Tab::Arrange, "Split");
+    assert_eq!(h.app.arrange.tool, Tool::Split);
+    h.click(pos2(
+        tick_x(&h, bar * 2) + 3.0,
+        lane_rect(&h, bass.id).center().y,
+    ));
+    let mut halves = h.track_named("Bass").clips;
+    halves.sort_by_key(|c| c.start);
+    let spans: Vec<(i64, i64)> = halves.iter().map(|c| (c.start, c.length)).collect();
+    assert_eq!(spans, [(0, bar * 2), (bar * 2, bar * 2)]);
+    let mut heard: Vec<(i64, u8)> = halves
+        .iter()
+        .flat_map(|c| {
+            notes_of(c)
+                .into_iter()
+                .map(|n| (c.start + n.start, n.pitch))
+        })
+        .collect();
+    heard.sort_unstable();
+    let mut was: Vec<(i64, u8)> = notes.iter().map(|n| (n.start, n.pitch)).collect();
+    was.sort_unstable();
+    assert_eq!(heard, was);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Split clip"));
+
+    // Ctrl+E cuts the selected clips under the playhead, and the new
+    // halves are selected with them.
+    h.key(Key::Num1, Modifiers::NONE);
+    h.key(Key::A, COMMAND);
+    assert_eq!(h.app.sel.clips.len(), 4);
+    arrange::seek(&mut h.app, bar * 3);
+    h.heard();
+    h.frames(2);
+    h.key(Key::E, COMMAND);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Split 3 clips"));
+    let count = |h: &Harness| -> usize { h.project().tracks.iter().map(|t| t.clips.len()).sum() };
+    assert_eq!(count(&h), 7);
+    assert_eq!(h.app.sel.clips.len(), 7);
+
+    // With nothing there to cut, it says how to use it.
+    h.key(Key::Escape, Modifiers::NONE);
+    arrange::seek(&mut h.app, bar * 6);
+    h.heard();
+    h.frames(2);
+    h.key(Key::E, COMMAND);
+    assert_eq!(count(&h), 7);
+    assert!(
+        h.app
+            .notice
+            .as_ref()
+            .is_some_and(|n| n.text.starts_with("Put the playhead"))
+    );
+}
+
+#[test]
+fn the_mute_and_erase_tools_act_on_clicks_and_sweeps() {
+    let mut h = Harness::demo();
+    h.show_bars(8);
+    let bar = h.project().ticks_per_bar();
+    let drums = h.track_named("Drums").clips[0].id;
+    let chords = h.track_named("Pad").clips[0].id;
+    let at = |h: &Harness, clip: ClipId| {
+        let r = arrange::clip_screen_rect(&h.app, clip).expect("clip visible");
+        pos2(tick_x(h, bar), r.center().y)
+    };
+    let muted = |h: &Harness| -> Vec<bool> {
+        h.project()
+            .tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .map(|c| c.muted)
+            .collect()
+    };
+
+    // A click mutes a clip, and another unmutes it.
+    h.key(Key::Num5, Modifiers::NONE);
+    assert_eq!(h.app.arrange.tool, Tool::Mute);
+    h.click(at(&h, chords));
+    assert!(h.clip(chords).muted);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Mute clip"));
+    h.frames(40);
+    h.click(at(&h, chords));
+    assert!(!h.clip(chords).muted);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Unmute clip"));
+
+    // A drag down across all three mutes them in one step.
+    let history = h.history_len();
+    h.drag(at(&h, drums), at(&h, chords));
+    assert_eq!(muted(&h), [true, true, true]);
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Mute 3 clips"));
+
+    // Shift+M unmutes the selection when every clip in it is muted.
+    h.key(Key::Num1, Modifiers::NONE);
+    h.key(Key::A, COMMAND);
+    h.key(Key::M, Modifiers::SHIFT);
+    assert_eq!(muted(&h), [false, false, false]);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Unmute 3 clips"));
+    h.key(Key::M, Modifiers::SHIFT);
+    assert_eq!(muted(&h), [true, true, true]);
+
+    // The Erase tool: Escape during a sweep keeps everything; a sweep
+    // deletes what it crossed, and a click deletes one clip.
+    h.key(Key::Num6, Modifiers::NONE);
+    let from = at(&h, drums);
+    h.move_to(from);
+    h.pointer(from, true);
+    h.frame();
+    for step in 1..=5 {
+        h.move_to(from.lerp(at(&h, chords), step as f32 / 5.0));
+    }
+    assert!(h.app.arrange.sweep.is_some());
+    h.key(Key::Escape, Modifiers::NONE);
+    h.pointer(at(&h, chords), false);
+    h.frames(2);
+    assert_eq!(muted(&h).len(), 3);
+    h.drag(at(&h, drums), at(&h, chords));
+    assert!(h.project().tracks.iter().all(|t| t.clips.is_empty()));
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Delete 3 clips"));
+    h.key(Key::Z, COMMAND);
+    h.frames(40);
+    h.click(at(&h, chords));
+    assert!(h.track_named("Pad").clips.is_empty());
+    assert_eq!(muted(&h).len(), 2);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Delete clip"));
+}
+
+#[test]
+fn the_draw_tool_paints_clips_and_number_keys_pick_tools() {
+    let (p, _) = with_audio_clip();
+    let mut h = Harness::with_project(p);
+    h.show_bars(8);
+    h.accessible();
+    let bar = h.project().ticks_per_bar();
+    let bass = h.track_named("Bass").id;
+    let pad = h.track_named("Pad").id;
+    let audio = h.track_named("Audio").id;
+
+    for tool in Tool::ALL {
+        h.key(tool.key(), Modifiers::NONE);
+        assert_eq!(h.app.arrange.tool, tool);
+    }
+    h.click_in(Tab::Arrange, "Draw");
+    assert_eq!(h.app.arrange.tool, Tool::Draw);
+
+    // A drag paints from the grid line before it to the one nearest its
+    // end, then opens the new clip in the editor.
+    let y = lane_rect(&h, bass).center().y;
+    h.drag(
+        pos2(tick_x(&h, bar * 5) + 3.0, y),
+        pos2(tick_x(&h, bar * 6 + PPQ * 2) - 3.0, y),
+    );
+    let new = h
+        .track_named("Bass")
+        .clips
+        .into_iter()
+        .find(|c| c.start == bar * 5)
+        .expect("a painted clip");
+    assert_eq!(new.length, bar + PPQ * 2);
+    assert!(matches!(new.content, ClipContent::Midi { .. }));
+    assert_eq!(h.app.sel.clip, Some(new.id));
+    assert!(h.app.workspace.is_front(Tab::Editor));
+
+    // A click paints a bar.
+    h.frames(40);
+    h.click(pos2(
+        tick_x(&h, bar * 5 + PPQ) + 10.0,
+        lane_rect(&h, pad).center().y,
+    ));
+    let spans: Vec<(i64, i64)> = h
+        .track_named("Pad")
+        .clips
+        .iter()
+        .map(|c| (c.start, c.length))
+        .collect();
+    assert_eq!(spans, [(0, bar * 4), (bar * 5 + PPQ, bar)]);
+
+    // Audio tracks take no painted clips.
+    h.frames(40);
+    h.click(pos2(tick_x(&h, bar * 6), lane_rect(&h, audio).center().y));
+    assert_eq!(h.track_named("Audio").clips.len(), 1);
+    assert!(
+        h.app
+            .notice
+            .as_ref()
+            .is_some_and(|n| n.text.contains("instrument tracks"))
+    );
+}
+
+#[test]
+fn markers_are_added_moved_renamed_and_deleted() {
+    let mut h = Harness::with_engine(demo_project());
+    h.show_bars(8);
+    h.accessible();
+    let bar = h.project().ticks_per_bar();
+    let lane = h.rect_of(Id::new("marker_lane"));
+    let flag = |h: &Harness, id: MarkerId| h.rect_of(Id::new(("marker", id))).center();
+
+    // A double-click on the lane adds one on the grid.
+    h.double_click(pos2(tick_x(&h, bar * 2) + 4.0, lane.center().y));
+    let p = h.project();
+    assert_eq!(p.markers.len(), 1);
+    assert_eq!(
+        (p.markers[0].tick, p.markers[0].name.as_str()),
+        (bar * 2, "Marker 1")
+    );
+    let first = p.markers[0].id;
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Add marker"));
+
+    // M adds one at the playhead, or picks the one already there.
+    arrange::seek(&mut h.app, bar * 3);
+    h.heard();
+    h.frames(2);
+    h.key(Key::M, Modifiers::NONE);
+    let second = h
+        .project()
+        .markers
+        .iter()
+        .find(|m| m.tick == bar * 3)
+        .map(|m| m.id)
+        .expect("a marker at the playhead");
+    h.key(Key::M, Modifiers::NONE);
+    assert_eq!(h.project().markers.len(), 2);
+    assert_eq!(h.app.arrange.ruler.marker, Some(second));
+
+    // A click on one goes there.
+    arrange::seek(&mut h.app, bar * 6);
+    h.heard();
+    h.click(flag(&h, first));
+    h.heard();
+    h.frames(2);
+    assert_eq!(h.app.transport.position_ticks.round() as i64, bar * 2);
+
+    // Dragged a bar later, as one step.
+    let history = h.history_len();
+    let from = flag(&h, second);
+    h.drag(
+        from,
+        from + vec2(h.app.arrange.px_per_tick * bar as f32, 0.0),
+    );
+    let tick_of = |h: &Harness, id: MarkerId| {
+        h.project()
+            .markers
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.tick)
+    };
+    assert_eq!(tick_of(&h, second), Some(bar * 4));
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Move marker"));
+
+    // A double-click renames it; Enter keeps the name.
+    h.frames(40);
+    h.double_click(flag(&h, first));
+    assert!(h.app.arrange.ruler.renaming.is_some());
+    h.key(Key::A, COMMAND);
+    h.type_text("Drop");
+    h.key(Key::Enter, Modifiers::NONE);
+    h.frames(2);
+    assert!(h.app.arrange.ruler.renaming.is_none());
+    let name = |h: &Harness, id: MarkerId| {
+        h.project()
+            .markers
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.name.clone())
+    };
+    assert_eq!(name(&h, first).as_deref(), Some("Drop"));
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Rename marker"));
+
+    // Its menu loops to the next marker and deletes it.
+    h.right_click(flag(&h, first));
+    h.click_label("Loop to the next marker");
+    let r = h.project().loop_region;
+    assert_eq!((r.start, r.end), (bar * 2, bar * 4));
+    h.frames(40);
+    h.right_click(flag(&h, second));
+    h.click_label("Delete");
+    assert_eq!(tick_of(&h, second), None);
+    assert_eq!(h.project().markers.len(), 1);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Delete marker"));
+}
+
+#[test]
+fn the_tempo_lane_adds_moves_and_deletes_tempo_changes() {
+    let mut h = Harness::demo();
+    h.show_bars(8);
+    h.accessible();
+    let bar = h.project().ticks_per_bar();
+    let lane = h.rect_of(Id::new("tempo_lane"));
+    let point = |h: &Harness, i: usize| h.rect_of(Id::new(("tempo_point", i))).center();
+    let points = |h: &Harness| -> Vec<(i64, f64)> {
+        h.project()
+            .tempo
+            .points()
+            .iter()
+            .map(|p| (p.tick, p.bpm))
+            .collect()
+    };
+
+    // The lane shows 112 to 128 BPM around a steady 120; a double-click at
+    // its top sets 128 from there on.
+    let top = lane.top() + 6.0;
+    h.double_click(pos2(tick_x(&h, bar * 2) + 4.0, top));
+    assert_eq!(points(&h), [(0, 120.0), (bar * 2, 128.0)]);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Change tempo"));
+
+    // Down 11 pixels is 12 BPM now that the lane shows 112 to 136; along a
+    // bar moves it a bar.
+    let from = point(&h, 1);
+    h.drag(from, from + vec2(0.0, 11.0));
+    assert_eq!(points(&h), [(0, 120.0), (bar * 2, 116.0)]);
+    let from = point(&h, 1);
+    let bar_px = h.app.arrange.px_per_tick * bar as f32;
+    h.drag(from, from + vec2(bar_px, 0.0));
+    assert_eq!(points(&h), [(0, 120.0), (bar * 3, 116.0)]);
+
+    // The first point stays at the start.
+    let history = h.history_len();
+    let from = point(&h, 0);
+    h.drag(from, from + vec2(bar_px, 0.0));
+    assert_eq!(points(&h)[0].0, 0);
+    assert_eq!(h.history_len(), history);
+
+    // The transport's tempo changes the start and keeps later changes.
+    let r = actions::set_tempo(&h.app.session, 100.0, None);
+    h.app.report(r);
+    h.frames(2);
+    assert_eq!(points(&h), [(0, 100.0), (bar * 3, 116.0)]);
+
+    // A point's menu deletes it; the lane's menu flattens the map.
+    h.right_click(point(&h, 1));
+    h.click_label("Delete");
+    assert_eq!(points(&h), [(0, 100.0)]);
+    h.key(Key::Z, COMMAND);
+    assert_eq!(points(&h).len(), 2);
+    h.frames(40);
+    h.right_click(pos2(tick_x(&h, bar * 6), lane.center().y));
+    h.click_label("Keep the starting tempo throughout");
+    assert_eq!(points(&h), [(0, 100.0)]);
+}
+
+#[test]
+fn the_ruler_lanes_hide_and_come_back_next_run() {
+    let mut h = Harness::with_engine(demo_project());
+    h.frames(2);
+    assert!(h.ctx.read_response(Id::new("marker_lane")).is_some());
+    assert!(h.ctx.read_response(Id::new("tempo_lane")).is_some());
+
+    // View > Marker lane hides it.
+    let lane_item = |h: &Harness, lane: Lane| -> Option<bool> {
+        let menus = menu::menus(&h.app);
+        menu_entries(&menus, "View").iter().find_map(|e| match e {
+            menu::Entry::Item(it) if it.label == lane.label() => it.checked,
+            _ => None,
+        })
+    };
+    assert_eq!(lane_item(&h, Lane::Markers), Some(true));
+    h.run(Action::ToggleLane(Lane::Markers));
+    assert_eq!(lane_item(&h, Lane::Markers), Some(false));
+    assert!(h.ctx.read_response(Id::new("marker_lane")).is_none());
+    assert!(h.ctx.read_response(Id::new("tempo_lane")).is_some());
+
+    // The next run starts without it.
+    let mut storage = MemoryStorage::default();
+    eframe::App::save(&mut h.app, &mut storage);
+    let mut next = Harness::with_engine(demo_project());
+    next.app.restore(&storage);
+    next.frames(2);
+    assert!(!next.app.workspace.lanes.markers);
+    assert!(next.app.workspace.lanes.tempo);
+    assert!(next.ctx.read_response(Id::new("marker_lane")).is_none());
+
+    // Adding a marker shows it again.
+    next.key(Key::M, Modifiers::NONE);
+    assert!(next.app.workspace.lanes.markers);
+    assert_eq!(next.project().markers.len(), 1);
+    assert!(next.ctx.read_response(Id::new("marker_lane")).is_some());
 }

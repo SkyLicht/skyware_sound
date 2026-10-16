@@ -147,6 +147,7 @@ mod tests {
             name: "p".into(),
             start: 0,
             length: 960,
+            muted: false,
             content: ClipContent::pattern("s0", 0, 960),
         });
         t

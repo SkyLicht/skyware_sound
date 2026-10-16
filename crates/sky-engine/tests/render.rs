@@ -27,6 +27,7 @@ fn drum_project(notes: Vec<Note>) -> Project {
         name: "c".into(),
         start: 0,
         length: PPQ * 16,
+        muted: false,
         content: ClipContent::Midi { notes },
     });
     p.tracks.push(t);
@@ -89,6 +90,7 @@ fn audio_clips_play_sample_exact() {
         name: "ramp".into(),
         start: PPQ,
         length: PPQ * 4,
+        muted: false,
         content: ClipContent::Audio {
             source: id,
             offset: 100,
@@ -191,6 +193,7 @@ fn notes_held_into_the_body_do_not_cut_off_at_the_join() {
         name: "c".into(),
         start: 0,
         length: PPQ * 16,
+        muted: false,
         content: ClipContent::Midi {
             notes: vec![Note::new(PPQ * 2, PPQ * 3, 57, 110)],
         },
@@ -257,6 +260,17 @@ fn mute_and_solo() {
 }
 
 #[test]
+fn muted_clips_play_nothing() {
+    let mut p = drum_project(vec![Note::new(0, PPQ / 4, 36, 127)]);
+    p.tracks[0].clips[0].muted = true;
+    let out = render(compile(&p, &AudioCache::new(), SR, 1), 0, 48_000, false);
+    assert_eq!(out.peak(), 0.0);
+    p.tracks[0].clips[0].muted = false;
+    let out = render(compile(&p, &AudioCache::new(), SR, 1), 0, 48_000, false);
+    assert!(out.peak() > 0.0);
+}
+
+#[test]
 fn swaps_keep_held_notes_sounding() {
     let mut p = Project::new("held");
     p.loop_enabled = false;
@@ -266,6 +280,7 @@ fn swaps_keep_held_notes_sounding() {
         name: "long".into(),
         start: 0,
         length: PPQ * 16,
+        muted: false,
         content: ClipContent::Midi {
             notes: vec![Note::new(0, PPQ * 16, 60, 100)],
         },
@@ -303,6 +318,7 @@ fn pattern_clips_play_on_the_grid() {
             name: "p".into(),
             start: 0,
             length: PPQ * 4 * bars,
+            muted: false,
             content: ClipContent::pattern("~ bd", 0, PPQ * 4),
         });
         p.tracks.push(t);
@@ -390,6 +406,7 @@ fn bank_project(clip: ClipContent, pitched: Option<&str>) -> (Project, AudioCach
         name: "c".into(),
         start: 0,
         length: PPQ * 4,
+        muted: false,
         content: clip,
     });
     p.tracks.push(t);

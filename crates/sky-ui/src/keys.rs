@@ -10,6 +10,7 @@
 use egui::{Align2, Context, Key, KeyboardShortcut, Modifiers, RichText, ScrollArea, Window, vec2};
 
 use crate::app::{Action, App, Focus};
+use crate::clip_tools::Tool;
 use crate::dialogs::PathPurpose;
 use crate::theme;
 
@@ -114,7 +115,15 @@ const fn ctrl_shift(key: Key) -> KeyboardShortcut {
 }
 
 /// The groups, in the order they are listed.
-pub const GROUPS: [&str; 6] = ["File", "Edit", "Selection", "Transport", "View", "Help"];
+pub const GROUPS: [&str; 7] = [
+    "File",
+    "Edit",
+    "Selection",
+    "Tools",
+    "Transport",
+    "View",
+    "Help",
+];
 
 /// Every key command.
 pub fn table() -> Vec<KeyCommand> {
@@ -122,7 +131,10 @@ pub fn table() -> Vec<KeyCommand> {
     use Key::*;
     use Scope::{Arrange, Editor};
     let k = KeyCommand::new;
-    vec![
+    let tools = Tool::ALL
+        .into_iter()
+        .map(|tool| k("Tools", tool.command(), &[plain(tool.key())], A::Tool(tool)).only(Arrange));
+    let mut table = vec![
         k("File", "Open a project", &[ctrl(O)], A::Open).typing(),
         k("File", "Save", &[ctrl(S)], A::Save).typing(),
         k("File", "Save as a new project", &[ctrl_shift(S)], A::SaveAs).typing(),
@@ -139,6 +151,14 @@ pub fn table() -> Vec<KeyCommand> {
             &[plain(Delete), plain(Backspace)],
             A::DeleteSelection,
         ),
+        k(
+            "Edit",
+            "Split clips at the playhead",
+            &[ctrl(E)],
+            A::SplitAtPlayhead,
+        )
+        .only(Arrange),
+        k("Edit", "Mute or unmute clips", &[shift(M)], A::MuteClips).only(Arrange),
         k("Edit", "Select all", &[ctrl(A)], A::SelectAll),
         k("Edit", "Select nothing", &[plain(Escape)], A::SelectNone),
         k(
@@ -210,6 +230,12 @@ pub fn table() -> Vec<KeyCommand> {
         k("Transport", "Play or pause", &[plain(Space)], A::PlayStop),
         k("Transport", "Loop on or off", &[ctrl(L)], A::ToggleLoop),
         k(
+            "Transport",
+            "Add a marker at the playhead",
+            &[plain(M)],
+            A::AddMarker,
+        ),
+        k(
             "View",
             "Show or hide the browser",
             &[ctrl(B)],
@@ -251,7 +277,9 @@ pub fn table() -> Vec<KeyCommand> {
         k("View", "Actual size", &[ctrl(Num0)], A::ZoomReset).typing(),
         k("Help", "Command palette", &[ctrl(K)], A::OpenPalette).typing(),
         k("Help", "Keyboard shortcuts", &[ctrl(Slash)], A::Shortcuts).typing(),
-    ]
+    ];
+    table.extend(tools);
+    table
 }
 
 /// The keys menus show for an action, such as "Ctrl+D", or "" if none.

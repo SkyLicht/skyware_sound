@@ -21,6 +21,7 @@ use crate::arrange::ArrangeState;
 use crate::audio::AudioState;
 use crate::audition::Audition;
 use crate::browser::BrowserState;
+use crate::clip_tools::Tool;
 use crate::dialogs::{Confirm, Dialogs, PathPurpose};
 use crate::edit::EditState;
 use crate::jobs::{JobOutput, Jobs};
@@ -30,6 +31,7 @@ use crate::mixer::MixerState;
 use crate::palette::PaletteState;
 use crate::pattern_editor::PatternState;
 use crate::piano_roll::PianoState;
+use crate::ruler_lanes::Lane;
 use crate::step_editor::StepState;
 use crate::waveform::{Peaks, WaveformCache};
 use crate::widgets::Gestures;
@@ -110,6 +112,16 @@ pub enum Action {
     TimelineZoom(i32),
     /// Show the whole song, or the whole clip in the piano roll.
     TimelineFit,
+    /// Pick an arrangement tool.
+    Tool(Tool),
+    /// Cut the selected clips, or those on the selected track, at the
+    /// playhead.
+    SplitAtPlayhead,
+    /// Mute the selected clips, or unmute them when all are muted.
+    MuteClips,
+    AddMarker,
+    /// Show or hide a lane under the ruler.
+    ToggleLane(Lane),
     Quit,
 }
 
@@ -455,9 +467,7 @@ impl App {
 
     fn end_frame(&mut self, ctx: &Context) {
         let fast = self.transport.playing
-            || self.arrange.drag.is_some()
-            || self.arrange.marquee.is_some()
-            || self.arrange.asset_drag.is_some()
+            || self.arrange.gesture()
             || self.piano.marquee.is_some()
             || self.mixer.any_active()
             || self.ai.flashing(self.now)
@@ -509,9 +519,7 @@ impl App {
         // Arrow keys move between widgets while one has the keyboard.
         let widget_focus = ctx.memory(|m| m.focused().is_some());
         // Escape cancels a drag or closes a menu before it deselects.
-        let escape_taken = self.arrange.drag.is_some()
-            || self.arrange.marquee.is_some()
-            || self.arrange.asset_drag.is_some()
+        let escape_taken = self.arrange.gesture()
             || self.piano.drag.is_some()
             || self.piano.marquee.is_some()
             || egui::Popup::is_any_open(ctx);
@@ -674,6 +682,11 @@ impl App {
             Action::MoveToTrack(rows) => self.move_to_track(rows),
             Action::TimelineZoom(dir) => self.timeline_zoom(dir),
             Action::TimelineFit => self.timeline_fit(),
+            Action::Tool(tool) => self.set_tool(tool),
+            Action::SplitAtPlayhead => self.split_at_playhead(),
+            Action::MuteClips => self.mute_selection(),
+            Action::AddMarker => self.add_marker_at_playhead(),
+            Action::ToggleLane(lane) => self.workspace.lanes.toggle(lane),
         }
         self.refresh();
     }

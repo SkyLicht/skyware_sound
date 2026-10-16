@@ -127,6 +127,7 @@ fn save_and_open_keep_pool_audio() {
                         name: "Tone".into(),
                         start: 0,
                         length: PPQ,
+                        muted: false,
                         content: ClipContent::Audio {
                             source: id,
                             offset: 0,
@@ -515,6 +516,7 @@ fn banks_load_from_packs_play_undo_and_credit_exports() {
         name: "Beat".into(),
         start: 0,
         length: PPQ * 4,
+        muted: false,
         content: ClipContent::pattern("bd sd bd:1 sd", 0, PPQ * 4),
     });
     let track_id = track.id;
@@ -626,6 +628,7 @@ fn unknown_licenses_warn_and_bad_requests_change_nothing() {
                 name: "p".into(),
                 start: 0,
                 length: PPQ * 4,
+                muted: false,
                 content: ClipContent::pattern("bd", 0, PPQ * 4),
             }),
         }))

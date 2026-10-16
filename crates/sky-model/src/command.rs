@@ -152,6 +152,10 @@ pub enum Command {
         id: ClipId,
         name: String,
     },
+    SetClipMuted {
+        id: ClipId,
+        muted: bool,
+    },
     #[serde(rename_all = "camelCase")]
     SetAudioClip {
         id: ClipId,
@@ -650,6 +654,8 @@ impl Command {
             Command::MoveClip { .. } => "Move clip",
             Command::SetClipLength { .. } => "Resize clip",
             Command::SetClipName { .. } => "Rename clip",
+            Command::SetClipMuted { muted: true, .. } => "Mute clip",
+            Command::SetClipMuted { muted: false, .. } => "Unmute clip",
             Command::SetAudioClip { .. } => "Edit audio clip",
             Command::AddNotes { .. } => "Add notes",
             Command::RemoveNotes { .. } => "Delete notes",
@@ -1023,6 +1029,11 @@ impl Command {
                 let c = project.clip_mut(id)?;
                 let old = std::mem::replace(&mut c.name, name);
                 Command::SetClipName { id, name: old }
+            }
+            Command::SetClipMuted { id, muted } => {
+                let c = project.clip_mut(id)?;
+                let old = std::mem::replace(&mut c.muted, muted);
+                Command::SetClipMuted { id, muted: old }
             }
             Command::SetAudioClip {
                 id,

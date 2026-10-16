@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use sky_core::{ClipId, EffectId, NoteId, PPQ, Ticks, TrackId};
+use sky_core::{ClipId, EffectId, NoteId, PPQ, TempoMap, Ticks, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::{
     ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project, StepClip,
@@ -171,8 +171,16 @@ pub fn set_channel(
     )
 }
 
+/// Sets the tempo at the start of the song. Tempo changes later in the
+/// song stay.
 pub fn set_tempo(session: &Session, bpm: f64, key: Option<u64>) -> ActionResult<u64> {
-    single(session, Command::SetTempo { bpm }, key)
+    let mut points = session.project().tempo.points().to_vec();
+    if points.len() < 2 {
+        return single(session, Command::SetTempo { bpm }, key);
+    }
+    points[0].bpm = bpm;
+    let map = TempoMap::from_points(points).map_err(|e| e.to_string())?;
+    single(session, Command::SetTempoMap { map }, key)
 }
 
 pub fn set_time_signature(
@@ -344,6 +352,7 @@ pub fn add_midi_clip(
         name: "Clip".into(),
         start: start.max(0),
         length: length.max(1),
+        muted: false,
         content: ClipContent::Midi { notes: Vec::new() },
     };
     let id = clip.id;
@@ -375,6 +384,7 @@ pub fn add_pattern_clip(
         name: "Pattern".into(),
         start: start.max(0),
         length: length.max(1),
+        muted: false,
         content: ClipContent::pattern(source, 0, project.ticks_per_bar()),
     };
     let id = clip.id;
@@ -438,6 +448,7 @@ pub fn add_step_clip(
         name: "Steps".into(),
         start: start.max(0),
         length: length.max(1),
+        muted: false,
         content: ClipContent::Steps(steps),
     };
     let id = clip.id;
@@ -709,6 +720,7 @@ pub fn stress_project(tracks: usize) -> Project {
                 name: format!("Pattern {}", i + 1),
                 start: 0,
                 length: bar * 8,
+                muted: false,
                 content: ClipContent::pattern(patterns[i % patterns.len()], i as u64, bar),
             }
         } else {
@@ -723,6 +735,7 @@ pub fn stress_project(tracks: usize) -> Project {
                 name: format!("Notes {}", i + 1),
                 start: 0,
                 length: bar * 8,
+                muted: false,
                 content: ClipContent::Midi { notes },
             }
         };
