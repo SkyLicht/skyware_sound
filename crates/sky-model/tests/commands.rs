@@ -1001,3 +1001,80 @@ fn bank_sounds_resolve_by_name_case_and_drum_alias() {
     assert_eq!(bank.resolve("hh"), None);
     assert_eq!(bank.sample_count(), 4);
 }
+
+#[test]
+fn commands_name_what_they_change() {
+    let project = demo_project();
+    let drums = project.tracks[0].id;
+    let clip = project.tracks[0].clips[0].id;
+    let reverb = project.tracks[2].channel.effects[0].id;
+    let pad = ChannelRef::Track(project.tracks[2].id);
+    let targets = |commands: &[Command]| {
+        let mut out = Vec::new();
+        for c in commands {
+            c.targets(&mut out);
+        }
+        out
+    };
+    let lead = Track::new_instrument("Lead", InstrumentType::Synth);
+    let lead_id = lead.id;
+    let duck = EffectSlot::new(EffectType::Duck);
+    let duck_id = duck.id;
+    let found = targets(&[
+        Command::SetTempo { bpm: 128.0 },
+        Command::SetLoopEnabled { enabled: false },
+        Command::SetPattern {
+            clip,
+            source: "bd*4".into(),
+            seed: 0,
+            cycle: PPQ * 4,
+            controls: Default::default(),
+            swing: Default::default(),
+        },
+        Command::MoveClip {
+            id: clip,
+            track: drums,
+            start: 0,
+        },
+        Command::SetEffectParam {
+            channel: pad,
+            effect: reverb,
+            param: "mix".into(),
+            value: Some(0.5),
+        },
+        Command::AddEffect {
+            channel: ChannelRef::Master,
+            effect: duck,
+            index: None,
+        },
+        Command::SetChannel {
+            channel: ChannelRef::Track(drums),
+            volume_db: Some(-3.0),
+            pan: None,
+            mute: None,
+            solo: None,
+        },
+        Command::SetInstrumentParam {
+            track: drums,
+            param: "tune".into(),
+            value: None,
+        },
+        Command::AddTrack {
+            track: Box::new(lead),
+            index: None,
+        },
+        Command::RemoveClip { id: clip },
+    ]);
+    assert_eq!(
+        found,
+        vec![
+            Target::Song,
+            Target::Clip(clip),
+            Target::Effect(pad, reverb),
+            Target::Effect(ChannelRef::Master, duck_id),
+            Target::Channel(ChannelRef::Track(drums)),
+            Target::Instrument(drums),
+            Target::Track(lead_id),
+        ]
+    );
+}

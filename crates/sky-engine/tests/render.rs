@@ -469,3 +469,51 @@ fn bank_notes_play_drums_by_number_or_the_pitched_sound() {
     );
     assert!((level_at(out.left(), 0) / level_at(bd.left(), 0) - 4.0).abs() < 0.01);
 }
+
+#[test]
+fn the_master_loudness_meter_agrees_with_the_offline_analysis() {
+    let p = demo_project();
+    let (mut handle, mut engine) = create_engine(compile(&p, &AudioCache::new(), SR, 1));
+    handle.send(EngineMsg::Play);
+    let frames = SR as usize * 4;
+    let mut left = vec![0.0; frames];
+    let mut right = vec![0.0; frames];
+    for (l, r) in left.chunks_mut(480).zip(right.chunks_mut(480)) {
+        engine.process_planar(l, r);
+    }
+    let shared = handle.shared().clone();
+    let mut seen = 0;
+    let mut loud = sky_dsp::loudness::Loudness::default();
+    let mut blocks = 0;
+    shared.loudness.read(&mut seen, |b| {
+        assert!(b.playing);
+        loud.push(b.power, b.playing);
+        blocks += 1;
+    });
+    assert_eq!(blocks, 40);
+    let analysis = analysis::analyze(&AudioData {
+        sample_rate: SR,
+        channels: vec![left, right],
+    });
+    let integrated = loud.integrated().unwrap();
+    let expected = analysis.integrated_lufs.unwrap();
+    assert!(
+        (integrated - expected).abs() < 0.15,
+        "{integrated} vs {expected}"
+    );
+    let (tl, tr) = shared.master_true_peak.take();
+    let tp = sky_dsp::util::gain_to_db(tl.max(tr));
+    let expected = analysis.true_peak_dbfs.unwrap();
+    assert!((tp - expected).abs() < 0.1, "{tp} vs {expected}");
+    // Stopped, the blocks keep coming but say so.
+    handle.send(EngineMsg::Stop);
+    let mut l = vec![0.0; 4800];
+    let mut r = vec![0.0; 4800];
+    engine.process_planar(&mut l, &mut r);
+    let mut stopped = 0;
+    shared.loudness.read(&mut seen, |b| {
+        assert!(!b.playing);
+        stopped += 1;
+    });
+    assert_eq!(stopped, 1);
+}

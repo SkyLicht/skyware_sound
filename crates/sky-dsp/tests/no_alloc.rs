@@ -37,6 +37,8 @@ fn processors_do_not_allocate() {
         .collect();
     let mut left = vec![0.0f32; sky_dsp::MAX_BLOCK];
     let mut right = vec![0.0f32; sky_dsp::MAX_BLOCK];
+    let mut meter = sky_dsp::loudness::BlockMeter::new(48_000);
+    let mut blocks = 0usize;
     assert_no_alloc(|| {
         for block in 0..50 {
             for (params, inst) in instruments.iter_mut() {
@@ -65,6 +67,8 @@ fn processors_do_not_allocate() {
                 }
                 fx.process(&mut left, &mut right);
             }
+            meter.process(&left, &right, |_| blocks += 1);
         }
     });
+    assert!(blocks > 0);
 }

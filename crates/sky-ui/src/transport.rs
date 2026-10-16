@@ -351,13 +351,13 @@ fn ai_indicator(app: &App, ui: &mut Ui) -> Response {
         } else {
             theme::PANEL
         };
-        let fill = base.lerp_to_gamma(theme::ACCENT, glow * 0.85);
+        let fill = base.lerp_to_gamma(theme::AI, glow * 0.85);
         let painter = ui.painter();
         painter.rect(
             rect,
             CornerRadius::same(11),
             fill,
-            Stroke::new(1.0, theme::GRID_BEAT.lerp_to_gamma(theme::ACCENT, glow)),
+            Stroke::new(1.0, theme::GRID_BEAT.lerp_to_gamma(theme::AI, glow)),
             StrokeKind::Inside,
         );
         let dot_color = if !connected {
@@ -365,7 +365,7 @@ fn ai_indicator(app: &App, ui: &mut Ui) -> Response {
         } else if glow > 0.0 {
             Color32::WHITE
         } else {
-            theme::ACCENT
+            theme::AI
         };
         painter.circle_filled(pos2(rect.left() + 10.0, rect.center().y), 3.5, dot_color);
         let text_color = if glow > 0.3 {

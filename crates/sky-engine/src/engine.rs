@@ -8,13 +8,14 @@ use std::sync::atomic::Ordering;
 
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use sky_core::TrackId;
+use sky_dsp::loudness::BlockMeter;
 use sky_dsp::{Instrument, MAX_BLOCK};
 
 use crate::compile::{
     AudioClipNode, ChannelNode, EngineSnapshot, NoteEvent, SourceNode, TrackNode, Triggers,
 };
 use crate::preview::{Preview, PreviewVoice};
-use crate::shared::EngineShared;
+use crate::shared::{EngineShared, LoudnessBlock};
 
 /// Messages from the control thread to the audio thread.
 pub enum EngineMsg {
@@ -134,6 +135,8 @@ pub struct Engine {
     smoothing: f32,
     live: [Option<LiveNote>; MAX_LIVE],
     preview: Option<PreviewVoice>,
+    /// Loudness and true peak of the master, for the meters.
+    loudness: BlockMeter,
 }
 
 /// Creates the two ends of an engine around a first snapshot.
@@ -141,6 +144,7 @@ pub fn create_engine(snapshot: EngineSnapshot) -> (EngineHandle, Engine) {
     let (tx, rx) = RingBuffer::new(256);
     let (trash_tx, trash_rx) = RingBuffer::new(64);
     let shared = Arc::new(EngineShared::new(snapshot.sample_rate));
+    let loudness = BlockMeter::new(snapshot.sample_rate);
     let smoothing = 1.0 - (-1.0 / (0.01 * snapshot.sample_rate.max(1) as f32)).exp();
     let handle = EngineHandle {
         tx,
@@ -160,6 +164,7 @@ pub fn create_engine(snapshot: EngineSnapshot) -> (EngineHandle, Engine) {
         smoothing,
         live: [None; MAX_LIVE],
         preview: None,
+        loudness,
     };
     (handle, engine)
 }
@@ -695,6 +700,11 @@ impl Engine {
         feed_sidechains(&mut snap.master, &snap.triggers);
         let (pl, pr) = apply_channel(&mut snap.master, k, ml, mr);
         self.shared.master.record(pl, pr);
+        let (shared, playing) = (&self.shared, self.playing);
+        let (tl, tr) = self.loudness.process(ml, mr, |power| {
+            shared.loudness.push(LoudnessBlock { power, playing });
+        });
+        self.shared.master_true_peak.record(tl, tr);
         if let Some(v) = self.preview.as_mut() {
             v.render_add(ml, mr);
         }

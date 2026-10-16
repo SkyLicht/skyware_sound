@@ -17,7 +17,7 @@ pub mod steps;
 pub mod summary;
 pub mod templates;
 
-pub use command::{ChannelRef, Command};
+pub use command::{ChannelRef, Command, Target};
 pub use error::ModelError;
 pub use history::{Applied, History, Origin, Transaction};
 pub use licenses::{LicenseReport, license_report};

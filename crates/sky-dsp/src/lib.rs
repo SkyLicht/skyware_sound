@@ -12,6 +12,7 @@ pub mod audio;
 pub mod effects;
 pub mod filters;
 pub mod instruments;
+pub mod loudness;
 pub mod params;
 pub mod util;
 
