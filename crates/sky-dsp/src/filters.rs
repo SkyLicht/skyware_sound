@@ -152,6 +152,20 @@ impl BiquadCoeffs {
         )
     }
 
+    /// The response at `freq`, in dB.
+    pub fn magnitude_db(&self, freq: f32, sample_rate: f32) -> f32 {
+        let w = 2.0 * std::f64::consts::PI * f64::from(freq) / f64::from(sample_rate);
+        let (c1, s1, c2, s2) = (w.cos(), w.sin(), (2.0 * w).cos(), (2.0 * w).sin());
+        let [b0, b1, b2, a1, a2] = [self.b0, self.b1, self.b2, self.a1, self.a2].map(f64::from);
+        let num_re = b0 + b1 * c1 + b2 * c2;
+        let num_im = -(b1 * s1 + b2 * s2);
+        let den_re = 1.0 + a1 * c1 + a2 * c2;
+        let den_im = -(a1 * s1 + a2 * s2);
+        let num = num_re * num_re + num_im * num_im;
+        let den = (den_re * den_re + den_im * den_im).max(1e-30);
+        (10.0 * (num / den).max(1e-18).log10()) as f32
+    }
+
     pub fn highpass(freq: f32, q: f32, sample_rate: f32) -> Self {
         let (cos, sin) = Self::omega(freq, sample_rate);
         let alpha = sin / (2.0 * q.max(0.05));

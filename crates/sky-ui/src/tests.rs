@@ -10,7 +10,7 @@ use egui::accesskit::Role;
 use egui::{
     Context, Event, FontId, Id, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2,
 };
-use sky_core::{AudioId, ClipId, MarkerId, PPQ};
+use sky_core::{AudioId, ClipId, EffectId, MarkerId, PPQ, TrackId};
 use sky_dsp::{AudioData, InstrumentType};
 use sky_model::templates::{demo_project, empty_project};
 use sky_model::{
@@ -32,8 +32,8 @@ use crate::waveform::Peaks;
 use crate::widgets::Gestures;
 use crate::workspace::Workspace;
 use crate::{
-    UiConfig, arrange, asset_lane, game, keys, menu, mixer, palette, pattern_editor, sounds, theme,
-    velocity_lane,
+    UiConfig, arrange, asset_lane, fx_view, game, inst_view, keys, menu, mixer, palette,
+    pattern_editor, sounds, theme, velocity_lane,
 };
 
 /// The app in a bare egui context, fed with synthetic input.
@@ -4966,4 +4966,252 @@ fn notes_quantize_to_the_grid() {
         .collect();
     on_grid.sort_unstable();
     assert_eq!(spans(&h), on_grid);
+}
+
+/// Adds an effect to a track and opens its window in the mixer.
+fn open_effect(h: &mut Harness, track: &str, kind: sky_dsp::EffectType) -> (TrackId, EffectId) {
+    let t = h.track_named(track);
+    let channel = sky_model::ChannelRef::Track(t.id);
+    let id = h
+        .app
+        .report(actions::add_effect(&h.app.session, channel, kind))
+        .expect("effect added");
+    h.app.mixer.open_effect = Some((channel, id));
+    h.app.workspace.show(Tab::Mixer);
+    h.frames(3);
+    (t.id, id)
+}
+
+fn effect_param(h: &Harness, track: TrackId, effect: EffectId, name: &str) -> f32 {
+    h.project()
+        .track(track)
+        .ok()
+        .and_then(|t| t.channel.effect(effect))
+        .and_then(|e| e.param(name))
+        .expect("parameter")
+}
+
+fn instrument_param(h: &Harness, track: TrackId, name: &str) -> f32 {
+    h.project()
+        .track(track)
+        .ok()
+        .and_then(|t| t.instrument.as_ref())
+        .and_then(|i| i.param(name))
+        .expect("parameter")
+}
+
+#[test]
+fn dragging_an_eq_band_moves_it_in_one_undo_step() {
+    let mut h = Harness::demo();
+    let (bass, eq) = open_effect(&mut h, "Bass", sky_dsp::EffectType::Eq);
+    let handle = h.rect_of(fx_view::handle_id(eq, "mid_freq")).center();
+    let history = h.history_len();
+    h.drag(handle, handle + vec2(60.0, -40.0));
+    let freq = effect_param(&h, bass, eq, "mid_freq");
+    let gain = effect_param(&h, bass, eq, "mid_gain");
+    assert!(freq > 1_500.0, "{freq}");
+    assert!(gain > 5.0, "{gain}");
+    assert_eq!(h.history_len(), history + 1, "one drag is one undo step");
+
+    // The wheel over it makes it narrower, steps close together one step.
+    let handle = h.rect_of(fx_view::handle_id(eq, "mid_freq")).center();
+    h.move_to(handle);
+    for _ in 0..3 {
+        h.events.push(Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, 40.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        });
+        h.frames(4);
+    }
+    h.frames(20);
+    let q = effect_param(&h, bass, eq, "mid_q");
+    assert!(q > 1.0, "{q}");
+    assert_eq!(h.history_len(), history + 2);
+
+    // A double-click sets the gain back to flat.
+    let handle = h.rect_of(fx_view::handle_id(eq, "mid_freq")).center();
+    h.double_click(handle);
+    assert_eq!(effect_param(&h, bass, eq, "mid_gain"), 0.0);
+    h.run(Action::Undo);
+    h.run(Action::Undo);
+    h.run(Action::Undo);
+    assert_eq!(effect_param(&h, bass, eq, "mid_freq"), 1_000.0);
+}
+
+#[test]
+fn the_filter_and_compressor_handles_set_their_parameters() {
+    let mut h = Harness::demo();
+    let (bass, filter) = open_effect(&mut h, "Bass", sky_dsp::EffectType::Filter);
+    let handle = h.rect_of(fx_view::handle_id(filter, "cutoff")).center();
+    h.drag(handle, handle + vec2(-50.0, -50.0));
+    assert!(effect_param(&h, bass, filter, "cutoff") < 700.0);
+    assert!(effect_param(&h, bass, filter, "resonance") > 0.5);
+
+    let (drums, comp) = open_effect(&mut h, "Drums", sky_dsp::EffectType::Compressor);
+    let handle = h.rect_of(fx_view::handle_id(comp, "threshold")).center();
+    h.drag(handle, handle + vec2(-30.0, 0.0));
+    let threshold = effect_param(&h, drums, comp, "threshold");
+    assert!(threshold < -25.0, "{threshold}");
+    // Down at the right edge compresses harder.
+    let handle = h.rect_of(fx_view::handle_id(comp, "ratio")).center();
+    h.drag(handle, handle + vec2(0.0, 20.0));
+    let ratio = effect_param(&h, drums, comp, "ratio");
+    assert!(ratio > 5.0, "{ratio}");
+}
+
+#[test]
+fn compressors_show_how_much_they_turn_down() {
+    let mut h = Harness::with_engine(demo_project());
+    let (drums, comp) = open_effect(&mut h, "Drums", sky_dsp::EffectType::Compressor);
+    let channel = sky_model::ChannelRef::Track(drums);
+    for (name, v) in [("threshold", -40.0), ("ratio", 20.0)] {
+        h.app
+            .report(actions::set_effect_param(
+                &h.app.session,
+                channel,
+                comp,
+                name,
+                Some(v),
+                None,
+            ))
+            .unwrap();
+    }
+    assert!(!h.app.mixer.reductions[&(channel, comp)].is_active());
+    h.run(Action::PlayStop);
+    for _ in 0..10 {
+        h.heard();
+        h.frame();
+    }
+    let level = &h.app.mixer.reductions[&(channel, comp)];
+    assert!(level.db > 10.0 && level.hold >= level.db, "{}", level.db);
+    assert!(level.history.iter().any(|d| *d > 10.0));
+    assert!(h.app.mixer.any_active());
+    // Effects that never turn the signal down have no meter.
+    let (_, eq) = open_effect(&mut h, "Bass", sky_dsp::EffectType::Eq);
+    let bass = sky_model::ChannelRef::Track(h.track_named("Bass").id);
+    assert!(!h.app.mixer.reductions.contains_key(&(bass, eq)));
+    h.run(Action::PlayStop);
+}
+
+#[test]
+fn the_envelope_graph_drags_attack_and_sustain() {
+    let mut h = Harness::demo();
+    let bass = h.track_named("Bass");
+    h.app.sel.select_track(bass.id);
+    h.app.workspace.show(Tab::Instrument);
+    h.frames(3);
+    let attack = instrument_param(&h, bass.id, "attack");
+    let history = h.history_len();
+    let handle = h.rect_of(inst_view::handle_id(bass.id, "attack")).center();
+    h.drag(handle, handle + vec2(30.0, 0.0));
+    assert!(instrument_param(&h, bass.id, "attack") > attack * 2.0);
+    assert_eq!(h.history_len(), history + 1, "one drag is one undo step");
+
+    // The decay's handle sets the sustain too, in the same step.
+    let sustain = instrument_param(&h, bass.id, "sustain");
+    let handle = h.rect_of(inst_view::handle_id(bass.id, "decay")).center();
+    h.drag(handle, handle + vec2(20.0, 30.0));
+    let now = instrument_param(&h, bass.id, "sustain");
+    assert!(now < sustain - 0.1, "{now}");
+    assert_eq!(h.history_len(), history + 2);
+
+    // The filter sweep's handles set its depth and cutoff.
+    let amount = instrument_param(&h, bass.id, "env_amount");
+    let handle = h
+        .rect_of(inst_view::handle_id(bass.id, "env_amount"))
+        .center();
+    h.drag(handle, handle + vec2(0.0, 20.0));
+    assert!(instrument_param(&h, bass.id, "env_amount") < amount);
+}
+
+#[test]
+fn the_sampler_markers_set_where_it_plays() {
+    let mut p = demo_project();
+    let entry = PoolEntry {
+        id: AudioId::new(),
+        name: "hit".into(),
+        file: "audio/hit.wav".into(),
+        channels: 1,
+        sample_rate: 48_000,
+        frames: 48_000,
+        source: None,
+    };
+    let mut track = Track::new_instrument("Hit", InstrumentType::Sampler);
+    if let Some(i) = track.instrument.as_mut() {
+        i.sample = Some(entry.id);
+    }
+    let track_id = track.id;
+    p.audio_pool.push(entry.clone());
+    p.tracks.push(track);
+    let mut h = Harness::with_project(p);
+    let mut audio = AudioData::silent(1, 48_000, 48_000);
+    if let Some(s) = audio.channels.first_mut().and_then(|c| c.get_mut(100)) {
+        *s = 0.9;
+    }
+    h.app
+        .waveforms
+        .insert(entry.id, Some(Arc::new(Peaks::compute(&audio))));
+    h.app.sel.select_track(track_id);
+    h.app.workspace.show(Tab::Instrument);
+    h.frames(3);
+    let history = h.history_len();
+    let start = h.rect_of(inst_view::handle_id(track_id, "start"));
+    let end = h.rect_of(inst_view::handle_id(track_id, "end"));
+    let width = end.center().x - start.center().x;
+    h.drag(start.center(), start.center() + vec2(width * 0.25, 0.0));
+    let at = instrument_param(&h, track_id, "start");
+    assert!((at - 0.25).abs() < 0.02, "{at}");
+    assert_eq!(h.history_len(), history + 1, "one drag is one undo step");
+    // The end can't pass the start.
+    h.drag(end.center(), start.center() - vec2(40.0, 0.0));
+    let end_at = instrument_param(&h, track_id, "end");
+    assert!(end_at > at && end_at < at + 0.01, "{end_at}");
+}
+
+#[test]
+fn drum_pads_play_and_pick_their_sound() {
+    let mut h = Harness::with_engine(demo_project());
+    let drums = h.track_named("Drums");
+    h.app.sel.select_track(drums.id);
+    h.app.workspace.show(Tab::Instrument);
+    h.accessible();
+    assert!(h.find("Kick tune").is_some(), "the kick is picked first");
+    assert!(h.find("Snare snap").is_none());
+    let snare = h.rect_of(inst_view::pad_id(drums.id, 2));
+    assert_eq!(h.find_role("Snare", Some(Role::Button)), Some(snare));
+    h.move_to(snare.center());
+    h.pointer(snare.center(), true);
+    h.frame();
+    assert_eq!(h.app.audition.held, Some((drums.id, 38)));
+    assert!(h.heard() > 0.01);
+    h.pointer(snare.center(), false);
+    h.frames(3);
+    assert_eq!(h.app.audition.held, None);
+    assert_eq!(h.app.devices.pads.get(&drums.id), Some(&2));
+    assert!(h.find("Snare snap").is_some(), "its settings show");
+    assert!(h.find("Kick tune").is_none());
+    // The kit's own settings stay.
+    assert!(h.find("Style").is_some());
+}
+
+#[test]
+fn sliders_leave_values_set_elsewhere_alone() {
+    let mut h = Harness::demo();
+    let bass = h.track_named("Bass");
+    h.app.sel.select_track(bass.id);
+    h.app.workspace.show(Tab::Instrument);
+    h.frames(3);
+    // An AI sets a value finer than its slider shows.
+    let r = actions::set_instrument_param(&h.app.session, bass.id, "attack", Some(20.6537), None);
+    h.app.report(r).unwrap();
+    let history = h.history_len();
+    h.frames(5);
+    assert_eq!(instrument_param(&h, bass.id, "attack"), 20.6537);
+    assert_eq!(
+        h.history_len(),
+        history,
+        "the slider adds no step of its own"
+    );
 }

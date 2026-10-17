@@ -59,6 +59,8 @@ impl<T: Clone> Marquee<T> {
 pub struct Gestures {
     keys: HashMap<Id, u64>,
     next: u64,
+    /// The widget last scrolled over, its key and when.
+    scroll: Option<(Id, u64, f64)>,
 }
 
 impl Default for Gestures {
@@ -68,6 +70,7 @@ impl Default for Gestures {
         Self {
             keys: HashMap::new(),
             next: 0x5157_0000_0000,
+            scroll: None,
         }
     }
 }
@@ -88,6 +91,21 @@ impl Gestures {
         let k = self.fresh();
         self.keys.insert(id, k);
         k
+    }
+
+    /// The key for scrolling over `id` at `now` seconds: steps less than
+    /// half a second apart are one gesture.
+    pub fn scroll_key(&mut self, id: Id, now: f64) -> u64 {
+        if let Some((last, key, at)) = &mut self.scroll
+            && *last == id
+            && now - *at < 0.5
+        {
+            *at = now;
+            return *key;
+        }
+        let key = self.fresh();
+        self.scroll = Some((id, key, now));
+        key
     }
 
     /// A key no other gesture uses.

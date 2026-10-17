@@ -16,7 +16,7 @@ mod envelope;
 mod sampler;
 mod synth;
 
-pub use acid::{ACCENT_THRESHOLD, Acid};
+pub use acid::{ACCENT_THRESHOLD, Acid, ENV_OCTAVES as ACID_ENV_OCTAVES};
 pub use bank::{Bank, BankMap, KeyZone};
 pub use drums::DrumKit;
 pub use envelope::Adsr;

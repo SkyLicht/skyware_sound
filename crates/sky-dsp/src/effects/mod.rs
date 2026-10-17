@@ -15,7 +15,7 @@ mod tone;
 pub use duck::Duck;
 pub use dynamics::{Compressor, Limiter};
 pub use space::{Delay, Reverb};
-pub use tone::{Distortion, Eq, Filter, Gain};
+pub use tone::{Distortion, Eq, Filter, Gain, eq_coeffs};
 
 /// An insert effect. `process` works in place on one block of planar stereo.
 pub trait Effect: Send + 'static {
@@ -34,6 +34,12 @@ pub trait Effect: Send + 'static {
     /// Processes a block in place. `left` and `right` have the same length,
     /// at most [`crate::MAX_BLOCK`] frames. Must not allocate.
     fn process(&mut self, left: &mut [f32], right: &mut [f32]);
+    /// The most the last [`process`](Self::process) turned the signal down,
+    /// in dB (0 or more), for gain-reduction meters. Effects that never
+    /// turn it down report 0.
+    fn gain_reduction_db(&self) -> f32 {
+        0.0
+    }
     /// Clears all internal state (tails, envelopes).
     fn reset(&mut self);
     /// Takes over the running state of `previous` when it is the same kind
@@ -162,6 +168,15 @@ impl EffectType {
     /// project names in the effect slot's sidechain.
     pub fn takes_sidechain(self) -> bool {
         self == EffectType::Duck
+    }
+
+    /// Whether the effect turns the signal down on its own, so a
+    /// gain-reduction meter means something for it.
+    pub fn reduces_gain(self) -> bool {
+        matches!(
+            self,
+            EffectType::Compressor | EffectType::Limiter | EffectType::Duck
+        )
     }
 
     /// A new instance with default parameters.

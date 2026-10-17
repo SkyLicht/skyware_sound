@@ -42,6 +42,8 @@ pub struct Duck {
     /// the previous one has recovered does not jump.
     from: f32,
     gain: f32,
+    /// The lowest gain in the last block, for meters.
+    block_gain: f32,
 }
 
 impl Duck {
@@ -61,6 +63,7 @@ impl Duck {
             elapsed: f32::MAX,
             from: 1.0,
             gain: 1.0,
+            block_gain: 1.0,
         };
         duck.update_times();
         duck
@@ -75,15 +78,14 @@ impl Duck {
     /// The gain `elapsed` frames after a note started.
     #[inline]
     fn envelope(&self) -> f32 {
-        if self.elapsed >= self.length {
-            return 1.0;
-        }
-        let trough = 1.0 - self.depth;
-        if self.elapsed < self.attack {
-            return self.from + (trough - self.from) * (self.elapsed / self.attack);
-        }
-        let x = (self.elapsed - self.attack) / (self.length - self.attack).max(1.0);
-        trough + (1.0 - trough) * x.powf(self.power)
+        crate::curves::duck_gain(
+            self.from,
+            self.depth,
+            self.power,
+            self.attack,
+            self.length,
+            self.elapsed,
+        )
     }
 }
 
@@ -92,7 +94,7 @@ impl Effect for Duck {
         match name {
             "depth" => self.depth = value.clamp(0.0, 1.0),
             "length" => self.beats = value.clamp(0.0625, 4.0),
-            "curve" => self.power = 4f32.powf(value.clamp(-1.0, 1.0)),
+            "curve" => self.power = crate::curves::duck_power(value),
             "attack" => self.attack_ms = value.clamp(0.0, 30.0),
             "trigger" => self.kick_only = value >= 0.5,
             _ => return false,
@@ -117,6 +119,7 @@ impl Effect for Duck {
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.block_gain = 1.0;
         let mut next = 0;
         for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
             while next < self.pending_len && self.pending[next] as usize <= i {
@@ -126,6 +129,7 @@ impl Effect for Duck {
             }
             let g = self.envelope();
             self.gain = g;
+            self.block_gain = self.block_gain.min(g);
             if self.elapsed < self.length {
                 self.elapsed += 1.0;
             }
@@ -140,11 +144,16 @@ impl Effect for Duck {
         self.pending_len = 0;
     }
 
+    fn gain_reduction_db(&self) -> f32 {
+        -crate::util::gain_to_db(self.block_gain)
+    }
+
     fn reset(&mut self) {
         self.pending_len = 0;
         self.elapsed = f32::MAX;
         self.from = 1.0;
         self.gain = 1.0;
+        self.block_gain = 1.0;
     }
 
     effect_state!(elapsed, from, gain);

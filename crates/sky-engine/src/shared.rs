@@ -32,6 +32,28 @@ impl Meter {
     }
 }
 
+/// Insert slots per channel whose gain reduction is metered.
+pub const REDUCTION_SLOTS: usize = 16;
+
+/// The most gain reduction since the last read, in dB, as f32 bits that
+/// `fetch_max` orders like the floats.
+#[derive(Default)]
+pub struct Reduction(AtomicU32);
+
+impl Reduction {
+    #[inline]
+    pub fn record(&self, db: f32) {
+        if db > 0.0 {
+            self.0.fetch_max(db.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the most reduction since the last call and resets it.
+    pub fn take(&self) -> f32 {
+        f32::from_bits(self.0.swap(0, Ordering::Relaxed))
+    }
+}
+
 /// Loudness blocks kept for readers: 6.4 seconds of 100 ms blocks.
 pub const LOUDNESS_SLOTS: usize = 64;
 
@@ -119,6 +141,9 @@ pub struct EngineShared {
     /// K-weighted 100 ms blocks of the master, for loudness meters.
     pub loudness: LoudnessTap,
     pub tracks: Vec<Meter>,
+    /// Gain reduction of each insert slot: [`REDUCTION_SLOTS`] per track
+    /// meter slot, then the master's.
+    reductions: Vec<Reduction>,
 }
 
 impl EngineShared {
@@ -137,6 +162,9 @@ impl EngineShared {
             master_true_peak: Meter::default(),
             loudness: LoudnessTap::default(),
             tracks: (0..MAX_METERS).map(|_| Meter::default()).collect(),
+            reductions: (0..(MAX_METERS + 1) * REDUCTION_SLOTS)
+                .map(|_| Reduction::default())
+                .collect(),
         }
     }
 
@@ -159,6 +187,21 @@ impl EngineShared {
 
     pub fn track_meter(&self, index: usize) -> Option<&Meter> {
         self.tracks.get(index)
+    }
+
+    /// The gain-reduction meters of a channel's insert slots, by effect
+    /// position: a track's by its meter slot, or the master's for `None`.
+    /// Tracks past the last meter slot get none.
+    pub fn reductions(&self, track: Option<usize>) -> &[Reduction] {
+        let channel = match track {
+            Some(t) if t < MAX_METERS => t,
+            Some(_) => return &[],
+            None => MAX_METERS,
+        };
+        let from = channel * REDUCTION_SLOTS;
+        self.reductions
+            .get(from..from + REDUCTION_SLOTS)
+            .unwrap_or_default()
     }
 }
 

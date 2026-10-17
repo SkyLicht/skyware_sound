@@ -34,7 +34,7 @@ const CONTROL_RATE: usize = 16;
 /// Keys held at once that the slide logic remembers.
 const STACK: usize = 16;
 /// How far the envelope opens the filter at full env mod, in octaves.
-const ENV_OCTAVES: f32 = 4.0;
+pub const ENV_OCTAVES: f32 = 4.0;
 /// How far a full accent sweep opens the filter, in octaves.
 const ACCENT_OCTAVES: f32 = 6.0;
 /// Accented notes sweep the filter this fast, whatever the decay.
