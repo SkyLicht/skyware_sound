@@ -88,18 +88,75 @@
 //! `100 60 80 60`, `<400 800 1600>`, `-12 [0 7]`. Numbers may be negative
 //! and have up to six decimal places (`0.25`); each becomes a
 //! [`Value::Number`], kept exact. Names and note names are errors there.
+//!
+//! # Strudel code
+//!
+//! [`parse`] also reads [Strudel](https://strudel.cc) code, so a pattern
+//! pasted from Strudel plays as written:
+//!
+//! ```
+//! use sky_pattern::{Control, Time, Value, parse};
+//!
+//! let p = parse(r#"note("c3 e3").s("piano").gain(0.5).every(2, rev)"#).unwrap();
+//! let events = p.query(Time::from_integer(0), Time::from_integer(1), 0);
+//! assert_eq!(events[0].value, Value::Sound { name: "piano".into(), index: 0 });
+//! assert_eq!(events[0].controls.get(Control::Note), Some(52.0)); // reversed
+//! assert_eq!(events[0].controls.get(Control::Gain), Some(0.5));
+//! ```
+//!
+//! Text is code when it has quotes, `$:`, `;`, `=`, a method call such as
+//! `.fast(`, or a call such as `note(run(4))` ([`is_code`]). Strings in
+//! code are mini-notation, read as the function needs: `s("e f")` plays
+//! sounds named `e` and `f`, `note()` takes notes, and `n()` and controls
+//! take numbers (`.5` works there). A lone `-` is a rest, as `~` is.
+//!
+//! | Kind | Functions |
+//! |---|---|
+//! | Patterns | `s`/`sound`, `note`, `n`, `pure`/`mini`/`m`, a bare string, `stack`, `cat`/`slowcat`, `seq`/`fastcat`, `randcat`, `timecat`, `arrange`, `run` |
+//! | Time | `fast`, `slow`, `hurry`, `early`, `late`, `rev`, `palindrome`, `brak`, `ply`, `iter`, `iterBack`, `swingBy`, `swing`, `segment` |
+//! | Conditions | `every`/`firstOf`, `lastOf`, `chunk`, `within`, `inside`, `outside`, `superimpose`, `layer`, `off`, `echo`, `stut`, `jux`/`juxBy` (both sides play in the middle) |
+//! | Chance | `sometimesBy`, `sometimes`, `often`, `rarely`, `almostNever`, `almostAlways`, `always`, `never`, `someCyclesBy`, `someCycles`, `degradeBy`, `degrade`, `undegradeBy` |
+//! | Structure | `struct`, `mask`, `euclid`, `euclidRot`, `euclidLegato`, `euclidLegatoRot` |
+//! | Values | `add`/`transpose`, `sub`, `mul`, `div`, `range`, `scale`, `bank`, `legato`/`clip` |
+//! | Controls | `gain`, `velocity`, `speed`, `lpf`/`cutoff`, `resonance`/`lpq`, `attack`, `decay`, `sustain`, `release` ([`Control`]) |
+//! | Signals | `sine`, `cosine`, `saw`, `isaw`, `tri`, `square`, `rand`, `perlin`, `irand(n)` and their `…2` forms from -1 to 1, with `range`, `rangex`, `fast`, `slow`, `early`, `late`, `add`, `sub`, `mul`, `div`, `round`, `floor` and `segment` |
+//!
+//! Numeric arguments may be patterns, as in `.fast("<1 2>")` or
+//! `.gain(".5 1")`, or signals, as in `.lpf(sine.range(200, 2000))`; each
+//! event takes the value sounding at its start. Functions can be passed
+//! by name (`every(4, rev)`, `every(4, fast(2))`) or as arrow functions
+//! (`x => x.add(12)`), and `const`/`let` names, comments, `;` and `await`
+//! work as in JavaScript, with `+ - * / %` on plain numbers.
+//!
+//! With `$:` lines, every such line plays (`_$:` mutes one); otherwise the
+//! last pattern plays. `samples(...)` and `hush()` are skipped, and
+//! `setcps` is left out with a [`Warning`], since the clip sets the speed.
+//! Effects such as `room` or `delay` are left out with one warning (they
+//! belong on the track's inserts), and visual functions such as
+//! `pianoroll` are skipped. Other Strudel functions are errors.
+//!
+//! Random choices use the query's seed as `?` does. Code has the same
+//! limits as mini-notation, and also at most 1024 for counts (`ply`,
+//! `iter`, `segment`, `run`) and cycles of shift, 64 echoes or parts,
+//! and 64 distinct values for a patterned argument.
 
 mod ast;
 mod bounds;
+mod code;
+mod controls;
 mod lexer;
+mod ops;
 mod parser;
 mod query;
+mod signal;
 mod value;
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use code::{code_ranges, is_code};
+pub use controls::{Control, Controls};
 pub use value::{drum_names, drum_note, note_number};
 
 /// Time measured in cycles. One cycle is one pattern repetition (the DAW maps a
@@ -140,12 +197,20 @@ mod exact {
 impl Value {
     /// The MIDI note this value plays: `Note(n)` gives `n`; a sound gives its
     /// General MIDI drum note from [`drum_note`] (the index is ignored), or
-    /// `None` for sounds that aren't drums.
+    /// `None` for sounds that aren't drums. A number, from Strudel's `n`,
+    /// plays as the nearest note, as Strudel plays `n` without a sound.
+    /// A bank prefix is skipped, so `RolandTR909_bd` is a kick.
     pub fn midi_note(&self) -> Option<u8> {
         match self {
             Value::Note(note) => Some(*note),
-            Value::Sound { name, .. } => drum_note(name),
-            Value::Number(_) => None,
+            Value::Sound { name, .. } => drum_note(name).or_else(|| {
+                let (_, drum) = name.rsplit_once('_')?;
+                drum_note(drum)
+            }),
+            Value::Number(_) => {
+                let n = self.number()?.round();
+                (0.0..=127.0).contains(&n).then_some(n as u8)
+            }
         }
     }
 
@@ -175,6 +240,31 @@ pub struct Event {
     pub value: Value,
     /// Where in the source text this event's atom came from.
     pub source: Span,
+    /// What Strudel code set on the event besides its value, such as
+    /// `.gain(0.5)`. Empty for mini-notation.
+    pub controls: Controls,
+}
+
+impl Event {
+    /// The MIDI note this event plays: a named sound's `note` control, as
+    /// from `note("c3").s("piano")`, or else [`Value::midi_note`].
+    ///
+    /// ```
+    /// use sky_pattern::{Time, parse};
+    ///
+    /// let p = parse(r#"note("c3").s("piano")"#).unwrap();
+    /// let e = &p.query(Time::from_integer(0), Time::from_integer(1), 0)[0];
+    /// assert_eq!((e.note(), e.value.midi_note()), (Some(48), None));
+    /// ```
+    pub fn note(&self) -> Option<u8> {
+        match (&self.value, self.controls.get(Control::Note)) {
+            (Value::Sound { .. }, Some(n)) => {
+                let n = n.round();
+                (0.0..=127.0).contains(&n).then_some(n as u8)
+            }
+            (v, _) => v.midi_note(),
+        }
+    }
 }
 
 /// Why a pattern failed to parse, and where.
@@ -202,19 +292,36 @@ impl ParseError {
     }
 }
 
+/// Something in Strudel code that was left out because this pattern
+/// engine can't do it, such as a reverb set with `.room(0.5)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Warning {
+    pub message: String,
+    /// The text it is about.
+    pub span: Span,
+}
+
 /// A parsed pattern. Cheap to clone; it can be shared between threads.
 #[derive(Clone, Debug)]
 pub struct Pattern {
     source: String,
     root: Arc<ast::Node>,
+    warnings: Arc<[Warning]>,
 }
 
-/// Parses mini-notation text. Empty text, or text with only rests, is a valid
-/// pattern that plays nothing.
+/// Parses mini-notation text, or Strudel code such as
+/// `s("bd*2 sd").fast(2)` (see [Strudel code](crate#strudel-code)). Empty
+/// text, or text with only rests, is a valid pattern that plays nothing.
 pub fn parse(src: &str) -> Result<Pattern, ParseError> {
+    let (root, warnings) = if is_code(src) {
+        code::parse(src)?
+    } else {
+        (parser::parse(src)?, Vec::new())
+    };
     Ok(Pattern {
         source: src.to_string(),
-        root: parser::parse(src)?,
+        root,
+        warnings: warnings.into(),
     })
 }
 
@@ -234,6 +341,7 @@ pub fn parse_numbers(src: &str) -> Result<Pattern, ParseError> {
     Ok(Pattern {
         source: src.to_string(),
         root: parser::parse_numbers(src)?,
+        warnings: Arc::new([]),
     })
 }
 
@@ -267,6 +375,33 @@ impl Pattern {
         out.sort_by_key(|(_, s)| (s.start, s.end));
         out.dedup_by_key(|(_, s)| *s);
         out
+    }
+
+    /// What Strudel code asked for that this pattern leaves out.
+    pub fn warnings(&self) -> &[Warning] {
+        &self.warnings
+    }
+
+    /// Whether the pattern was written as Strudel code.
+    pub fn is_code(&self) -> bool {
+        is_code(&self.source)
+    }
+
+    /// The names of every sound the pattern can play, sorted and each once,
+    /// including those it gets from functions such as `.s("piano")` and
+    /// `.bank("RolandTR909")` (which names `bd` as `RolandTR909_bd`).
+    ///
+    /// ```
+    /// let p = sky_pattern::parse(r#"s("bd sd").bank("RolandTR909")"#).unwrap();
+    /// assert_eq!(p.sounds(), ["RolandTR909_bd", "RolandTR909_sd"]);
+    /// ```
+    pub fn sounds(&self) -> Vec<String> {
+        code::sounds(&self.root).into_iter().collect()
+    }
+
+    /// The controls the pattern's events can set, such as `lpf`.
+    pub fn controls(&self) -> Vec<Control> {
+        code::controls(&self.root).into_iter().collect()
     }
 
     /// All events whose onset `begin` lies in `[from, to)`, sorted by `begin`,

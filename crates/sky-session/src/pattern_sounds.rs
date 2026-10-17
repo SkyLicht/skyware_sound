@@ -57,21 +57,32 @@ pub struct SoundsLoaded {
     pub offline: bool,
 }
 
-/// The sound names in mini-notation, in text order and each once. Empty
-/// when the text does not parse.
+/// The sound names a pattern plays, in text order and each once, with
+/// those Strudel code gives, such as `RolandTR909_bd` from
+/// `s("bd").bank("RolandTR909")`. Empty when the text does not parse.
 pub fn pattern_sound_names(text: &str) -> Vec<String> {
     let Ok(pattern) = sky_pattern::parse(text) else {
         return Vec::new();
     };
+    let sounds = pattern.sounds();
+    // Each sound where its name first appears, or a bank's names where
+    // the name they end with does.
+    let mut ordered = Vec::new();
+    for (value, _) in pattern.atoms() {
+        if let sky_pattern::Value::Sound { name, .. } = value {
+            ordered.extend(sounds.iter().filter(|s| {
+                *s == name
+                    || s.strip_suffix(name.as_str())
+                        .is_some_and(|b| b.ends_with('_'))
+            }));
+        }
+    }
+    ordered.extend(&sounds);
     let mut seen = BTreeSet::new();
-    pattern
-        .atoms()
+    ordered
         .into_iter()
-        .filter_map(|(v, _)| match v {
-            sky_pattern::Value::Sound { name, .. } => Some(name.clone()),
-            _ => None,
-        })
         .filter(|n| seen.insert(n.to_ascii_lowercase()))
+        .cloned()
         .collect()
 }
 
@@ -230,31 +241,75 @@ impl Session {
             }
         }
         let mut linked = Vec::new();
-        for source in &links {
-            let is_fresh = fresh(source);
-            if !is_fresh && wanted.is_empty() {
-                continue;
+        // Each link's pack once opened, `Some(None)` when it can't be read.
+        let mut opened: Vec<Option<Option<Pack>>> = links.iter().map(|_| None).collect();
+        let mut chosen: Vec<BTreeMap<String, Vec<MapFile>>> =
+            links.iter().map(|_| BTreeMap::new()).collect();
+        let mut missing = Vec::new();
+        // A name from Strudel's bank, such as RolandTR909_bd, that no pack
+        // has plays its plain sound (bd) instead, so that is looked for next.
+        let mut fallbacks: Vec<(String, String)> = Vec::new();
+        for pass in 0..2 {
+            if pass == 1 {
+                for name in std::mem::take(&mut wanted) {
+                    match name.rsplit_once('_') {
+                        Some((_, plain)) if sky_library::valid_sound_name(plain) => {
+                            if !has(plain) {
+                                fallbacks.push((name.clone(), plain.to_string()));
+                            }
+                        }
+                        _ => missing.push(name),
+                    }
+                }
+                for (_, plain) in &fallbacks {
+                    if !wanted.iter().any(|w| w.eq_ignore_ascii_case(plain)) {
+                        wanted.push(plain.clone());
+                    }
+                }
             }
-            let pack = match library.open(source) {
-                Ok(p) => p,
-                Err(e) if is_fresh => return Err(e.into()),
-                Err(e) => {
-                    failed.push(e.to_string());
+            for (i, source) in links.iter().enumerate() {
+                let is_fresh = fresh(source) && pass == 0;
+                if !is_fresh && wanted.is_empty() {
                     continue;
                 }
-            };
-            offline |= pack.offline;
-            if is_fresh {
-                linked.push(source.name.clone());
-            }
-            let mut chosen = BTreeMap::new();
-            wanted.retain(|name| match pack.map.find_sound(name) {
-                Some((key, f)) if sky_library::valid_sound_name(key) => {
-                    chosen.insert(key.to_string(), f.to_vec());
-                    false
+                if opened[i].is_none() {
+                    let pack = match library.open(source) {
+                        Ok(p) => Some(p),
+                        Err(e) if is_fresh => return Err(e.into()),
+                        Err(e) => {
+                            failed.push(e.to_string());
+                            None
+                        }
+                    };
+                    if let Some(p) = &pack {
+                        offline |= p.offline;
+                        if is_fresh {
+                            linked.push(source.name.clone());
+                        }
+                    }
+                    opened[i] = Some(pack);
                 }
-                _ => true,
-            });
+                let Some(Some(pack)) = &opened[i] else {
+                    continue;
+                };
+                wanted.retain(|name| match pack.map.find_sound(name) {
+                    Some((key, f)) if sky_library::valid_sound_name(key) => {
+                        chosen[i].insert(key.to_string(), f.to_vec());
+                        false
+                    }
+                    _ => true,
+                });
+            }
+        }
+        for (name, plain) in fallbacks {
+            if wanted.iter().any(|w| w.eq_ignore_ascii_case(&plain)) {
+                missing.push(name);
+            }
+        }
+        for ((source, pack), chosen) in links.iter().zip(opened).zip(chosen) {
+            let Some(Some(pack)) = pack else {
+                continue;
+            };
             if chosen.is_empty() {
                 continue;
             }
@@ -346,7 +401,7 @@ impl Session {
             linked,
             packs: bank.packs,
             loaded,
-            missing: wanted,
+            missing,
             new_files,
             reused_files,
             failed,

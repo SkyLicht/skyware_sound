@@ -7,7 +7,7 @@
 //! stack    = sequence ( "," sequence )*
 //! sequence = ( step | "_" | "!" )*
 //! step     = term modifier*
-//! term     = WORD | NUMBER | "~" | "[" group "]" | "<" group ">"
+//! term     = WORD | NUMBER | "~" | "-" | "[" group "]" | "<" group ">"
 //! modifier = "*" NUMBER | "/" NUMBER | "@" NUMBER | "!" NUMBER? | "?" NUMBER?
 //!          | "(" NUMBER "," NUMBER ( "," "-"? NUMBER )? ")"
 //! ```
@@ -41,21 +41,37 @@ const MAX_VALUE_DECIMALS: usize = 6;
 const MAX_VALUE: i64 = 1_000_000_000;
 
 pub(crate) fn parse(src: &str) -> Result<Arc<Node>, ParseError> {
-    parse_terms(src, false)
+    parse_terms(src, Terms::Notes)
 }
 
 /// Parses a pattern whose terms are numbers, such as `100 60 <80 -12.5>`.
 pub(crate) fn parse_numbers(src: &str) -> Result<Arc<Node>, ParseError> {
-    parse_terms(src, true)
+    parse_terms(src, Terms::Numbers)
 }
 
-fn parse_terms(src: &str, numbers: bool) -> Result<Arc<Node>, ParseError> {
+/// Parses a pattern whose terms are all sound names, as in Strudel's
+/// `s("e f")`, where `e` and `f` are sounds rather than notes.
+pub(crate) fn parse_sounds(src: &str) -> Result<Arc<Node>, ParseError> {
+    parse_terms(src, Terms::Sounds)
+}
+
+/// What a pattern's terms are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Terms {
+    /// Notes, note numbers and sound names.
+    Notes,
+    Numbers,
+    Sounds,
+}
+
+fn parse_terms(src: &str, terms: Terms) -> Result<Arc<Node>, ParseError> {
     let mut parser = Parser {
         src,
         tokens: lex(src)?,
         pos: 0,
         last_end: 0,
-        numbers,
+        numbers: terms == Terms::Numbers,
+        sounds: terms == Terms::Sounds,
     };
     let group = parser.group(false)?;
     let tok = parser.peek();
@@ -77,6 +93,8 @@ struct Parser<'a> {
     last_end: usize,
     /// Terms are numbers rather than names and notes.
     numbers: bool,
+    /// Every name is a sound, even one shaped like a note.
+    sounds: bool,
 }
 
 /// A parsed group, stack or sequence.
@@ -257,11 +275,17 @@ impl Parser<'_> {
                     self.step(&mut steps)?;
                 }
                 Tok::Minus => {
-                    return Err(self.error(
-                        tok.span,
-                        "unexpected '-'; negative numbers are only allowed \
-                         for a Euclidean rotation",
-                    ));
+                    let next = self.tokens[self.pos + 1];
+                    if next.kind == Tok::Number && !next.spaced {
+                        return Err(self.error(
+                            tok.span,
+                            "unexpected '-'; negative numbers are only allowed \
+                             for a Euclidean rotation",
+                        ));
+                    }
+                    // A lone `-` is a rest, as in Strudel.
+                    self.bump();
+                    steps.push((Node::silence(), Q::from_integer(1)));
                 }
                 Tok::Word | Tok::Number | Tok::Tilde | Tok::LBracket | Tok::LAngle => {
                     self.step(&mut steps)?;
@@ -296,6 +320,14 @@ impl Parser<'_> {
                 // number touching the sign.
                 let number = self.bump();
                 self.number(number, true)?
+            }
+            Tok::Number if self.sounds => {
+                let message = format!(
+                    "expected a sound name, found '{}'; pick a sound's sample with \
+                     a colon, as in sd:3, or with .n()",
+                    self.text(tok.span)
+                );
+                return Err(self.error(tok.span, message));
             }
             Tok::Number => self.note_number(tok)?,
             Tok::Tilde => Node::silence(),
@@ -406,7 +438,7 @@ impl Parser<'_> {
             end: tok.span.end,
         };
         // Drum names win over note names, so `cb` is the cowbell.
-        let note = if drum_note(name).is_some() {
+        let note = if self.sounds || drum_note(name).is_some() {
             NoteName::NotANote
         } else {
             note_name(name)
@@ -484,7 +516,11 @@ impl Parser<'_> {
                 format!("a number can be at most {MAX_VALUE} either side of zero"),
             )
         };
-        let whole: i64 = whole.parse().map_err(|_| too_large())?;
+        let whole: i64 = if whole.is_empty() {
+            0
+        } else {
+            whole.parse().map_err(|_| too_large())?
+        };
         if whole > MAX_VALUE {
             return Err(too_large());
         }
@@ -528,7 +564,11 @@ impl Parser<'_> {
             ));
         }
         let too_large = || self.error(tok.span, format!("a {what} can be at most {MAX_FACTOR}"));
-        let whole: i128 = whole.parse().map_err(|_| too_large())?;
+        let whole: i128 = if whole.is_empty() {
+            0
+        } else {
+            whole.parse().map_err(|_| too_large())?
+        };
         if whole > MAX_FACTOR {
             return Err(too_large());
         }

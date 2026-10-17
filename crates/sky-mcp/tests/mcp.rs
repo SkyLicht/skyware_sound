@@ -422,6 +422,33 @@ async fn an_assistant_builds_a_ducked_techno_loop() {
         .collect();
     assert_eq!(values, [100.0, -12.0, 0.5]);
 
+    // Strudel code: its controls by Strudel's names, and what it leaves out.
+    let query = ok(
+        &client,
+        "pattern_query",
+        json!({ "pattern": "note(\"c3 e3\").s(\"sawtooth\").lpf(800).room(.5)" }),
+    )
+    .await;
+    let first = &query["events"][0];
+    assert_eq!(first["sound"], "sawtooth", "{query}");
+    assert_eq!(first["midi"], 48);
+    assert_eq!(first["controls"], json!({ "note": 48.0, "lpf": 800.0 }));
+    assert_eq!(
+        query["warnings"],
+        json!(["room was ignored: effects go on the track's inserts here"])
+    );
+    let hats = ok(
+        &client,
+        "pattern_set",
+        json!({ "clip": "Hats", "pattern": "s(\"hh*16\").gain(\".6 1\").pan(sine)" }),
+    )
+    .await;
+    assert_eq!(hats["pattern"], "s(\"hh*16\").gain(\".6 1\").pan(sine)");
+    assert_eq!(
+        hats["warnings"],
+        json!(["pan was ignored: effects go on the track's inserts here"])
+    );
+
     ok(&client, "set_loop", json!({ "start_bar": 1, "end_bar": 5 })).await;
     let seam = ok(&client, "loop_check_seam", json!({})).await;
     assert_eq!(seam["seam"]["verdict"], "seamless", "{seam}");

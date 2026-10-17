@@ -3570,6 +3570,7 @@ name = "sky-pattern"
 version = "0.1.0-alpha.1"
 dependencies = [
  "num-rational",
+ "num-traits",
  "proptest",
  "serde",
  "thiserror 2.0.21",
