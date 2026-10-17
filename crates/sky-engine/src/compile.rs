@@ -16,7 +16,7 @@ use sky_model::command::VELOCITY;
 use sky_model::{
     Channel, Clip, ClipContent, InstrumentSlot, Project, SampleBank, StepClip, Track, TrackKind,
 };
-use sky_pattern::{Time, Value};
+use sky_pattern::{Control as Code, Controls, Event, Pattern, Time, Value};
 
 /// Decoded audio-pool files, shared between snapshots.
 pub type AudioCache = HashMap<AudioId, Arc<AudioData>>;
@@ -203,11 +203,116 @@ fn ticks_to_samples(tempo: &TempoMap, tick: Ticks, sr: u32) -> i64 {
     tempo.tick_to_sample(tick, sr)
 }
 
-/// What a pattern value plays on a track: a key, or a bank sound.
-type Resolve<'a> = dyn Fn(&Value) -> Option<(u8, Option<u32>)> + 'a;
+/// What a pattern event plays on a track.
+#[derive(Clone, Copy)]
+struct Play {
+    /// The key, or for a bank sound its drum note.
+    pitch: u8,
+    /// A bank sound to start instead of the key.
+    sound: Option<u32>,
+    /// For a bank sound, how far Strudel code moves its pitch, in
+    /// semitones, with `note` or `speed`.
+    tune: Option<f64>,
+}
+
+impl Play {
+    fn key(pitch: u8) -> Self {
+        Self {
+            pitch,
+            sound: None,
+            tune: None,
+        }
+    }
+}
+
+type Resolve<'a> = dyn Fn(&Event) -> Option<Play> + 'a;
 
 /// The velocity of a note with none given.
 const DEFAULT_VELOCITY: u8 = 100;
+
+/// The velocity for Strudel's linear `gain` (0.8 when not given) times
+/// `velocity` (1 when not given): 0.8 is the usual velocity, 100.
+fn code_velocity(c: &Controls) -> Option<u8> {
+    let (gain, velocity) = (c.get(Code::Gain), c.get(Code::Velocity));
+    if gain.is_none() && velocity.is_none() {
+        return None;
+    }
+    let v = 125.0 * gain.unwrap_or(0.8) * velocity.unwrap_or(1.0);
+    Some(v.round().clamp(0.0, 127.0) as u8)
+}
+
+/// A MIDI note from Strudel's `note`, which may be fractional.
+fn midi(note: f64) -> Option<u8> {
+    let n = note.round();
+    (0.0..=127.0).contains(&n).then_some(n as u8)
+}
+
+/// A Strudel waveform sound such as `sawtooth`, as a synth's wave option.
+fn wave_of(value: &Value) -> Option<&'static str> {
+    let Value::Sound { name, .. } = value else {
+        return None;
+    };
+    Some(match name.as_str() {
+        "sawtooth" | "saw" => "saw",
+        "square" => "square",
+        "triangle" | "tri" => "triangle",
+        "sine" => "sine",
+        _ => return None,
+    })
+}
+
+/// The instrument parameters a pattern's Strudel code sets per note.
+fn code_params(pattern: &Pattern, kind: InstrumentType) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for c in pattern.controls() {
+        names.push(match c {
+            Code::Cutoff => "cutoff",
+            Code::Resonance => "resonance",
+            Code::Attack => "attack",
+            Code::Decay => "decay",
+            Code::Sustain => "sustain",
+            Code::Release => "release",
+            Code::Note | Code::Speed if kind == InstrumentType::Bank => "tune",
+            Code::Note | Code::Speed | Code::Gain | Code::Velocity => continue,
+        });
+    }
+    let sounds = pattern.sounds();
+    if sounds.iter().any(|name| {
+        wave_of(&Value::Sound {
+            name: name.clone(),
+            index: 0,
+        })
+        .is_some()
+    }) {
+        names.push("wave");
+    }
+    names
+}
+
+/// The value Strudel code gives parameter `spec` for one note, converted
+/// from Strudel's units: seconds become milliseconds, and a resonance Q of
+/// 0 to 25 becomes 0 to 1.
+fn code_param(spec: &ParamSpec, ev: &Event, play: &Play, base: f32) -> Option<f64> {
+    let c = &ev.controls;
+    let ms = |control| {
+        c.get(control)
+            .filter(|_| spec.unit == "ms")
+            .map(|s| s * 1000.0)
+    };
+    match spec.name {
+        "cutoff" => c.get(Code::Cutoff).filter(|_| spec.unit == "Hz"),
+        "resonance" => c.get(Code::Resonance).map(|q| (q / 25.0).clamp(0.0, 1.0)),
+        "attack" => ms(Code::Attack),
+        "decay" => ms(Code::Decay),
+        "release" => ms(Code::Release),
+        "sustain" => c.get(Code::Sustain),
+        "wave" => wave_of(&ev.value)
+            .and_then(|w| spec.option_index(w))
+            .map(f64::from),
+        "tune" => play.tune.map(|t| f64::from(base) + t),
+        _ => None,
+    }
+}
 
 /// The instrument parameters a track's patterns and steps set per note.
 /// Once any clip sets one, every note on the track carries a value for it,
@@ -221,7 +326,8 @@ struct Locks {
 }
 
 impl Locks {
-    fn new(track: &Track) -> Self {
+    /// `patterns` holds each clip's parsed pattern, if it has one.
+    fn new(track: &Track, patterns: &[Option<Pattern>]) -> Self {
         let mut locks = Self {
             params: Vec::new(),
             base: Vec::new(),
@@ -232,6 +338,9 @@ impl Locks {
         };
         let specs = slot.kind.params();
         let mut names: Vec<&str> = Vec::new();
+        for pattern in patterns.iter().flatten() {
+            names.extend(code_params(pattern, slot.kind));
+        }
         for clip in &track.clips {
             match &clip.content {
                 ClipContent::Pattern { controls, .. } => {
@@ -253,12 +362,12 @@ impl Locks {
         locks
     }
 
-    /// Records a note's values, `value(i)` overriding parameter `i`'s
-    /// usual one, and returns where they sit.
-    fn push(&mut self, value: impl Fn(usize) -> Option<f64>) -> (u32, u32) {
+    /// Records a note's values, `value(i, base)` overriding parameter
+    /// `i`'s usual value `base`, and returns where they sit.
+    fn push(&mut self, value: impl Fn(usize, f32) -> Option<f64>) -> (u32, u32) {
         let start = self.out.len() as u32;
         for (i, (spec, base)) in self.params.iter().zip(&self.base).enumerate() {
-            let v = value(i).map_or(*base, |v| spec.clamp(v as f32));
+            let v = value(i, *base).map_or(*base, |v| spec.clamp(v as f32));
             self.out.push(ParamLock {
                 param: spec.name,
                 value: v,
@@ -327,28 +436,27 @@ fn control_seed(seed: u64, name: &str) -> u64 {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pattern_notes(
     tempo: &TempoMap,
     sr: u32,
     clip: &Clip,
+    pattern: &Pattern,
     resolve: &Resolve,
     locks: &mut Locks,
     out: &mut Vec<NoteEvent>,
 ) {
     let ClipContent::Pattern {
-        source,
         seed,
         cycle,
         controls,
         swing,
+        ..
     } = &clip.content
     else {
         return;
     };
     let (clip_start, clip_len, seed, cycle) = (clip.start, clip.length, *seed, *cycle);
-    let Ok(pattern) = sky_pattern::parse(source) else {
-        return;
-    };
     if cycle <= 0 {
         return;
     }
@@ -366,16 +474,18 @@ fn pattern_notes(
         .collect();
     let clip_end = clip_start + clip_len;
     for ev in pattern.query(Rational64::from_integer(0), to, seed) {
-        let Some((pitch, sound)) = resolve(&ev.value) else {
+        let Some(play) = resolve(&ev) else {
             continue;
         };
         let mut velocity = DEFAULT_VELOCITY;
         for c in &controls {
             if let (Target::Velocity, Some(v)) = (c.target, c.at(ev.begin)) {
-                // Like MIDI, velocity 0 is no note at all.
                 velocity = v.round().clamp(0.0, 127.0) as u8;
             }
         }
+        // What the code sets wins over the clip's control lanes.
+        velocity = code_velocity(&ev.controls).unwrap_or(velocity);
+        // Like MIDI, velocity 0 is no note at all.
         if velocity == 0 {
             continue;
         }
@@ -386,18 +496,27 @@ fn pattern_notes(
         if end <= begin {
             continue;
         }
-        let (lock_start, lock_end) = locks.push(|i| {
-            controls.iter().find_map(|c| match c.target {
-                Target::Param(p) if p == i => c.at(ev.begin),
-                _ => None,
+        let values: Vec<Option<f64>> = locks
+            .params
+            .iter()
+            .zip(&locks.base)
+            .enumerate()
+            .map(|(i, (spec, base))| {
+                let lane = controls.iter().find_map(|c| match c.target {
+                    Target::Param(p) if p == i => c.at(ev.begin),
+                    _ => None,
+                });
+                let base = lane.map_or(*base, |v| spec.clamp(v as f32));
+                code_param(spec, &ev, &play, base).or(lane)
             })
-        });
+            .collect();
+        let (lock_start, lock_end) = locks.push(|i, _| values.get(i).copied().flatten());
         out.push(NoteEvent {
             time: ticks_to_samples(tempo, begin, sr),
             end: ticks_to_samples(tempo, end, sr),
-            pitch,
+            pitch: play.pitch,
             velocity,
-            sound,
+            sound: play.sound,
             lock_start,
             lock_end,
         });
@@ -420,7 +539,7 @@ fn step_notes(
         if end <= begin {
             continue;
         }
-        let (lock_start, lock_end) = locks.push(|i| {
+        let (lock_start, lock_end) = locks.push(|i, _| {
             names
                 .get(i)
                 .and_then(|name| n.locks.get(*name))
@@ -470,17 +589,38 @@ impl<'a> CompiledBank<'a> {
         compiled
     }
 
+    /// A sound's loaded variations. A name from Strudel's `bank`, such as
+    /// `RolandTR909_bd`, falls back to the sound after the last `_`.
     fn loaded(&self, name: &str) -> Option<&[(u32, Option<u8>)]> {
-        let (key, _) = self.bank.resolve(name)?;
-        self.sounds.get(key).map(Vec::as_slice)
+        let find = |name: &str| {
+            let (key, _) = self.bank.resolve(name)?;
+            self.sounds.get(key).map(Vec::as_slice)
+        };
+        find(name).or_else(|| find(name.rsplit_once('_')?.1))
     }
 
     /// The sample for a pattern sound: `bd:3` is the fourth `bd`, wrapping
     /// around when the sound has fewer variations.
     pub fn sound(&self, name: &str, index: u32) -> Option<u32> {
+        self.sound_at(name, index, None).map(|(sample, _)| sample)
+    }
+
+    /// The sample for a pattern sound played at `note`, and how many
+    /// semitones to shift it. With a note, the variation recorded nearest
+    /// to it plays; a sound with no recorded notes picks by `index` and
+    /// counts as C2 (36), as in Strudel.
+    pub fn sound_at(&self, name: &str, index: u32, note: Option<f64>) -> Option<(u32, f64)> {
         let list = self.loaded(name)?;
-        list.get(index as usize % list.len())
-            .map(|&(sample, _)| sample)
+        let by_index = *list.get(index as usize % list.len())?;
+        let Some(note) = note else {
+            return Some((by_index.0, 0.0));
+        };
+        let nearest = list
+            .iter()
+            .filter_map(|&(sample, root)| Some((sample, f64::from(root?))))
+            .min_by(|a, b| (a.1 - note).abs().total_cmp(&(b.1 - note).abs()));
+        let (sample, root) = nearest.unwrap_or((by_index.0, 36.0));
+        Some((sample, note - root))
     }
 
     fn key_zone(&self, key: u8) -> Option<KeyZone> {
@@ -569,24 +709,56 @@ fn track_node(
                 .and_then(|s| s.bank.as_ref())
                 .map(|b| CompiledBank::new(b, audio));
             let resolve: Box<Resolve> = match &bank {
-                Some(bank) => Box::new(|v: &Value| match v {
-                    Value::Note(n) => Some((*n, None)),
-                    Value::Sound { name, index } => bank
-                        .sound(name, *index)
-                        .map(|s| (sky_pattern::drum_note(name).unwrap_or(0), Some(s))),
-                    Value::Number(_) => None,
+                Some(bank) => Box::new(|e: &Event| match &e.value {
+                    Value::Sound { name, index } => {
+                        let note = e.controls.get(Code::Note);
+                        match bank.sound_at(name, *index, note) {
+                            Some((sample, semitones)) => {
+                                let speed = e.controls.get(Code::Speed);
+                                let octaves = speed.filter(|s| *s > 0.0).map_or(0.0, f64::log2);
+                                Some(Play {
+                                    pitch: e.value.midi_note().unwrap_or(0),
+                                    sound: Some(sample),
+                                    tune: (note.is_some() || speed.is_some())
+                                        .then_some(semitones + 12.0 * octaves),
+                                })
+                            }
+                            // A sound the bank lacks plays its note on the keys.
+                            None => note.and_then(midi).map(Play::key),
+                        }
+                    }
+                    v => v.midi_note().map(Play::key),
                 }),
-                None => Box::new(|v: &Value| v.midi_note().map(|n| (n, None))),
+                None => Box::new(|e: &Event| {
+                    let pitch = match (&e.value, e.controls.get(Code::Note)) {
+                        (Value::Sound { .. }, Some(note)) => midi(note),
+                        // Strudel's synth sounds play C2 without a note.
+                        (v, None) if wave_of(v).is_some() => Some(36),
+                        (v, _) => v.midi_note(),
+                    }?;
+                    Some(Play::key(pitch))
+                }),
             };
+            let patterns: Vec<Option<Pattern>> = track
+                .clips
+                .iter()
+                .map(|clip| match &clip.content {
+                    ClipContent::Pattern { source, .. } => sky_pattern::parse(source).ok(),
+                    _ => None,
+                })
+                .collect();
             let mut notes = Vec::new();
-            let mut locks = Locks::new(track);
-            for clip in track.clips.iter().filter(|c| !c.muted) {
+            let mut locks = Locks::new(track, &patterns);
+            for (clip, pattern) in track.clips.iter().zip(&patterns) {
+                if clip.muted {
+                    continue;
+                }
                 match &clip.content {
                     ClipContent::Midi { notes: clip_notes } => {
                         for n in clip_notes.iter().filter(|n| n.start < clip.length) {
                             let begin = clip.start + n.start;
                             let end = clip.start + (n.start + n.length).min(clip.length);
-                            let (lock_start, lock_end) = locks.push(|_| None);
+                            let (lock_start, lock_end) = locks.push(|_, _| None);
                             notes.push(NoteEvent {
                                 time: ticks_to_samples(tempo, begin, sr),
                                 end: ticks_to_samples(tempo, end, sr),
@@ -599,7 +771,11 @@ fn track_node(
                         }
                     }
                     ClipContent::Pattern { .. } => {
-                        pattern_notes(tempo, sr, clip, &resolve, &mut locks, &mut notes);
+                        if let Some(pattern) = pattern {
+                            pattern_notes(
+                                tempo, sr, clip, pattern, &resolve, &mut locks, &mut notes,
+                            );
+                        }
                     }
                     ClipContent::Steps(steps) => {
                         step_notes(tempo, sr, clip, steps, &mut locks, &mut notes);

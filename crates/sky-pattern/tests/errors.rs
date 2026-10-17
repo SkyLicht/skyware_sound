@@ -159,12 +159,6 @@ fn unknown_characters() {
     check("bd ☃", 3, 3, "unexpected character '☃'");
     check("{bd sd}", 0, 1, "polymeter braces '{ }' are not supported");
     check(
-        "\"bd sd\"",
-        0,
-        1,
-        "unexpected \"; write the pattern without quotes",
-    );
-    check(
         "bd -1",
         3,
         1,

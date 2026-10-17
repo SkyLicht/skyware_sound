@@ -64,6 +64,8 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Token>, ParseError> {
             b'-' => Tok::Minus,
             b'a'..=b'z' | b'A'..=b'Z' => Tok::Word,
             b'0'..=b'9' => Tok::Number,
+            // `.5`, as Strudel writes it.
+            b'.' if bytes.get(i + 1).is_some_and(u8::is_ascii_digit) => Tok::Number,
             _ => {
                 let ch = src[i..].chars().next().unwrap_or_default();
                 if ch.is_whitespace() {

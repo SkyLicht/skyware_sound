@@ -889,7 +889,7 @@ fn palette_runs_commands() {
 #[test]
 fn pattern_status_and_mcp_command() {
     match pattern_editor::parse_status("bd*4, hh*8", 0) {
-        pattern_editor::ParseStatus::Ok { events } => assert_eq!(events, 12),
+        pattern_editor::ParseStatus::Ok { events, .. } => assert_eq!(events, 12),
         other => panic!("{other:?}"),
     }
     match pattern_editor::parse_status("c4 [e4", 0) {
@@ -900,6 +900,46 @@ fn pattern_status_and_mcp_command() {
         crate::ai_panel::mcp_command("http://127.0.0.1:7777/mcp", "abc"),
         "claude mcp add --transport http skyware http://127.0.0.1:7777/mcp --header \"Authorization: Bearer abc\""
     );
+}
+
+#[test]
+fn strudel_code_applies_and_says_what_it_leaves_out() {
+    let mut h = Harness::demo();
+    let drums = h.track_named("Drums");
+    let clip = drums.clips[0].id;
+    h.app.sel.select_clip(drums.id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    let text_id = Id::new(("pattern_text", clip));
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+    let code = r#"s("bd*2 sd").fast(2).every(4, rev).room(.3)"#;
+    h.key(Key::A, COMMAND);
+    h.type_text(code);
+    match pattern_editor::parse_status(&h.app.pattern.text, 0) {
+        pattern_editor::ParseStatus::Ok { events, warnings } => {
+            assert_eq!(events, 6);
+            assert_eq!(
+                warnings,
+                ["room was ignored: effects go on the track's inserts here"]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    h.key(Key::Enter, COMMAND);
+    h.frames(2);
+    match &h.clip(clip).content {
+        ClipContent::Pattern { source, .. } => assert_eq!(source, code),
+        other => panic!("{other:?}"),
+    }
+    // Names are offered inside the strings only.
+    h.key(Key::A, COMMAND);
+    h.type_text(r#"s("b"#);
+    h.frames(2);
+    assert!(!h.app.pattern.offered().0.is_empty());
+    h.type_text(r#"d").fa"#);
+    h.frames(2);
+    assert!(h.app.pattern.offered().0.is_empty());
 }
 
 #[test]
@@ -953,7 +993,7 @@ fn pattern_edits_apply_on_ctrl_enter_and_span_lines() {
         "the box keeps the focus"
     );
     match pattern_editor::parse_status(&source(&h), 0) {
-        pattern_editor::ParseStatus::Ok { events } => assert_eq!(events, 6),
+        pattern_editor::ParseStatus::Ok { events, .. } => assert_eq!(events, 6),
         other => panic!("{other:?}"),
     }
 
@@ -2032,7 +2072,7 @@ fn a_samples_line_links_a_pack_and_patterns_load_what_they_name() {
     h.type_text("bd*2 sd");
     assert!(matches!(
         pattern_editor::parse_status(&h.app.pattern.text, 0),
-        pattern_editor::ParseStatus::Ok { events: 3 }
+        pattern_editor::ParseStatus::Ok { events: 3, .. }
     ));
     h.key(Key::Enter, COMMAND);
     assert_eq!(h.app.pattern.loading, Some(clip));

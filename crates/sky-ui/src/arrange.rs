@@ -1689,7 +1689,7 @@ fn draw_pattern(
                     let end = (time_f64(e.end) * cycle as f64).min(clip.length as f64);
                     let x0 = r.left() + (begin as f32) * ppt;
                     let w = (((end - begin) as f32) * ppt - 1.0).max(2.0);
-                    let note = e.value.midi_note().unwrap_or(60) as f32;
+                    let note = e.note().unwrap_or(60) as f32;
                     let frac = ((note - 24.0) / 84.0).clamp(0.0, 1.0);
                     let y = body.bottom() - 3.0 - frac * (body.height() - 6.0);
                     shapes.push(Shape::rect_filled(

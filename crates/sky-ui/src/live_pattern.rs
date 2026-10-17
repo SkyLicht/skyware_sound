@@ -311,6 +311,9 @@ fn fits(events: &[Event], steps: usize) -> bool {
 /// Patterns that change from cycle to cycle, or whose notes fall between
 /// steps or overlap, have none, and the reason is given instead.
 pub fn grid_of(text: &str, seed: u64, steps: Option<usize>) -> Result<Grid, &'static str> {
+    if sky_pattern::is_code(text) {
+        return Err("The grid edits mini-notation; this pattern is Strudel code");
+    }
     let pattern = sky_pattern::parse(text).map_err(|_| "Fix the pattern to see its grid")?;
     let events = pattern.query(Time::from_integer(0), Time::from_integer(1), seed);
     let first = first_cycle(&pattern, seed);
@@ -515,6 +518,30 @@ mod tests {
             .collect();
         assert_eq!(colors[0], ("samples('github:a/b')", CODE));
         assert!(colors.contains(&("bd", color(Kind::Sound))), "{colors:?}");
+    }
+
+    #[test]
+    fn strudel_code_is_colored_apart_from_its_strings() {
+        let src = r#"s("bd*2 sd").fast(2)"#;
+        let code = sky_pattern::code_ranges(src);
+        let job = layout(src, &FontId::monospace(14.0), &[], None, &code);
+        assert_eq!(job.text, src);
+        let colors: Vec<(&str, Color32)> = job
+            .sections
+            .iter()
+            .map(|s| {
+                (
+                    &src[s.byte_range.start.0..s.byte_range.end.0],
+                    s.format.color,
+                )
+            })
+            .collect();
+        assert_eq!(colors[0], ("s(\"", CODE));
+        assert!(colors.contains(&("bd", color(Kind::Sound))), "{colors:?}");
+        assert!(colors.contains(&("\").fast(2)", CODE)), "{colors:?}");
+        // The grid only edits mini-notation.
+        assert!(grid_of(src, 0, None).unwrap_err().contains("Strudel code"));
+        assert!(grid_of("bd*2 sd", 0, None).is_ok());
     }
 
     #[test]
