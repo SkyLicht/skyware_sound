@@ -35,6 +35,7 @@ mod palette;
 mod params;
 mod pattern_editor;
 mod piano_roll;
+mod presets;
 mod ruler_lanes;
 mod sounds;
 mod step_editor;
@@ -73,6 +74,9 @@ pub struct UiConfig {
     /// layout and the recent projects between runs; `None` uses eframe's
     /// default place for it.
     pub layout_store: Option<std::path::PathBuf>,
+    /// The file that keeps the user's instrument and effect presets; `None`
+    /// keeps them only while the app runs.
+    pub preset_store: Option<std::path::PathBuf>,
 }
 
 /// Opens the main window and runs until it is closed.

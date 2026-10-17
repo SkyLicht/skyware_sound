@@ -882,7 +882,7 @@ fn palette_runs_commands() {
     h.key(Key::Enter, Modifiers::NONE);
     let fx = &h.project().master.effects;
     assert!(fx.iter().any(|e| e.kind == sky_dsp::EffectType::Delay));
-    assert!(h.app.mixer.open_effect.is_some(), "the new effect opens");
+    assert_eq!(h.app.mixer.open_effects.len(), 1, "the new effect opens");
     h.frames(3);
 }
 
@@ -1312,7 +1312,9 @@ fn a_new_duck_follows_the_drums() {
     let bass = h.track_named("Bass");
     assert_eq!(bass.channel.effect(id).unwrap().sidechain, Some(drums.id));
     // The window shows who it follows and survives the drums being deleted.
-    h.app.mixer.open_effect = Some((sky_model::ChannelRef::Track(bass.id), id));
+    h.app
+        .mixer
+        .open_effect((sky_model::ChannelRef::Track(bass.id), id));
     h.app.workspace.show(Tab::Mixer);
     h.frames(3);
     h.app
@@ -1323,7 +1325,7 @@ fn a_new_duck_follows_the_drums() {
         ))
         .unwrap();
     h.frames(3);
-    assert!(h.app.mixer.open_effect.is_some());
+    assert_eq!(h.app.mixer.open_effects.len(), 1);
 }
 
 #[test]
@@ -1336,7 +1338,9 @@ fn the_techno_template_renders_everywhere() {
             h.every_tab();
         }
         for e in &t.channel.effects {
-            h.app.mixer.open_effect = Some((sky_model::ChannelRef::Track(t.id), e.id));
+            h.app
+                .mixer
+                .open_effect((sky_model::ChannelRef::Track(t.id), e.id));
             h.frames(2);
         }
     }
@@ -1588,8 +1592,8 @@ fn ai_changes_light_what_they_touched_and_show_it() {
     show(&mut h, "Change Reverb on Pad");
     assert!(h.app.workspace.is_front(Tab::Mixer));
     assert_eq!(
-        h.app.mixer.open_effect,
-        Some((ChannelRef::Track(pad.id), reverb))
+        h.app.mixer.open_effects,
+        [(ChannelRef::Track(pad.id), reverb)]
     );
     assert_eq!(h.app.sel.track, Some(pad.id));
     h.app.workspace.show(Tab::Ai);
@@ -4976,7 +4980,7 @@ fn open_effect(h: &mut Harness, track: &str, kind: sky_dsp::EffectType) -> (Trac
         .app
         .report(actions::add_effect(&h.app.session, channel, kind))
         .expect("effect added");
-    h.app.mixer.open_effect = Some((channel, id));
+    h.app.mixer.open_effect((channel, id));
     h.app.workspace.show(Tab::Mixer);
     h.frames(3);
     (t.id, id)
@@ -5214,4 +5218,240 @@ fn sliders_leave_values_set_elsewhere_alone() {
         history,
         "the slider adds no step of its own"
     );
+}
+
+/// Opens the preset menu showing `shown` and picks `item` from it.
+fn pick_preset(h: &mut Harness, shown: &str, item: &str) {
+    h.frames(40);
+    h.click_label(shown);
+    h.frames(30);
+    let rect = h
+        .access
+        .iter()
+        .rev()
+        .find(|(l, _, _)| l == item)
+        .map(|(_, r, _)| *r)
+        .unwrap_or_else(|| panic!("no {item:?} in the presets"));
+    h.click(rect.center());
+    h.frames(2);
+}
+
+fn effect_slot(h: &Harness, track: TrackId, effect: EffectId) -> sky_model::EffectSlot {
+    h.project()
+        .track(track)
+        .ok()
+        .and_then(|t| t.channel.effect(effect))
+        .cloned()
+        .expect("effect")
+}
+
+#[test]
+fn presets_load_in_one_undo_step_and_save_as_your_own() {
+    let mut h = Harness::demo();
+    let bass = h.track_named("Bass");
+    let before = bass.instrument.clone().unwrap();
+    h.app.sel.select_track(bass.id);
+    h.app.workspace.show(Tab::Instrument);
+    h.accessible();
+    let history = h.history_len();
+    pick_preset(&mut h, "Custom", "Pluck");
+    let pluck = InstrumentType::Synth
+        .presets()
+        .iter()
+        .find(|p| p.name == "Pluck")
+        .unwrap();
+    for spec in InstrumentType::Synth.params() {
+        assert_eq!(
+            instrument_param(&h, bass.id, spec.name),
+            pluck.value(spec.name).unwrap_or(spec.default),
+            "{}",
+            spec.name
+        );
+    }
+    assert_eq!(h.history_len(), history + 1, "one undo step");
+    assert!(h.find("Pluck").is_some(), "the menu shows it");
+    h.run(Action::Undo);
+    h.frames(3);
+    assert_eq!(h.track_named("Bass").instrument, Some(before.clone()));
+
+    // Saved under a name of your own, then deleted again.
+    h.click_label("Save…");
+    h.frames(2);
+    h.type_text("My bass");
+    h.key(Key::Enter, Modifiers::NONE);
+    h.frames(3);
+    let kind = crate::presets::Kind::Instrument(InstrumentType::Synth);
+    let names: Vec<String> = h
+        .app
+        .presets
+        .store
+        .of(kind)
+        .map(|p| p.name.clone())
+        .collect();
+    assert_eq!(names, ["My bass"]);
+    assert_eq!(
+        h.history_len(),
+        history,
+        "saving changes nothing in the song"
+    );
+    assert!(h.find("My bass").is_some(), "the menu shows the new name");
+    h.click_label("Delete");
+    h.frames(3);
+    assert_eq!(h.app.presets.store.of(kind).count(), 0);
+    assert!(h.find("Custom").is_some());
+    assert_eq!(h.track_named("Bass").instrument, Some(before));
+}
+
+#[test]
+fn a_and_b_keep_two_versions_to_switch_between() {
+    let mut h = Harness::demo();
+    let (bass, eq) = open_effect(&mut h, "Bass", sky_dsp::EffectType::Eq);
+    let channel = sky_model::ChannelRef::Track(bass);
+    let r = actions::set_effect_param(&h.app.session, channel, eq, "low_gain", Some(6.0), None);
+    h.app.report(r).unwrap();
+    h.accessible();
+    let history = h.history_len();
+    let a: std::collections::BTreeMap<String, f32> = [("low_gain".to_string(), 6.0)].into();
+
+    // B starts as a copy of A.
+    h.click_label("B");
+    h.frames(2);
+    let fx = effect_slot(&h, bass, eq);
+    assert_eq!(fx.params, a);
+    assert_eq!(
+        fx.compare,
+        Some(sky_model::AbCompare {
+            on_b: true,
+            other: a.clone(),
+        })
+    );
+    pick_preset(&mut h, "Custom", "Bright air");
+    let bright = effect_slot(&h, bass, eq).params;
+    assert_eq!(effect_param(&h, bass, eq, "high_gain"), 4.0);
+
+    // Back to A, then B again.
+    h.click_label("A");
+    h.frames(2);
+    let fx = effect_slot(&h, bass, eq);
+    assert_eq!(fx.params, a);
+    assert_eq!(
+        fx.compare.as_ref().map(|c| (c.on_b, &c.other)),
+        Some((false, &bright))
+    );
+    h.click_label("B");
+    h.frames(2);
+    assert_eq!(effect_slot(&h, bass, eq).params, bright);
+    assert_eq!(h.history_len(), history + 4, "each switch is one undo step");
+
+    // Copying makes both sides the same.
+    h.click_label("Copy B to A");
+    h.frames(2);
+    let fx = effect_slot(&h, bass, eq);
+    assert_eq!(fx.compare.as_ref().map(|c| &c.other), Some(&bright));
+    h.run(Action::Undo);
+    h.run(Action::Undo);
+    h.frames(2);
+    let fx = effect_slot(&h, bass, eq);
+    assert_eq!(fx.params, a, "undo goes back to A");
+    assert_eq!(fx.compare.map(|c| (c.on_b, c.other)), Some((false, bright)));
+}
+
+#[test]
+fn several_effect_windows_stay_open() {
+    let mut h = Harness::demo();
+    let (bass, eq) = open_effect(&mut h, "Bass", sky_dsp::EffectType::Eq);
+    let (drums, comp) = open_effect(&mut h, "Drums", sky_dsp::EffectType::Compressor);
+    h.accessible();
+    assert!(h.find("Bass · 3-band EQ").is_some());
+    assert!(h.find("Drums · Compressor").is_some());
+    let eq_key = (sky_model::ChannelRef::Track(bass), eq);
+    let comp_key = (sky_model::ChannelRef::Track(drums), comp);
+    assert_eq!(h.app.mixer.open_effects, [eq_key, comp_key]);
+    // Each has its own handles.
+    assert!(h.rect_of(fx_view::handle_id(eq, "mid_freq")).is_positive());
+    assert!(
+        h.rect_of(fx_view::handle_id(comp, "threshold"))
+            .is_positive()
+    );
+
+    // The slot in the strip closes its window and opens it again.
+    h.click_in(Tab::Mixer, "3-band EQ");
+    h.frames(2);
+    assert_eq!(h.app.mixer.open_effects, [comp_key]);
+    assert!(h.find("Bass · 3-band EQ").is_none());
+    h.click_in(Tab::Mixer, "3-band EQ");
+    h.frames(2);
+    assert_eq!(h.app.mixer.open_effects, [comp_key, eq_key]);
+}
+
+#[test]
+fn inserts_drag_to_a_new_place() {
+    let mut h = Harness::demo();
+    let bass = h.track_named("Bass");
+    let drums = h.track_named("Drums");
+    let channel = sky_model::ChannelRef::Track(bass.id);
+    let ids: Vec<EffectId> = [
+        sky_dsp::EffectType::Eq,
+        sky_dsp::EffectType::Compressor,
+        sky_dsp::EffectType::Delay,
+    ]
+    .into_iter()
+    .map(|k| {
+        h.app
+            .report(actions::add_effect(&h.app.session, channel, k))
+            .unwrap()
+    })
+    .collect();
+    h.app.workspace.show(Tab::Mixer);
+    h.accessible();
+    let order = |h: &Harness, t: TrackId| -> Vec<EffectId> {
+        h.project()
+            .track(t)
+            .unwrap()
+            .channel
+            .effects
+            .iter()
+            .map(|e| e.id)
+            .collect()
+    };
+    let slot = |h: &Harness, label: &str| -> Rect {
+        let area = h.panel_rect(Tab::Mixer);
+        h.access
+            .iter()
+            .find(|(l, r, _)| l == label && area.contains(r.center()))
+            .map(|(_, r, _)| *r)
+            .unwrap_or_else(|| panic!("no {label:?} in the mixer"))
+    };
+    let history = h.history_len();
+    let delay = slot(&h, "Delay");
+    let eq = slot(&h, "3-band EQ");
+    h.drag(delay.center(), eq.center() - vec2(0.0, 8.0));
+    assert_eq!(order(&h, bass.id), [ids[2], ids[0], ids[1]]);
+    assert_eq!(h.history_len(), history + 1, "one undo step");
+    assert!(
+        h.app.mixer.open_effects.is_empty(),
+        "a drag opens no window"
+    );
+
+    // Dropped where it was, nothing changes.
+    let eq = slot(&h, "3-band EQ");
+    h.drag(eq.center(), eq.center() + vec2(0.0, 6.0));
+    assert_eq!(h.history_len(), history + 1);
+
+    // Onto another strip, it moves there.
+    let comp = slot(&h, "Compressor");
+    let to = h
+        .access
+        .iter()
+        .filter(|(l, _, _)| l == "+ Effect")
+        .map(|(_, r, _)| *r)
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("the drums strip");
+    h.drag(comp.center(), to.center() - vec2(0.0, 6.0));
+    assert_eq!(order(&h, drums.id), [ids[1]]);
+    assert_eq!(order(&h, bass.id), [ids[2], ids[0]]);
+    h.run(Action::Undo);
+    h.frames(2);
+    assert_eq!(order(&h, bass.id), [ids[2], ids[0], ids[1]]);
+    assert!(order(&h, drums.id).is_empty());
 }

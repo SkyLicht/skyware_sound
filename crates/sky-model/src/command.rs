@@ -120,6 +120,15 @@ pub enum Command {
         param: String,
         value: Option<f32>,
     },
+    /// Replaces all of an instrument's parameter values and its A/B
+    /// comparison, as loading a preset or switching to B does. Parameters
+    /// left out take their defaults.
+    SetInstrumentParams {
+        track: TrackId,
+        params: BTreeMap<String, f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compare: Option<AbCompare>,
+    },
     AddEffect {
         channel: ChannelRef,
         effect: EffectSlot,
@@ -140,6 +149,16 @@ pub enum Command {
         effect: EffectId,
         param: String,
         value: Option<f32>,
+    },
+    /// Replaces all of an effect's parameter values and its A/B
+    /// comparison, as loading a preset or switching to B does. Parameters
+    /// left out take their defaults.
+    SetEffectParams {
+        channel: ChannelRef,
+        effect: EffectId,
+        params: BTreeMap<String, f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compare: Option<AbCompare>,
     },
     SetEffectEnabled {
         channel: ChannelRef,
@@ -297,6 +316,32 @@ fn validate_param(
     spec.validate(value).map_err(ModelError::InvalidParam)
 }
 
+/// Checks a set of values against `specs`, rounding choices and toggles.
+fn validate_params(
+    specs: &[sky_dsp::ParamSpec],
+    owner: &str,
+    params: &mut BTreeMap<String, f32>,
+) -> Result<(), ModelError> {
+    for (name, value) in params.iter_mut() {
+        *value = validate_param(specs, owner, name, *value)?;
+    }
+    Ok(())
+}
+
+/// Checks both sides of a device's settings.
+fn validate_settings(
+    specs: &[sky_dsp::ParamSpec],
+    owner: &str,
+    params: &mut BTreeMap<String, f32>,
+    compare: &mut Option<AbCompare>,
+) -> Result<(), ModelError> {
+    validate_params(specs, owner, params)?;
+    if let Some(c) = compare {
+        validate_params(specs, owner, &mut c.other)?;
+    }
+    Ok(())
+}
+
 fn validate_clip(project: &Project, track: &Track, clip: &Clip) -> Result<(), ModelError> {
     check_clip_bounds(clip.start, clip.length)?;
     match &clip.content {
@@ -408,7 +453,8 @@ pub fn validate_swing(swing: Swing) -> Result<(), ModelError> {
 }
 
 fn validate_instrument(project: &Project, slot: &InstrumentSlot) -> Result<(), ModelError> {
-    for (name, value) in &slot.params {
+    let others = slot.compare.iter().flat_map(|c| &c.other);
+    for (name, value) in slot.params.iter().chain(others) {
         validate_param(slot.kind.params(), slot.kind.name(), name, *value)?;
     }
     if let Some(sample) = slot.sample {
@@ -471,7 +517,8 @@ fn validate_bank(project: &Project, bank: &SampleBank) -> Result<(), ModelError>
 /// in any order works; only [`Command::SetEffectSidechain`] insists the
 /// track exists.
 fn validate_effect(slot: &EffectSlot) -> Result<(), ModelError> {
-    for (name, value) in &slot.params {
+    let others = slot.compare.iter().flat_map(|c| &c.other);
+    for (name, value) in slot.params.iter().chain(others) {
         validate_param(slot.kind.params(), slot.kind.name(), name, *value)?;
     }
     if slot.sidechain.is_some() && !slot.kind.takes_sidechain() {
@@ -684,7 +731,9 @@ impl Command {
             C::SetChannel { channel, .. } | C::RemoveEffect { channel, .. } => {
                 add(Target::Channel(*channel));
             }
-            C::SetInstrument { track, .. } | C::SetInstrumentParam { track, .. } => {
+            C::SetInstrument { track, .. }
+            | C::SetInstrumentParam { track, .. }
+            | C::SetInstrumentParams { track, .. } => {
                 add(Target::Instrument(*track));
             }
             C::AddEffect {
@@ -692,6 +741,11 @@ impl Command {
             } => add(Target::Effect(*channel, effect.id)),
             C::MoveEffect { channel, id, .. }
             | C::SetEffectParam {
+                channel,
+                effect: id,
+                ..
+            }
+            | C::SetEffectParams {
                 channel,
                 effect: id,
                 ..
@@ -743,10 +797,12 @@ impl Command {
             Command::SetChannel { .. } => "Change mixer",
             Command::SetInstrument { .. } => "Change instrument",
             Command::SetInstrumentParam { .. } => "Change instrument parameter",
+            Command::SetInstrumentParams { .. } => "Change instrument settings",
             Command::AddEffect { .. } => "Add effect",
             Command::RemoveEffect { .. } => "Remove effect",
             Command::MoveEffect { .. } => "Move effect",
             Command::SetEffectParam { .. } => "Change effect parameter",
+            Command::SetEffectParams { .. } => "Change effect settings",
             Command::SetEffectEnabled { .. } => "Toggle effect",
             Command::SetEffectSidechain { .. } => "Change sidechain",
             Command::AddClip { .. } => "Add clip",
@@ -972,6 +1028,28 @@ impl Command {
                     value: old,
                 }
             }
+            Command::SetInstrumentParams {
+                track,
+                mut params,
+                mut compare,
+            } => {
+                let t = project.track_mut(track)?;
+                let slot = t
+                    .instrument
+                    .as_mut()
+                    .ok_or(ModelError::NotAnInstrumentTrack(track))?;
+                validate_settings(
+                    slot.kind.params(),
+                    slot.kind.name(),
+                    &mut params,
+                    &mut compare,
+                )?;
+                Command::SetInstrumentParams {
+                    track,
+                    params: std::mem::replace(&mut slot.params, params),
+                    compare: std::mem::replace(&mut slot.compare, compare),
+                }
+            }
             Command::AddEffect {
                 channel,
                 effect,
@@ -1046,6 +1124,31 @@ impl Command {
                     effect,
                     param,
                     value: old,
+                }
+            }
+            Command::SetEffectParams {
+                channel,
+                effect,
+                mut params,
+                mut compare,
+            } => {
+                let ch = channel_mut(project, channel)?;
+                let slot = ch
+                    .effects
+                    .iter_mut()
+                    .find(|e| e.id == effect)
+                    .ok_or(ModelError::EffectNotFound(effect))?;
+                validate_settings(
+                    slot.kind.params(),
+                    slot.kind.name(),
+                    &mut params,
+                    &mut compare,
+                )?;
+                Command::SetEffectParams {
+                    channel,
+                    effect,
+                    params: std::mem::replace(&mut slot.params, params),
+                    compare: std::mem::replace(&mut slot.compare, compare),
                 }
             }
             Command::SetEffectEnabled {

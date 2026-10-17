@@ -10,6 +10,7 @@ use sky_model::{InstrumentSlot, TrackKind};
 
 use crate::actions;
 use crate::app::{Action, App};
+use crate::presets::{self, Device, Kind};
 use crate::theme;
 use crate::widgets::Gestures;
 
@@ -302,6 +303,16 @@ pub fn instrument_panel(app: &mut App, ui: &mut Ui) {
                 .color(theme::TEXT_DIM),
         );
     });
+    if track.instrument.is_some() {
+        presets::bar(
+            app,
+            ui,
+            Device::Instrument(track_id),
+            Kind::Instrument(slot.kind),
+            &slot.params,
+            slot.compare.as_ref(),
+        );
+    }
 
     if slot.kind == InstrumentType::Sampler {
         ui.horizontal(|ui| {

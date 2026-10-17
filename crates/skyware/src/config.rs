@@ -34,6 +34,11 @@ pub fn layout_file() -> Option<PathBuf> {
     ProjectDirs::from("", "", "Skyware Sound").map(|d| d.config_dir().join("workspace.ron"))
 }
 
+/// Where the user's instrument and effect presets are kept.
+pub fn presets_file() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "Skyware Sound").map(|d| d.config_dir().join("presets.json"))
+}
+
 fn token_path() -> anyhow::Result<PathBuf> {
     Ok(dirs()?.config_dir().join("mcp-token"))
 }

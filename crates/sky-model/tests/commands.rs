@@ -94,6 +94,14 @@ fn every_command_undoes_exactly() {
             param: "gain".into(),
             value: None,
         },
+        Command::SetInstrumentParams {
+            track: bass,
+            params: [("cutoff".to_string(), 400.0)].into(),
+            compare: Some(AbCompare {
+                on_b: true,
+                other: [("wave".to_string(), 2.0)].into(),
+            }),
+        },
         Command::SetInstrument {
             track: lead,
             instrument: Some(InstrumentSlot::new(InstrumentType::Drums)),
@@ -123,6 +131,12 @@ fn every_command_undoes_exactly() {
             channel: ChannelRef::Track(project.tracks[2].id),
             effect: reverb,
             enabled: false,
+        },
+        Command::SetEffectParams {
+            channel: ChannelRef::Track(project.tracks[2].id),
+            effect: reverb,
+            params: [("size".to_string(), 0.2)].into(),
+            compare: Some(AbCompare::default()),
         },
         Command::RemoveEffect {
             channel: ChannelRef::Track(project.tracks[2].id),
@@ -643,6 +657,83 @@ fn sidechains_need_a_duck_and_an_instrument_track() {
 }
 
 #[test]
+fn whole_settings_swap_in_one_step_and_are_checked() {
+    let mut project = demo_project();
+    let mut history = History::new();
+    let pad = project.tracks[2].id;
+    let reverb = project.tracks[2].channel.effects[0].id;
+    let start = project.clone();
+    let compare = AbCompare {
+        on_b: true,
+        other: [("size".to_string(), 0.9), ("gate".to_string(), 200.4)].into(),
+    };
+    history
+        .apply(
+            &mut project,
+            tx(vec![Command::SetEffectParams {
+                channel: ChannelRef::Track(pad),
+                effect: reverb,
+                params: [("mix".to_string(), 0.5)].into(),
+                compare: Some(compare.clone()),
+            }]),
+        )
+        .unwrap();
+    let fx = project.tracks[2].channel.effect(reverb).unwrap();
+    assert_eq!(fx.param("mix"), Some(0.5));
+    assert_eq!(fx.param("size"), Some(0.6), "left out means default");
+    assert_eq!(fx.compare.as_ref(), Some(&compare));
+    // The project file keeps the other side.
+    let json = serde_json::to_string(&project).unwrap();
+    let back: Project = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.tracks[2].channel.effect(reverb), Some(fx));
+    history.undo(&mut project).unwrap();
+    assert_eq!(project, start);
+
+    // Choices round and both sides are checked.
+    let drums = project.tracks[0].id;
+    history
+        .apply(
+            &mut project,
+            tx(vec![Command::SetInstrumentParams {
+                track: drums,
+                params: [("style".to_string(), 1.2)].into(),
+                compare: None,
+            }]),
+        )
+        .unwrap();
+    let inst = project.tracks[0].instrument.as_ref().unwrap();
+    assert_eq!(inst.param("style"), Some(1.0));
+    let before = project.clone();
+    let err = history
+        .apply(
+            &mut project,
+            tx(vec![Command::SetInstrumentParams {
+                track: drums,
+                params: Default::default(),
+                compare: Some(AbCompare {
+                    on_b: false,
+                    other: [("cutoff".to_string(), 100.0)].into(),
+                }),
+            }]),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("cutoff"), "{err}");
+    let err = history
+        .apply(
+            &mut project,
+            tx(vec![Command::SetEffectParams {
+                channel: ChannelRef::Track(pad),
+                effect: reverb,
+                params: [("mix".to_string(), 3.0)].into(),
+                compare: None,
+            }]),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("mix"), "{err}");
+    assert_eq!(project, before);
+}
+
+#[test]
 fn old_files_load_without_controls_swing_or_sidechain() {
     let clip: ClipContent =
         serde_json::from_str(r#"{"type":"pattern","source":"bd sd","seed":2,"cycle":3840}"#)
@@ -788,6 +879,16 @@ fn arb_command(track_ids: Vec<TrackId>, clip_ids: Vec<ClipId>) -> impl Strategy<
             track: t,
             param: "cutoff".into(),
             value: Some(v)
+        }),
+        (tracks.clone(), 20.0f32..20_000.0, any::<bool>()).prop_map(|(t, v, on_b)| {
+            Command::SetInstrumentParams {
+                track: t,
+                params: [("cutoff".to_string(), v)].into(),
+                compare: Some(AbCompare {
+                    on_b,
+                    other: Default::default(),
+                }),
+            }
         }),
         (clips.clone(), tracks.clone(), 0i64..16).prop_map(|(id, track, s)| Command::MoveClip {
             id,

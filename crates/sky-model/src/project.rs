@@ -426,6 +426,9 @@ pub struct InstrumentSlot {
     /// The sounds a sample bank plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bank: Option<SampleBank>,
+    /// The other side of an A/B comparison, once one is started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare: Option<AbCompare>,
 }
 
 impl InstrumentSlot {
@@ -435,6 +438,7 @@ impl InstrumentSlot {
             params: BTreeMap::new(),
             sample: None,
             bank: None,
+            compare: None,
         }
     }
 
@@ -442,6 +446,29 @@ impl InstrumentSlot {
     pub fn param(&self, name: &str) -> Option<f32> {
         let spec = sky_dsp::params::find(self.kind.params(), name)?;
         Some(self.params.get(name).copied().unwrap_or(spec.default))
+    }
+}
+
+/// Two versions of a device's settings to switch between while listening.
+/// The slot's `params` are the side playing now; this holds the other.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbCompare {
+    /// Whether the side playing now is B.
+    #[serde(default)]
+    pub on_b: bool,
+    /// The other side's values that differ from the defaults.
+    #[serde(default)]
+    pub other: BTreeMap<String, f32>,
+}
+
+impl AbCompare {
+    /// The comparison after switching sides, when `params` were playing.
+    pub fn switched(&self, params: &BTreeMap<String, f32>) -> Self {
+        Self {
+            on_b: !self.on_b,
+            other: params.clone(),
+        }
     }
 }
 
@@ -548,6 +575,9 @@ pub struct EffectSlot {
     /// [takes a sidechain](EffectType::takes_sidechain).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidechain: Option<TrackId>,
+    /// The other side of an A/B comparison, once one is started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare: Option<AbCompare>,
 }
 
 impl EffectSlot {
@@ -558,6 +588,7 @@ impl EffectSlot {
             enabled: true,
             params: BTreeMap::new(),
             sidechain: None,
+            compare: None,
         }
     }
 

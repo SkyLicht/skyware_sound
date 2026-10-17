@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 
 use egui::{
-    Align, Color32, ComboBox, Context, CornerRadius, Frame, Id, Layout, Margin, Rect, RichText,
-    ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Window, pos2, vec2,
+    Align, Color32, ComboBox, Context, CornerRadius, DragAndDrop, Frame, Id, LayerId, Layout,
+    Margin, Order, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Window,
+    pos2, vec2,
 };
 use sky_core::{EffectId, TrackId};
 use sky_dsp::EffectType;
@@ -20,6 +21,7 @@ use crate::actions::{self, ChannelChange};
 use crate::app::{Action, App};
 use crate::fx_view::{self, REDUCTION_RANGE, ReductionLevel};
 use crate::params::{Edits, param_grid};
+use crate::presets::{self, Device, Kind};
 use crate::theme;
 use crate::widgets::{self, MeterLevel};
 
@@ -45,14 +47,32 @@ const TRUE_PEAK_CEILING_DB: f32 = -1.0;
 pub struct MixerState {
     pub meters: HashMap<TrackId, MeterLevel>,
     pub master: MeterLevel,
-    /// The effect whose parameter window is open.
-    pub open_effect: Option<(ChannelRef, EffectId)>,
+    /// The effects whose windows are open, oldest first.
+    pub open_effects: Vec<(ChannelRef, EffectId)>,
+    /// A window to bring to the front next frame.
+    raise: Option<(ChannelRef, EffectId)>,
     pub loudness: LoudnessState,
     /// The gain reduction of each compressor, limiter and duck.
     pub reductions: HashMap<(ChannelRef, EffectId), ReductionLevel>,
 }
 
 impl MixerState {
+    pub fn is_open(&self, effect: (ChannelRef, EffectId)) -> bool {
+        self.open_effects.contains(&effect)
+    }
+
+    /// Opens an effect's window, or brings it to the front.
+    pub fn open_effect(&mut self, effect: (ChannelRef, EffectId)) {
+        if !self.is_open(effect) {
+            self.open_effects.push(effect);
+        }
+        self.raise = Some(effect);
+    }
+
+    pub fn close_effect(&mut self, effect: (ChannelRef, EffectId)) {
+        self.open_effects.retain(|e| *e != effect);
+    }
+
     /// True while any meter still shows something, so it keeps falling smoothly.
     pub fn any_active(&self) -> bool {
         self.master.is_active()
@@ -415,6 +435,118 @@ fn effects_section(
             );
         }
     }
+    insert_drop(app, ui, area, project, channel_ref, channel);
+}
+
+/// An insert being dragged to another place in its strip or another one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InsertDrag {
+    channel: ChannelRef,
+    id: EffectId,
+    kind: EffectType,
+}
+
+/// While an insert is dragged over a channel's slots, shows where it would
+/// go with a line, and moves it there when let go.
+fn insert_drop(
+    app: &mut App,
+    ui: &Ui,
+    area: Rect,
+    project: &Project,
+    channel_ref: ChannelRef,
+    channel: &Channel,
+) {
+    let ctx = ui.ctx().clone();
+    let Some(drag) = DragAndDrop::payload::<InsertDrag>(&ctx) else {
+        return;
+    };
+    let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+        return;
+    };
+    let pitch = SLOT_H + SLOT_GAP;
+    if !area.expand2(vec2(0.0, pitch / 2.0)).contains(pos) {
+        return;
+    }
+    let count = channel.effects.len();
+    // The gap between slots nearest the pointer, and where the insert
+    // lands counted without it.
+    let gap = (((pos.y - area.top() + SLOT_GAP / 2.0) / pitch)
+        .round()
+        .max(0.0) as usize)
+        .min(count);
+    let same = drag.channel == channel_ref;
+    let from = if same {
+        channel.effects.iter().position(|e| e.id == drag.id)
+    } else {
+        None
+    };
+    let index = match from {
+        Some(i) if gap > i => gap - 1,
+        _ => gap,
+    };
+    let moves = from != Some(index);
+    if moves {
+        let y = area.top() + gap as f32 * pitch - SLOT_GAP / 2.0;
+        ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("insert_drop")))
+            .hline(area.x_range(), y, Stroke::new(2.0, theme::ACCENT));
+    }
+    if !ctx.input(|i| i.pointer.any_released()) {
+        return;
+    }
+    DragAndDrop::clear_payload(&ctx);
+    if !moves {
+        return;
+    }
+    let r = if same {
+        actions::move_effect(&app.session, channel_ref, drag.id, index)
+    } else {
+        let Some(slot) = channel_of(project, drag.channel).and_then(|c| c.effect(drag.id)) else {
+            return;
+        };
+        actions::move_effect_to(
+            &app.session,
+            drag.channel,
+            slot.clone(),
+            channel_ref,
+            index,
+            &format!(
+                "Move {} to {}",
+                drag.kind.label(),
+                channel_name(project, channel_ref)
+            ),
+        )
+    };
+    if app.report(r).is_some() && !same && app.mixer.is_open((drag.channel, drag.id)) {
+        // Its window follows it.
+        app.mixer.close_effect((drag.channel, drag.id));
+        app.mixer.open_effect((channel_ref, drag.id));
+    }
+}
+
+/// The name of the insert being dragged, beside the pointer. Once per
+/// frame, after everything else is drawn.
+fn insert_drag_label(app: &App, ctx: &Context) {
+    let (Some(drag), Some(pos)) = (
+        DragAndDrop::payload::<InsertDrag>(ctx),
+        ctx.input(|i| i.pointer.latest_pos()),
+    ) else {
+        return;
+    };
+    let from = channel_name(&app.view.project, drag.channel);
+    egui::Area::new(Id::new("insert_drag_label"))
+        .order(Order::Tooltip)
+        .fixed_pos(pos + vec2(14.0, 10.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            Frame::popup(ui.style())
+                .inner_margin(Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(format!("{from} · {}", drag.kind.label()))
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+        });
 }
 
 fn effect_slot(app: &mut App, ui: &mut Ui, channel_ref: ChannelRef, effect: &EffectSlot, i: usize) {
@@ -427,27 +559,37 @@ fn effect_slot(app: &mut App, ui: &mut Ui, channel_ref: ChannelRef, effect: &Eff
         let r = actions::set_effect_enabled(&app.session, channel_ref, effect.id, on);
         app.report(r);
     }
-    let open = app.mixer.open_effect == Some((channel_ref, effect.id));
+    let key = (channel_ref, effect.id);
+    let open = app.mixer.is_open(key);
     let text = RichText::new(effect.kind.label()).color(if effect.enabled {
         theme::TEXT
     } else {
         theme::TEXT_DIM
     });
     let w = (ui.available_width() - 22.0).max(30.0);
-    if ui
-        .add_sized([w, 20.0], egui::Button::selectable(open, text).truncate())
+    let button = ui
+        .add_sized(
+            [w, 20.0],
+            egui::Button::selectable(open, text)
+                .truncate()
+                .sense(Sense::click_and_drag()),
+        )
         .on_hover_text(format!(
-            "{} (slot {})\nClick to edit",
+            "{} (slot {})\nClick to edit, drag to move",
             effect.kind.description(),
             i + 1
-        ))
-        .clicked()
-    {
-        app.mixer.open_effect = if open {
-            None
+        ));
+    button.dnd_set_drag_payload(InsertDrag {
+        channel: channel_ref,
+        id: effect.id,
+        kind: effect.kind,
+    });
+    if button.clicked() {
+        if open {
+            app.mixer.close_effect(key);
         } else {
-            Some((channel_ref, effect.id))
-        };
+            app.mixer.open_effect(key);
+        }
     }
     if ui
         .add(egui::Button::new(RichText::new("×").color(theme::TEXT_WEAK)).small())
@@ -648,40 +790,53 @@ fn sidechain_row(
     });
 }
 
-pub fn effect_window(app: &mut App, ctx: &Context) {
-    let Some((channel_ref, effect_id)) = app.mixer.open_effect else {
-        return;
-    };
+/// The open effect windows, each where it was left, the newest on top;
+/// and the label of an insert being dragged.
+pub fn effect_windows(app: &mut App, ctx: &Context) {
+    let open = app.mixer.open_effects.clone();
+    for (i, key) in open.into_iter().enumerate() {
+        effect_window(app, ctx, key, i);
+    }
+    if let Some(key) = app.mixer.raise.take() {
+        ctx.move_to_top(LayerId::new(Order::Middle, window_id(key)));
+    }
+    insert_drag_label(app, ctx);
+}
+
+fn window_id((channel, effect): (ChannelRef, EffectId)) -> Id {
+    Id::new(("effect_window", channel, effect))
+}
+
+/// One effect's window. `nth` staggers where new windows open.
+fn effect_window(app: &mut App, ctx: &Context, key: (ChannelRef, EffectId), nth: usize) {
+    let (channel_ref, effect_id) = key;
     let view = app.view.clone();
     let project = &view.project;
-    let Some(channel) = channel_of(project, channel_ref) else {
-        app.mixer.open_effect = None;
+    let Some((index, effect, count)) = channel_of(project, channel_ref).and_then(|channel| {
+        let (i, e) = channel
+            .effects
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.id == effect_id)?;
+        Some((i, e, channel.effects.len()))
+    }) else {
+        app.mixer.close_effect(key);
         return;
     };
-    let Some((index, effect)) = channel
-        .effects
-        .iter()
-        .enumerate()
-        .find(|(_, e)| e.id == effect_id)
-    else {
-        app.mixer.open_effect = None;
-        return;
-    };
-    let count = channel.effects.len();
     let mut open = true;
     let mut changes = Vec::new();
+    let step = (nth % 8) as f32;
     Window::new(format!(
         "{} · {}",
         channel_name(project, channel_ref),
         effect.kind.label()
     ))
-    .id(Id::new("effect_window"))
+    .id(window_id(key))
     .open(&mut open)
     .collapsible(false)
     .resizable(false)
     .pivot(egui::Align2::CENTER_CENTER)
-    .default_pos(ctx.content_rect().center())
-    .default_pos(ctx.content_rect().center() - vec2(180.0, 200.0))
+    .default_pos(ctx.content_rect().center() - vec2(180.0, 200.0) + vec2(48.0, 32.0) * step)
     .show(ctx, |ui| {
         ui.label(
             RichText::new(effect.kind.description())
@@ -716,6 +871,14 @@ pub fn effect_window(app: &mut App, ctx: &Context) {
                 app.report(r);
             }
         });
+        presets::bar(
+            app,
+            ui,
+            Device::Effect(channel_ref, effect_id),
+            Kind::Effect(effect.kind),
+            &effect.params,
+            effect.compare.as_ref(),
+        );
         if effect.kind.takes_sidechain() {
             sidechain_row(app, ui, project, channel_ref, effect);
         }
@@ -729,7 +892,7 @@ pub fn effect_window(app: &mut App, ctx: &Context) {
                 effect.kind,
                 &mut edits,
                 project.tempo.initial_bpm(),
-                app.mixer.reductions.get(&(channel_ref, effect_id)),
+                app.mixer.reductions.get(&key),
             );
             changes = edits.changes;
             ui.separator();
@@ -754,6 +917,6 @@ pub fn effect_window(app: &mut App, ctx: &Context) {
         app.report(r);
     }
     if !open {
-        app.mixer.open_effect = None;
+        app.mixer.close_effect(key);
     }
 }

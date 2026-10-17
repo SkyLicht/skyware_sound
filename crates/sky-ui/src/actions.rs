@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use sky_core::{ClipId, EffectId, NoteId, PPQ, TempoMap, Ticks, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::{
-    ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project, StepClip,
-    StepLane, Swing, Track, Transaction,
+    AbCompare, ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project,
+    StepClip, StepLane, Swing, Track, Transaction,
 };
 use sky_session::Session;
 
@@ -244,6 +244,28 @@ pub fn set_instrument(
     )
 }
 
+/// Replaces all of an instrument's values and its A/B comparison.
+pub fn set_instrument_settings(
+    session: &Session,
+    track: TrackId,
+    params: BTreeMap<String, f32>,
+    compare: Option<AbCompare>,
+    label: &str,
+) -> ActionResult<u64> {
+    apply(
+        session,
+        Transaction::user(
+            label,
+            vec![Command::SetInstrumentParams {
+                track,
+                params,
+                compare,
+            }],
+        ),
+        None,
+    )
+}
+
 pub fn add_effect(
     session: &Session,
     channel: ChannelRef,
@@ -284,6 +306,35 @@ pub fn move_effect(
     index: usize,
 ) -> ActionResult<u64> {
     single(session, Command::MoveEffect { channel, id, index }, None)
+}
+
+/// Moves an effect onto another channel, at `index` among its effects.
+pub fn move_effect_to(
+    session: &Session,
+    from: ChannelRef,
+    effect: EffectSlot,
+    to: ChannelRef,
+    index: usize,
+    label: &str,
+) -> ActionResult<u64> {
+    apply(
+        session,
+        Transaction::user(
+            label,
+            vec![
+                Command::RemoveEffect {
+                    channel: from,
+                    id: effect.id,
+                },
+                Command::AddEffect {
+                    channel: to,
+                    effect,
+                    index: Some(index),
+                },
+            ],
+        ),
+        None,
+    )
 }
 
 pub fn set_effect_enabled(
@@ -337,6 +388,30 @@ pub fn set_effect_param(
             value,
         },
         key,
+    )
+}
+
+/// Replaces all of an effect's values and its A/B comparison.
+pub fn set_effect_settings(
+    session: &Session,
+    channel: ChannelRef,
+    effect: EffectId,
+    params: BTreeMap<String, f32>,
+    compare: Option<AbCompare>,
+    label: &str,
+) -> ActionResult<u64> {
+    apply(
+        session,
+        Transaction::user(
+            label,
+            vec![Command::SetEffectParams {
+                channel,
+                effect,
+                params,
+                compare,
+            }],
+        ),
+        None,
     )
 }
 

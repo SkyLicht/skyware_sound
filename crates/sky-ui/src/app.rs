@@ -32,6 +32,7 @@ use crate::mixer::MixerState;
 use crate::palette::PaletteState;
 use crate::pattern_editor::PatternState;
 use crate::piano_roll::PianoState;
+use crate::presets::{PresetState, PresetStore};
 use crate::ruler_lanes::Lane;
 use crate::step_editor::StepState;
 use crate::waveform::{Peaks, WaveformCache};
@@ -245,6 +246,7 @@ pub struct App {
     pub jobs: Jobs,
     pub gestures: Gestures,
     pub devices: DeviceState,
+    pub presets: PresetState,
     pub waveforms: WaveformCache,
     /// The panels, where they are, and the recent projects.
     pub workspace: Workspace,
@@ -295,6 +297,10 @@ impl App {
             jobs: Jobs::default(),
             gestures: Gestures::default(),
             devices: DeviceState::default(),
+            presets: PresetState {
+                store: PresetStore::load(config.preset_store),
+                naming: None,
+            },
             waveforms: WaveformCache::default(),
             workspace: Workspace::default(),
             about: false,
@@ -400,7 +406,7 @@ impl App {
             .frame(Frame::new().fill(theme::BG).inner_margin(Margin::same(0)))
             .show(ui, |ui| crate::workspace::show(self, ui));
 
-        crate::mixer::effect_window(self, &ctx);
+        crate::mixer::effect_windows(self, &ctx);
         crate::menu::about_window(self, &ctx);
         keys::window(self, &ctx);
         crate::dialogs::show(self, &ctx);
@@ -441,7 +447,7 @@ impl App {
             self.arrange.reset_for_new_project();
             self.piano = PianoState::default();
             self.pattern = PatternState::default();
-            self.mixer.open_effect = None;
+            self.mixer.open_effects.clear();
             self.waveforms.clear();
         }
         if project.audio_pool.len() != self.pool_len {
@@ -621,7 +627,7 @@ impl App {
             Action::AddEffect { channel, kind } => {
                 let r = actions::add_effect(&self.session, channel, kind);
                 if let Some(id) = self.report(r) {
-                    self.mixer.open_effect = Some((channel, id));
+                    self.mixer.open_effect((channel, id));
                 }
             }
             Action::NewEmpty
