@@ -147,14 +147,19 @@ impl Eq {
     }
 
     fn update(&mut self) {
-        let [lf, lg, mf, mg, mq, hf, hg] = self.values;
-        let sr = self.sample_rate;
-        self.coeffs = [
-            BiquadCoeffs::low_shelf(lf, lg, sr),
-            BiquadCoeffs::peaking(mf, mq, mg, sr),
-            BiquadCoeffs::high_shelf(hf, hg, sr),
-        ];
+        self.coeffs = eq_coeffs(&self.values, self.sample_rate);
     }
+}
+
+/// The EQ's low shelf, mid peak and high shelf for `values` in the order
+/// of its parameters.
+pub fn eq_coeffs(values: &[f32; 7], sample_rate: f32) -> [BiquadCoeffs; 3] {
+    let [lf, lg, mf, mg, mq, hf, hg] = *values;
+    [
+        BiquadCoeffs::low_shelf(lf, lg, sample_rate),
+        BiquadCoeffs::peaking(mf, mq, mg, sample_rate),
+        BiquadCoeffs::high_shelf(hf, hg, sample_rate),
+    ]
 }
 
 impl Effect for Eq {
@@ -213,16 +218,7 @@ impl Distortion {
 
     #[inline]
     fn shape(&self, x: f32) -> f32 {
-        let x = x * self.drive;
-        match self.mode {
-            1 => x.clamp(-1.0, 1.0),
-            2 => {
-                // Triangle wavefolder: reflects the signal back inside [-1, 1].
-                let t = (x + 1.0).rem_euclid(4.0);
-                if t < 2.0 { t - 1.0 } else { 3.0 - t }
-            }
-            _ => x.tanh(),
-        }
+        crate::curves::distortion_shape(self.mode, self.drive, x)
     }
 }
 

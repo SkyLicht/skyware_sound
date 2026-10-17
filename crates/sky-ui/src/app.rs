@@ -24,6 +24,7 @@ use crate::browser::BrowserState;
 use crate::clip_tools::Tool;
 use crate::dialogs::{Confirm, Dialogs, PathPurpose};
 use crate::edit::EditState;
+use crate::inst_view::DeviceState;
 use crate::jobs::{JobOutput, Jobs};
 use crate::keys;
 use crate::loop_inspector::InspectorState;
@@ -243,6 +244,7 @@ pub struct App {
     pub dialogs: Dialogs,
     pub jobs: Jobs,
     pub gestures: Gestures,
+    pub devices: DeviceState,
     pub waveforms: WaveformCache,
     /// The panels, where they are, and the recent projects.
     pub workspace: Workspace,
@@ -292,6 +294,7 @@ impl App {
             dialogs: Dialogs::default(),
             jobs: Jobs::default(),
             gestures: Gestures::default(),
+            devices: DeviceState::default(),
             waveforms: WaveformCache::default(),
             workspace: Workspace::default(),
             about: false,
@@ -497,13 +500,29 @@ impl App {
                 .meters
                 .retain(|id, _| project.tracks.iter().any(|t| t.id == *id));
         }
+        let mut seen = Vec::new();
         for (i, t) in project.tracks.iter().enumerate() {
             let peaks = shared
                 .as_ref()
                 .and_then(|s| s.track_meter(i))
                 .map_or((0.0, 0.0), |m| m.take());
             self.mixer.meters.entry(t.id).or_default().update(peaks, dt);
+            self.mixer.update_reductions(
+                ChannelRef::Track(t.id),
+                &t.channel,
+                shared.as_ref().map(|s| s.reductions(Some(i))),
+                dt,
+                &mut seen,
+            );
         }
+        self.mixer.update_reductions(
+            ChannelRef::Master,
+            &project.master,
+            shared.as_ref().map(|s| s.reductions(None)),
+            dt,
+            &mut seen,
+        );
+        self.mixer.reductions.retain(|k, _| seen.contains(k));
     }
 
     /// Where the edit commands and arrow keys act: the piano roll while it

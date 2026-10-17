@@ -34,7 +34,9 @@ pub use compile::{AudioCache, compile};
 pub use engine::{Engine, EngineHandle, EngineMsg, create_engine};
 pub use offline::{render, render_intro_loop, render_loop, render_one_shot};
 pub use preview::Preview;
-pub use shared::{EngineShared, LoudnessBlock, LoudnessTap, MAX_METERS};
+pub use shared::{
+    EngineShared, LoudnessBlock, LoudnessTap, MAX_METERS, REDUCTION_SLOTS, Reduction,
+};
 
 pub use sky_dsp::MAX_BLOCK;
 

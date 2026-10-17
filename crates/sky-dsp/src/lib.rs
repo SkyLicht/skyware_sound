@@ -9,6 +9,7 @@
 
 pub mod analysis;
 pub mod audio;
+pub mod curves;
 pub mod effects;
 pub mod filters;
 pub mod instruments;

@@ -517,3 +517,34 @@ fn the_master_loudness_meter_agrees_with_the_offline_analysis() {
     });
     assert_eq!(stopped, 1);
 }
+
+#[test]
+fn insert_slots_report_their_gain_reduction() {
+    let mut p = demo_project();
+    let drums = p.tracks.iter().position(|t| t.name == "Drums").unwrap();
+    // A hard compressor, then the same one switched off.
+    let squash = EffectSlot::new(sky_dsp::EffectType::Compressor)
+        .with_params(&[("threshold", -40.0), ("ratio", 20.0)]);
+    let mut off = squash.clone();
+    off.id = sky_core::EffectId::new();
+    off.enabled = false;
+    p.tracks[drums].channel.effects.extend([squash, off]);
+    p.master.effects[0].params.insert("ceiling".into(), -20.0);
+    let (mut handle, mut engine) = create_engine(compile(&p, &AudioCache::new(), SR, 1));
+    handle.send(EngineMsg::Play);
+    let mut left = vec![0.0; 480];
+    let mut right = vec![0.0; 480];
+    for _ in 0..100 {
+        engine.process_planar(&mut left, &mut right);
+    }
+    let shared = handle.shared().clone();
+    let slots = shared.reductions(Some(drums));
+    let squashed = slots[0].take();
+    assert!(squashed > 10.0, "{squashed}");
+    assert_eq!(slots[1].take(), 0.0, "a switched-off effect reads nothing");
+    assert_eq!(slots[0].take(), 0.0, "a read clears it");
+    // The master's limiter, set low, works too.
+    assert!(shared.reductions(None)[0].take() > 1.0);
+    // Tracks past the meters have no slots, rather than the master's.
+    assert!(shared.reductions(Some(sky_engine::MAX_METERS)).is_empty());
+}

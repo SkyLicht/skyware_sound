@@ -31,6 +31,14 @@ pub const MUTE: Color32 = Color32::from_rgb(196, 150, 60);
 /// The AI lamp, and what an AI assistant just changed.
 pub const AI: Color32 = Color32::from_rgb(178, 132, 255);
 
+/// Gain reduction: compressors, limiters and ducks turning a signal down.
+pub const REDUCTION: Color32 = Color32::from_rgb(240, 140, 64);
+
+/// The EQ's bands, so each handle matches its own curve.
+pub const EQ_LOW: Color32 = Color32::from_rgb(236, 112, 99);
+pub const EQ_MID: Color32 = Color32::from_rgb(88, 196, 150);
+pub const EQ_HIGH: Color32 = Color32::from_rgb(214, 170, 82);
+
 /// Game assets on the timeline: loops and SFX sets.
 pub const GAME_LOOP: Color32 = Color32::from_rgb(72, 196, 172);
 pub const GAME_SFX: Color32 = Color32::from_rgb(222, 188, 86);

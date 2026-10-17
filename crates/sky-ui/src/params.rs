@@ -4,7 +4,7 @@
 
 use std::hash::Hash;
 
-use egui::{ComboBox, Grid, Id, RichText, ScrollArea, Sense, Slider, Ui};
+use egui::{ComboBox, Grid, Id, RichText, ScrollArea, Sense, Slider, SliderClamping, Ui};
 use sky_dsp::{InstrumentType, ParamKind, ParamSpec};
 use sky_model::{InstrumentSlot, TrackKind};
 
@@ -39,7 +39,7 @@ pub fn param_grid(
     ui: &mut Ui,
     gestures: &mut Gestures,
     salt: impl Hash + Copy + std::fmt::Debug,
-    specs: &'static [ParamSpec],
+    specs: &[ParamSpec],
     value_of: impl Fn(&str) -> f32,
 ) -> Vec<ParamChange> {
     let mut changes = Vec::new();
@@ -77,7 +77,11 @@ pub fn param_grid(
                 match spec.kind {
                     ParamKind::Continuous { log } => {
                         let mut v = current;
+                        // Clamping only what is typed: clamping always
+                        // rounds a value set elsewhere, by a handle or an AI,
+                        // to the shown decimals and reports that as an edit.
                         let mut slider = Slider::new(&mut v, spec.min..=spec.max)
+                            .clamping(SliderClamping::Edits)
                             .logarithmic(log)
                             .max_decimals(decimals(spec))
                             .suffix(unit_suffix(spec.unit));
@@ -128,6 +132,100 @@ pub fn param_grid(
             }
         });
     changes
+}
+
+/// Collects the parameter changes the handles of a device picture ask
+/// for, clamped to each parameter's range. Changes that keep a value are
+/// dropped, so a handle held still adds nothing to the undo history.
+pub struct Edits<'a> {
+    specs: &'a [ParamSpec],
+    value_of: &'a dyn Fn(&str) -> f32,
+    gestures: &'a mut Gestures,
+    pub changes: Vec<ParamChange>,
+}
+
+impl<'a> Edits<'a> {
+    pub fn new(
+        specs: &'a [ParamSpec],
+        gestures: &'a mut Gestures,
+        value_of: &'a dyn Fn(&str) -> f32,
+    ) -> Self {
+        Self {
+            specs,
+            value_of,
+            gestures,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn spec(&self, name: &str) -> Option<&'a ParamSpec> {
+        self.specs.iter().find(|s| s.name == name)
+    }
+
+    /// The value as it will be once this frame's changes apply.
+    pub fn get(&self, name: &str) -> f32 {
+        self.changes
+            .iter()
+            .rev()
+            .find(|c| c.name == name)
+            .map_or_else(
+                || (self.value_of)(name),
+                |c| {
+                    c.value
+                        .or_else(|| self.spec(name).map(|s| s.default))
+                        .unwrap_or(0.0)
+                },
+            )
+    }
+
+    /// Sets `name` as part of the drag of the widget `id`: one undo step
+    /// for the whole drag, whatever it changes.
+    pub fn drag(&mut self, id: Id, name: &str, value: f32) {
+        let key = self.gestures.key(id);
+        self.push(name, value, key);
+    }
+
+    /// Sets `name` from the scroll wheel over `id`: steps close together
+    /// are one undo step.
+    pub fn scroll(&mut self, id: Id, name: &str, value: f32, now: f64) {
+        let key = self.gestures.scroll_key(id, now);
+        self.push(name, value, key);
+    }
+
+    fn push(&mut self, name: &str, value: f32, key: u64) {
+        let Some(spec) = self.spec(name) else {
+            return;
+        };
+        if !value.is_finite() {
+            return;
+        }
+        let v = value.clamp(spec.min, spec.max);
+        if (v - self.get(name)).abs() <= 1e-6 * v.abs().max(1.0) {
+            return;
+        }
+        self.changes.retain(|c| c.name != spec.name);
+        self.changes.push(ParamChange {
+            name: spec.name,
+            value: Some(v),
+            key: Some(key),
+        });
+    }
+
+    /// Sets `name` back to its default.
+    pub fn reset(&mut self, name: &str) {
+        let Some(spec) = self.spec(name) else {
+            return;
+        };
+        if self.get(name) == spec.default {
+            return;
+        }
+        self.changes.retain(|c| c.name != spec.name);
+        self.changes.push(ParamChange {
+            name: spec.name,
+            value: None,
+            key: None,
+        });
+    }
 }
 
 fn unit_suffix(unit: &str) -> String {
@@ -260,6 +358,12 @@ pub fn instrument_panel(app: &mut App, ui: &mut Ui) {
         .id_salt(("instrument_params", track_id))
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            if slot.kind == InstrumentType::Drums {
+                changes = crate::inst_view::drum_panel(app, ui, track_id, &slot);
+                return;
+            }
+            changes = crate::inst_view::instrument_view(app, ui, track_id, &slot);
+            ui.separator();
             ui.columns(columns, |cols| {
                 for (c, col) in cols.iter_mut().enumerate() {
                     let from = (c * per).min(specs.len());

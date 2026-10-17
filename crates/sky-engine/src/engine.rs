@@ -15,7 +15,7 @@ use crate::compile::{
     AudioClipNode, ChannelNode, EngineSnapshot, NoteEvent, SourceNode, TrackNode, Triggers,
 };
 use crate::preview::{Preview, PreviewVoice};
-use crate::shared::{EngineShared, LoudnessBlock};
+use crate::shared::{EngineShared, LoudnessBlock, Reduction};
 
 /// Messages from the control thread to the audio thread.
 pub enum EngineMsg {
@@ -393,9 +393,15 @@ fn apply_channel(
     k: f32,
     left: &mut [f32],
     right: &mut [f32],
+    reductions: &[Reduction],
 ) -> (f32, f32) {
-    for fx in channel.effects.iter_mut().filter(|f| f.enabled) {
-        fx.effect.process(left, right);
+    for (i, fx) in channel.effects.iter_mut().enumerate() {
+        if fx.enabled {
+            fx.effect.process(left, right);
+            if let Some(meter) = reductions.get(i) {
+                meter.record(fx.effect.gain_reduction_db());
+            }
+        }
     }
     let [cl, cr] = &mut channel.current;
     let (tl, tr) = (channel.gain_l, channel.gain_r);
@@ -684,7 +690,8 @@ impl Engine {
                 continue;
             };
             feed_sidechains(&mut track.channel, &snap.triggers);
-            let (pl, pr) = apply_channel(&mut track.channel, k, bl, br);
+            let reductions = self.shared.reductions(Some(track.meter));
+            let (pl, pr) = apply_channel(&mut track.channel, k, bl, br, reductions);
             if let Some(m) = self.shared.track_meter(track.meter) {
                 m.record(pl, pr);
             }
@@ -698,7 +705,7 @@ impl Engine {
             }
         }
         feed_sidechains(&mut snap.master, &snap.triggers);
-        let (pl, pr) = apply_channel(&mut snap.master, k, ml, mr);
+        let (pl, pr) = apply_channel(&mut snap.master, k, ml, mr, self.shared.reductions(None));
         self.shared.master.record(pl, pr);
         let (shared, playing) = (&self.shared, self.playing);
         let (tl, tr) = self.loudness.process(ml, mr, |power| {

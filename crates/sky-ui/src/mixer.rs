@@ -13,12 +13,13 @@ use egui::{
 use sky_core::{EffectId, TrackId};
 use sky_dsp::EffectType;
 use sky_dsp::loudness::Loudness;
-use sky_engine::EngineShared;
+use sky_engine::{EngineShared, Reduction};
 use sky_model::{Channel, ChannelRef, EffectSlot, Project};
 
 use crate::actions::{self, ChannelChange};
 use crate::app::{Action, App};
-use crate::params::param_grid;
+use crate::fx_view::{self, REDUCTION_RANGE, ReductionLevel};
+use crate::params::{Edits, param_grid};
 use crate::theme;
 use crate::widgets::{self, MeterLevel};
 
@@ -47,6 +48,8 @@ pub struct MixerState {
     /// The effect whose parameter window is open.
     pub open_effect: Option<(ChannelRef, EffectId)>,
     pub loudness: LoudnessState,
+    /// The gain reduction of each compressor, limiter and duck.
+    pub reductions: HashMap<(ChannelRef, EffectId), ReductionLevel>,
 }
 
 impl MixerState {
@@ -55,6 +58,29 @@ impl MixerState {
         self.master.is_active()
             || self.meters.values().any(MeterLevel::is_active)
             || self.loudness.meter.momentary().is_some()
+            || self.reductions.values().any(ReductionLevel::is_active)
+    }
+
+    /// Reads the gain reduction the engine measured in a channel's inserts
+    /// since the last call; `slots` are its meters by insert position.
+    /// Adds the inserts it saw to `seen`.
+    pub fn update_reductions(
+        &mut self,
+        channel_ref: ChannelRef,
+        channel: &Channel,
+        slots: Option<&[Reduction]>,
+        dt: f32,
+        seen: &mut Vec<(ChannelRef, EffectId)>,
+    ) {
+        for (i, fx) in channel.effects.iter().enumerate() {
+            if !fx.kind.reduces_gain() {
+                continue;
+            }
+            let db = slots.and_then(|s| s.get(i)).map_or(0.0, Reduction::take);
+            let key = (channel_ref, fx.id);
+            self.reductions.entry(key).or_default().update(db, dt);
+            seen.push(key);
+        }
     }
 }
 
@@ -364,6 +390,18 @@ fn effects_section(
         slot.spacing_mut().item_spacing.x = 3.0;
         if let Some(effect) = channel.effects.get(i) {
             effect_slot(app, &mut slot, channel_ref, effect, i);
+            if let Some(level) = app.mixer.reductions.get(&(channel_ref, effect.id))
+                && level.db > 0.0
+            {
+                // A thin bar along the slot's foot shows how hard it works.
+                let frac = (level.db / REDUCTION_RANGE).clamp(0.0, 1.0);
+                let foot = Rect::from_min_size(
+                    pos2(rect.left() + 2.0, rect.bottom() - 3.0),
+                    vec2((rect.width() - 4.0) * frac, 2.0),
+                );
+                ui.painter()
+                    .rect_filled(foot, CornerRadius::same(1), theme::REDUCTION);
+            }
             let glow = app.ai.effect_glow(channel_ref, effect.id, app.now);
             widgets::ai_glow(ui.painter(), rect.expand(1.0), 3, glow);
         } else if i == channel.effects.len() {
@@ -682,13 +720,27 @@ pub fn effect_window(app: &mut App, ctx: &Context) {
             sidechain_row(app, ui, project, channel_ref, effect);
         }
         ui.separator();
-        changes = param_grid(
+        let value_of = |name: &str| effect.param(name).unwrap_or(0.0);
+        if fx_view::has_view(effect.kind) {
+            let mut edits = Edits::new(effect.kind.params(), &mut app.gestures, &value_of);
+            fx_view::effect_view(
+                ui,
+                effect_id,
+                effect.kind,
+                &mut edits,
+                project.tempo.initial_bpm(),
+                app.mixer.reductions.get(&(channel_ref, effect_id)),
+            );
+            changes = edits.changes;
+            ui.separator();
+        }
+        changes.extend(param_grid(
             ui,
             &mut app.gestures,
             ("fx", effect_id),
             effect.kind.params(),
-            |name| effect.param(name).unwrap_or(0.0),
-        );
+            value_of,
+        ));
     });
     for ch in changes {
         let r = actions::set_effect_param(

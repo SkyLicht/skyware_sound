@@ -30,6 +30,8 @@ pub struct Compressor {
     makeup: f32,
     /// Current gain reduction in dB (positive numbers reduce).
     reduction_db: f32,
+    /// The most reduction in the last block, for meters.
+    block_reduction: f32,
 }
 
 impl Compressor {
@@ -43,26 +45,13 @@ impl Compressor {
             knee: 6.0,
             makeup: 1.0,
             reduction_db: 0.0,
+            block_reduction: 0.0,
         }
     }
 
     /// Static curve: how many dB to reduce a signal at `level_db`.
     fn target_reduction(&self, level_db: f32) -> f32 {
-        let over = level_db - self.threshold;
-        let slope = 1.0 - 1.0 / self.ratio;
-        if self.knee > 0.0 && over.abs() <= self.knee * 0.5 {
-            let x = over + self.knee * 0.5;
-            slope * x * x / (2.0 * self.knee)
-        } else if over > 0.0 {
-            slope * over
-        } else {
-            0.0
-        }
-    }
-
-    /// Current gain reduction in dB, for meters.
-    pub fn reduction_db(&self) -> f32 {
-        self.reduction_db
+        crate::curves::compressor_reduction_db(level_db, self.threshold, self.ratio, self.knee)
     }
 }
 
@@ -81,6 +70,7 @@ impl Effect for Compressor {
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.block_reduction = 0.0;
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let level = gain_to_db(l.abs().max(r.abs()));
             let target = self.target_reduction(level);
@@ -90,14 +80,20 @@ impl Effect for Compressor {
                 self.release
             };
             self.reduction_db = target + (self.reduction_db - target) * coeff;
+            self.block_reduction = self.block_reduction.max(self.reduction_db);
             let g = db_to_gain(-self.reduction_db) * self.makeup;
             *l *= g;
             *r *= g;
         }
     }
 
+    fn gain_reduction_db(&self) -> f32 {
+        self.block_reduction
+    }
+
     fn reset(&mut self) {
         self.reduction_db = 0.0;
+        self.block_reduction = 0.0;
     }
 
     effect_state!(reduction_db);
@@ -114,6 +110,8 @@ pub struct Limiter {
     ceiling: f32,
     release: f32,
     gain: f32,
+    /// The lowest gain in the last block, for meters.
+    block_gain: f32,
 }
 
 impl Limiter {
@@ -123,6 +121,7 @@ impl Limiter {
             ceiling: db_to_gain(-1.0),
             release: time_coeff(60.0, sample_rate),
             gain: 1.0,
+            block_gain: 1.0,
         }
     }
 }
@@ -138,6 +137,7 @@ impl Effect for Limiter {
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.block_gain = 1.0;
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let peak = l.abs().max(r.abs());
             let needed = if peak > self.ceiling {
@@ -147,13 +147,19 @@ impl Effect for Limiter {
             };
             // Recover towards unity, but never more than the sample allows.
             self.gain = (1.0 + (self.gain - 1.0) * self.release).min(needed);
+            self.block_gain = self.block_gain.min(self.gain);
             *l *= self.gain;
             *r *= self.gain;
         }
     }
 
+    fn gain_reduction_db(&self) -> f32 {
+        -gain_to_db(self.block_gain)
+    }
+
     fn reset(&mut self) {
         self.gain = 1.0;
+        self.block_gain = 1.0;
     }
 
     effect_state!(gain);
@@ -190,5 +196,24 @@ mod tests {
         // 0 dB in, -20 threshold, 10:1 → about -18 dB out.
         let out_db = gain_to_db(loud[47_999]);
         assert!((out_db + 18.0).abs() < 0.5, "{out_db}");
+        // The meter shows the reduction of the last block only.
+        let reduction = c.gain_reduction_db();
+        assert!((reduction - 18.0).abs() < 0.5, "{reduction}");
+        c.process(&mut quiet, &mut quiet_r);
+        assert!(c.gain_reduction_db() < reduction);
+    }
+
+    #[test]
+    fn the_limiter_reports_how_far_it_turned_down() {
+        let mut lim = Limiter::new(48_000.0);
+        lim.set_param("ceiling", -6.0);
+        let mut l = vec![0.1; 256];
+        let mut r = l.clone();
+        lim.process(&mut l, &mut r);
+        assert_eq!(lim.gain_reduction_db(), 0.0);
+        let mut l = vec![1.0; 256];
+        let mut r = l.clone();
+        lim.process(&mut l, &mut r);
+        assert!((lim.gain_reduction_db() - 6.0).abs() < 0.01);
     }
 }
