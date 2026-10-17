@@ -42,8 +42,10 @@ use sky_model::{
 };
 use thiserror::Error;
 
+mod pattern_sounds;
 mod place;
 
+pub use pattern_sounds::{SoundsLoaded, SoundsRequest, pattern_sound_names};
 pub use place::{AudioInput, AudioTarget, ImportedFiles, Placed, audio_clip, sound_name};
 
 /// Longest render the session will make in one call.
@@ -411,6 +413,88 @@ struct Inner {
 #[derive(Clone)]
 pub struct Session {
     inner: Arc<Inner>,
+}
+
+/// One sound of a load, in the pool.
+struct Pooled {
+    name: String,
+    variations: Vec<BankSample>,
+    /// Its files new to the pool, and those already there.
+    new_files: usize,
+    reused_files: usize,
+}
+
+/// Puts a load's files into the pool, reusing files already there from the
+/// same address. The files it adds to the audio cache are listed in
+/// `added`, for taking out again if the change fails.
+fn pool_loaded(
+    st: &mut State,
+    loaded: &sky_library::LoadedBank,
+    commands: &mut Vec<Command>,
+    added: &mut Vec<AudioId>,
+) -> Result<Vec<Pooled>, SessionError> {
+    let source = &loaded.source;
+    let mut out = Vec::new();
+    for (name, samples) in &loaded.sounds {
+        let (mut new_files, mut reused_files) = (0, 0);
+        let mut variations = Vec::with_capacity(samples.len());
+        for (i, sample) in samples.iter().enumerate() {
+            let existing = st
+                .project
+                .audio_pool
+                .iter()
+                .find(|e| e.source.as_ref().is_some_and(|s| s.url == sample.location))
+                .map(|e| e.id);
+            let id = match existing {
+                Some(id) => {
+                    reused_files += 1;
+                    st.audio.entry(id).or_insert_with(|| sample.audio.clone());
+                    id
+                }
+                None => {
+                    new_files += 1;
+                    let id = AudioId::new();
+                    let entry = PoolEntry {
+                        id,
+                        name: format!("{} {name}:{i}", loaded.name),
+                        file: format!("{}/{id}.wav", file::AUDIO_DIR),
+                        channels: sample.audio.channel_count() as u16,
+                        sample_rate: sample.audio.sample_rate,
+                        frames: sample.audio.frames() as u64,
+                        source: Some(AudioSource {
+                            pack: source.name.clone(),
+                            url: sample.location.clone(),
+                            license: source.license,
+                            credit: source.credit.clone(),
+                        }),
+                    };
+                    if let Some(dir) = &st.path {
+                        write_wav(
+                            &dir.join(&entry.file),
+                            &sample.audio,
+                            WavFormat::Float32,
+                            false,
+                        )?;
+                    }
+                    st.audio.insert(id, sample.audio.clone());
+                    added.push(id);
+                    commands.push(Command::AddPoolAudio { entry, index: None });
+                    id
+                }
+            };
+            variations.push(BankSample {
+                audio: id,
+                root: sample.root,
+            });
+        }
+        out.push(Pooled {
+            name: name.clone(),
+            variations,
+            new_files,
+            reused_files,
+        });
+    }
+    Ok(out)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1049,58 +1133,19 @@ impl Session {
         let mut commands = Vec::new();
         let mut added = Vec::new();
         let (mut new_files, mut reused_files) = (0, 0);
-        for (name, samples) in &loaded.sounds {
-            let mut variations = Vec::with_capacity(samples.len());
-            for (i, sample) in samples.iter().enumerate() {
-                let existing = st
-                    .project
-                    .audio_pool
-                    .iter()
-                    .find(|e| e.source.as_ref().is_some_and(|s| s.url == sample.location))
-                    .map(|e| e.id);
-                let id = match existing {
-                    Some(id) => {
-                        reused_files += 1;
-                        st.audio.entry(id).or_insert_with(|| sample.audio.clone());
-                        id
-                    }
-                    None => {
-                        new_files += 1;
-                        let id = AudioId::new();
-                        let entry = PoolEntry {
-                            id,
-                            name: format!("{} {name}:{i}", selection.name),
-                            file: format!("{}/{id}.wav", file::AUDIO_DIR),
-                            channels: sample.audio.channel_count() as u16,
-                            sample_rate: sample.audio.sample_rate,
-                            frames: sample.audio.frames() as u64,
-                            source: Some(AudioSource {
-                                pack: source.name.clone(),
-                                url: sample.location.clone(),
-                                license: source.license,
-                                credit: source.credit.clone(),
-                            }),
-                        };
-                        if let Some(dir) = &st.path {
-                            write_wav(
-                                &dir.join(&entry.file),
-                                &sample.audio,
-                                WavFormat::Float32,
-                                false,
-                            )?;
-                        }
-                        st.audio.insert(id, sample.audio.clone());
-                        added.push(id);
-                        commands.push(Command::AddPoolAudio { entry, index: None });
-                        id
-                    }
-                };
-                variations.push(BankSample {
-                    audio: id,
-                    root: sample.root,
-                });
+        let pooled = match pool_loaded(&mut st, &loaded, &mut commands, &mut added) {
+            Ok(p) => p,
+            Err(e) => {
+                for id in added {
+                    st.audio.remove(&id);
+                }
+                return Err(e);
             }
-            sounds.insert(name.clone(), variations);
+        };
+        for p in pooled {
+            new_files += p.new_files;
+            reused_files += p.reused_files;
+            sounds.insert(p.name, p.variations);
         }
         let pitched = match &request.pitched {
             Some(p) => Some(p.clone()),
@@ -1124,6 +1169,7 @@ impl Session {
             name: name.clone(),
             sounds,
             pitched,
+            packs: previous.map(|p| p.packs).unwrap_or_default(),
         };
         slot.bank = Some(bank.clone());
         commands.push(Command::SetInstrument {

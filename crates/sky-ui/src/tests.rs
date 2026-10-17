@@ -1967,6 +1967,130 @@ fn write_pack(dir: &Path) {
 }
 
 #[test]
+fn a_samples_line_links_a_pack_and_patterns_load_what_they_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let folder = dir.path().join("dirt");
+    write_pack(&folder);
+    // Plain names, as Dirt-Samples has.
+    std::fs::write(
+        folder.join("strudel.json"),
+        r#"{"bd": ["bd0.wav", "bd1.wav"], "sn": "sd.wav", "hh": "hh.wav"}"#,
+    )
+    .expect("write map");
+    let mut project = empty_project("Strudel");
+    let mut track = Track::new_instrument("Beat", InstrumentType::Synth);
+    let clip = ClipId::new();
+    track.clips.push(Clip {
+        id: clip,
+        name: "Beat".into(),
+        start: 0,
+        length: PPQ * 4,
+        muted: false,
+        content: ClipContent::pattern("c4", 0, PPQ * 4),
+    });
+    let track_id = track.id;
+    project.tracks.push(track);
+    let mut h = Harness::with_project(project);
+    h.app
+        .session
+        .set_library(sky_library::Library::new(dir.path().join("cache")));
+    let source = |h: &Harness| match &h.clip(clip).content {
+        ClipContent::Pattern { source, .. } => source.clone(),
+        other => panic!("{other:?}"),
+    };
+    let bank = |h: &Harness| {
+        h.app
+            .session
+            .project()
+            .track(track_id)
+            .unwrap()
+            .instrument
+            .clone()
+            .unwrap()
+            .bank
+    };
+    let notice = |h: &Harness| {
+        h.app
+            .notice
+            .as_ref()
+            .map(|n| n.text.clone())
+            .unwrap_or_default()
+    };
+    h.app.sel.select_clip(track_id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    let text_id = Id::new(("pattern_text", clip));
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+
+    // Strudel's line, then the pattern: the sounds it names load from the
+    // pack, and the line is not kept.
+    let address = folder.to_string_lossy().replace('\\', "/");
+    h.key(Key::A, COMMAND);
+    h.type_text(&format!("samples('{address}')"));
+    h.key(Key::Enter, Modifiers::NONE);
+    h.type_text("bd*2 sd");
+    assert!(matches!(
+        pattern_editor::parse_status(&h.app.pattern.text, 0),
+        pattern_editor::ParseStatus::Ok { events: 3 }
+    ));
+    h.key(Key::Enter, COMMAND);
+    assert_eq!(h.app.pattern.loading, Some(clip));
+    h.wait_jobs();
+    assert_eq!(h.app.pattern.loading, None);
+    assert_eq!(source(&h), "bd*2 sd");
+    assert_eq!(h.app.pattern.text, "bd*2 sd");
+    let b = bank(&h).expect("a sample bank");
+    assert_eq!(b.packs.len(), 1);
+    assert_eq!(b.packs[0].name, "dirt");
+    assert_eq!(b.sounds.keys().collect::<Vec<_>>(), ["bd", "sn"]);
+    assert!(notice(&h).starts_with("Linked dirt"), "{}", notice(&h));
+
+    // The pack's other names are offered, and load once the pattern uses
+    // them.
+    h.wait_jobs();
+    h.ctx.memory_mut(|m| m.request_focus(text_id));
+    h.frames(2);
+    h.key(Key::A, COMMAND);
+    h.type_text("bd h");
+    assert!(
+        h.app.pattern.offered().0.contains(&"hh".to_string()),
+        "{:?}",
+        h.app.pattern.offered()
+    );
+    h.type_text("h");
+    h.key(Key::Enter, COMMAND);
+    h.wait_jobs();
+    assert_eq!(source(&h), "bd hh");
+    assert!(bank(&h).unwrap().sounds.contains_key("hh"));
+    assert_eq!(notice(&h), "Loaded hh");
+    // A name the bank has needs nothing loaded.
+    h.key(Key::A, COMMAND);
+    h.type_text("bd sd");
+    h.key(Key::Enter, COMMAND);
+    assert_eq!(h.app.pattern.loading, None);
+    assert_eq!(source(&h), "bd sd");
+
+    // Each load is one undo step with its pattern change.
+    h.run(Action::Undo);
+    h.run(Action::Undo);
+    assert_eq!(source(&h), "bd*2 sd");
+    assert!(!bank(&h).unwrap().sounds.contains_key("hh"));
+    h.run(Action::Undo);
+    assert_eq!(source(&h), "c4");
+    let slot = h
+        .app
+        .session
+        .project()
+        .track(track_id)
+        .unwrap()
+        .instrument
+        .clone()
+        .unwrap();
+    assert_eq!(slot.kind, InstrumentType::Synth);
+}
+
+#[test]
 fn sample_banks_load_from_a_pack_and_exports_credit_it() {
     let dir = tempfile::tempdir().expect("temp dir");
     let folder = dir.path().join("my kit");
@@ -2162,6 +2286,7 @@ fn starter_patterns_use_what_the_bank_has() {
             })
             .collect(),
         pitched: pitched.map(str::to_string),
+        packs: Vec::new(),
     };
     assert_eq!(
         sounds::starter_pattern(&bank(&["bd", "sn", "hh"], None)),

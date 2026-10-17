@@ -23,7 +23,7 @@ use sky_dsp::analysis;
 use sky_dsp::params::{self, ParamKind, ParamSpec};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_io::WavFormat;
-use sky_library::{PACKS, PackSource};
+use sky_library::{PACKS, PackSource, Samples};
 use sky_model::command::VELOCITY;
 use sky_model::notes::{format_note_list, parse_note_list};
 use sky_model::summary::{clip_json, game_asset_json, game_json, project_summary, track_json};
@@ -33,7 +33,7 @@ use sky_model::{
     License, MAX_SFX_VARIATIONS, Origin, Project, StepClip, StepLane, Swing, TimeRange, Track,
     TrackKind, Transaction,
 };
-use sky_session::{BankRequest, GameExportOptions, LoopExportOptions, Session};
+use sky_session::{BankRequest, GameExportOptions, LoopExportOptions, Session, SoundsRequest};
 
 use crate::policy::{Permission, Policy};
 
@@ -80,7 +80,10 @@ duck's length follow the tempo. The drums have per-piece tune, decay and level \
 Strudel's sample packs: a track with the \"bank\" instrument plays named sounds \
 from a pack, as Strudel's s(\"bd sd:2\").bank(\"RolandTR808\") does: sd:2 is the \
 third sd. sound_packs lists the packs and their banks; bank_load downloads a \
-bank or some sounds into a track. MIDI notes on a bank track play its drums by \
+bank or some sounds into a track. Or write Strudel's own line above the \
+pattern given to pattern_set, as samples('github:tidalcycles/dirt-samples'): it \
+links that pack to the track's bank, and the sounds the pattern names, then or \
+later, download from it. MIDI notes on a bank track play its drums by \
 General MIDI number, or its pitched sound (piano) when it has one. Packs keep \
 their license: exports list the credits they need and warn about unknown \
 licenses.\n\
@@ -862,7 +865,12 @@ pub struct StepsWriteArgs {
 pub struct PatternSetArgs {
     /// Pattern clip ID or name.
     pub clip: String,
-    /// New mini-notation. Default: unchanged.
+    /// New mini-notation. Default: unchanged. As in Strudel, a line
+    /// samples('github:user/repo') links that pack to the track's sample
+    /// bank (the track becomes one), and sounds the pattern names that the
+    /// bank lacks then download from its linked packs; samples({ name:
+    /// 'https://…/file.wav' }) loads those files. The line is not kept in
+    /// the pattern. Downloading needs the files permission.
     pub pattern: Option<String>,
     /// Cycle length in bars. Default: unchanged.
     pub cycle_bars: Option<f64>,
@@ -1093,6 +1101,69 @@ impl SkywareMcp {
             .map_err(|e| e.to_string())
     }
 
+    /// Reads a pattern a client wrote: the mini-notation without its
+    /// `samples(...)` calls, what to load before it changes, and a note
+    /// when sounds it names could not be fetched without the files
+    /// permission.
+    #[allow(clippy::type_complexity)]
+    fn pattern_sounds(
+        &self,
+        track: &Track,
+        text: &str,
+    ) -> Result<(String, Option<SoundsRequest>, Option<String>), String> {
+        let calls = sky_library::find_samples(text).map_err(|e| format!("pattern error: {e}"))?;
+        let source = sky_library::samples::strip_calls(text, &calls);
+        sky_pattern::parse(&source).map_err(|e| format!("pattern error: {e}"))?;
+        let used = sky_session::pattern_sound_names(&source);
+        let bank = track
+            .instrument
+            .as_ref()
+            .filter(|s| s.kind == InstrumentType::Bank)
+            .and_then(|s| s.bank.as_ref());
+        let missing: Vec<&String> = used
+            .iter()
+            .filter(|n| bank.is_some_and(|b| !b.packs.is_empty() && b.resolve(n).is_none()))
+            .collect();
+        if calls.is_empty() && missing.is_empty() {
+            return Ok((source, None, None));
+        }
+        if self.policy.permission < Permission::Files {
+            if !calls.is_empty() {
+                return Err(
+                    "samples(...) downloads sounds, which needs the files permission; write the \
+                     pattern without it"
+                        .into(),
+                );
+            }
+            let note = format!(
+                "the bank has no {}; loading them from its linked packs needs the files permission",
+                names(missing.iter().map(|s| s.as_str()))
+            );
+            return Ok((source, None, Some(note)));
+        }
+        let mut request = SoundsRequest {
+            names: used,
+            ..Default::default()
+        };
+        for call in calls {
+            match call.samples {
+                Samples::Address(a) => request.link.push(self.pack_source(&a, None)?),
+                Samples::Map(map) => {
+                    // Files on this computer must be in the allowed folders.
+                    for f in map.sounds.values().flatten() {
+                        let at = map.locate(f);
+                        let lower = at.get(..8).unwrap_or(&at).to_ascii_lowercase();
+                        if !lower.starts_with("http://") && !lower.starts_with("https://") {
+                            self.policy.resolve(&at)?;
+                        }
+                    }
+                    request.maps.push(map);
+                }
+            }
+        }
+        Ok((source, Some(request), None))
+    }
+
     /// The pack a client named: a known pack, an http(s) URL or github:
     /// shortcut, or a folder or file inside the allowed folders.
     fn pack_source(&self, pack: &str, license: Option<&str>) -> Result<PackSource, String> {
@@ -1229,10 +1300,14 @@ impl SkywareMcp {
     )]
     async fn pattern_query(&self, Parameters(a): Parameters<PatternQueryArgs>) -> ToolResult {
         let numbers = a.numbers.unwrap_or(false);
+        // samples(...) lines are not mini-notation; read what is around them.
+        let calls =
+            sky_library::find_samples(&a.pattern).map_err(|e| format!("pattern error: {e}"))?;
+        let text = sky_library::samples::blank_calls(&a.pattern, &calls);
         let pattern = if numbers {
-            sky_pattern::parse_numbers(&a.pattern)
+            sky_pattern::parse_numbers(&text)
         } else {
-            sky_pattern::parse(&a.pattern)
+            sky_pattern::parse(&text)
         }
         .map_err(|e| format!("pattern error: {e}"))?;
         let cycles = a.cycles.unwrap_or(1).clamp(1, 16);
@@ -1800,6 +1875,13 @@ impl SkywareMcp {
                 name,
             )
         } else if let Some(p) = &a.pattern {
+            if sky_library::find_samples(p).is_ok_and(|c| !c.is_empty()) {
+                return Err(
+                    "create the clip with the pattern alone, then give pattern_set the \
+                     samples(...) line with it to load the sounds"
+                        .into(),
+                );
+            }
             let cycle = bars_len(&project, a.cycle_bars.unwrap_or(1.0))?;
             let controls = a.controls.clone().unwrap_or_default();
             check_controls(&project, track, controls.keys().map(String::as_str))?;
@@ -2018,22 +2100,52 @@ impl SkywareMcp {
                     .map(|(k, _)| k.as_str()),
             )?;
         }
-        self.apply(
-            &ctx,
-            "pattern_set",
-            format!("Change pattern {}", clip.name),
-            vec![Command::SetPattern {
-                clip: id,
-                source: a.pattern.clone().unwrap_or_else(|| source.clone()),
-                seed: a.seed.unwrap_or(*seed),
-                cycle,
-                controls,
-                swing: swing_of(*swing, a.swing, a.swing_grid),
-            }],
-        )?;
+        let (text, request, note) = match &a.pattern {
+            Some(p) => self.pattern_sounds(track, p)?,
+            None => (source.clone(), None, None),
+        };
+        let label = format!("Change pattern {}", clip.name);
+        let command = Command::SetPattern {
+            clip: id,
+            source: text,
+            seed: a.seed.unwrap_or(*seed),
+            cycle,
+            controls,
+            swing: swing_of(*swing, a.swing, a.swing_grid),
+        };
+        let mut loaded = None;
+        match request {
+            Some(request) => {
+                let session = self.session.clone();
+                let (track, origin) = (track.id, origin(&ctx, "pattern_set"));
+                loaded = Some(
+                    blocking(move || {
+                        session
+                            .load_pattern_sounds(track, &request, &label, vec![command], origin)
+                            .map_err(|e| e.to_string())
+                    })
+                    .await?,
+                );
+            }
+            None => {
+                self.apply(&ctx, "pattern_set", label, vec![command])?;
+            }
+        }
         let project = self.session.project();
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
-        Ok(clip_json(&project, clip, true).to_string())
+        let mut v = clip_json(&project, clip, true);
+        if let Some(done) = loaded {
+            v["sounds"] = serde_json::to_value(&done).map_err(|e| e.to_string())?;
+            if done.packs.iter().any(|p| p.license == License::Unknown) {
+                v["licenseNote"] = json!(
+                    "A linked pack does not state a license; exports will warn until its terms are checked."
+                );
+            }
+        }
+        if let Some(note) = note {
+            v["note"] = json!(note);
+        }
+        Ok(v.to_string())
     }
 
     #[tool(

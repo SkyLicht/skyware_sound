@@ -186,6 +186,15 @@ pub fn bank_json(project: &Project, bank: &SampleBank, detail: bool) -> Value {
     if let Some(p) = &bank.pitched {
         v["pitched"] = json!(p);
     }
+    if !bank.packs.is_empty() {
+        // Packs the bank loads more sounds from as patterns name them.
+        v["linked"] = json!(
+            bank.packs
+                .iter()
+                .map(|l| json!({ "pack": l.name, "map": l.map, "license": l.license.id() }))
+                .collect::<Vec<_>>()
+        );
+    }
     v
 }
 

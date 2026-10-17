@@ -118,6 +118,12 @@ impl SampleMap {
     pub fn parse(json: &str, location: &str) -> Result<SampleMap, String> {
         let value: Value =
             serde_json::from_str(json).map_err(|e| format!("not a sample map: {e}"))?;
+        Self::from_value(&value, location)
+    }
+
+    /// Reads a map already parsed as JSON, such as one written in a
+    /// `samples({ ... })` call.
+    pub fn from_value(value: &Value, location: &str) -> Result<SampleMap, String> {
         let Value::Object(object) = value else {
             return Err("not a sample map: expected a JSON object of sound names".into());
         };
@@ -135,7 +141,7 @@ impl SampleMap {
             _ => parent(location),
         };
         let mut sounds = BTreeMap::new();
-        for (name, v) in &object {
+        for (name, v) in object {
             if name.starts_with('_') {
                 continue;
             }
@@ -168,6 +174,27 @@ impl SampleMap {
                 .to_string_lossy()
                 .into_owned()
         }
+    }
+
+    /// The sound a pattern's name plays, by its full name: the name itself,
+    /// the name in another case, then another name for the same drum, so
+    /// `sd` finds a map's `sn`.
+    pub fn find_sound(&self, name: &str) -> Option<(&str, &[MapFile])> {
+        let found = |key: &str| {
+            self.sounds
+                .get_key_value(key)
+                .or_else(|| {
+                    self.sounds
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                })
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+        };
+        found(name).or_else(|| {
+            let note = sky_pattern::drum_note(name)?;
+            sky_pattern::drum_names(note).find_map(found)
+        })
     }
 
     /// The banks in the map: name prefixes before `_` that two or more
@@ -361,5 +388,21 @@ mod tests {
                 .unwrap_err()
                 .contains("not a sample map")
         );
+    }
+
+    #[test]
+    fn patterns_find_sounds_by_other_names() {
+        let map =
+            SampleMap::parse(r#"{"BD": "bd.wav", "sn": ["a.wav", "b.wav"], "e": []}"#, "").unwrap();
+        assert_eq!(map.find_sound("bd").map(|(k, _)| k), Some("BD"));
+        assert_eq!(
+            map.find_sound("sd").map(|(k, f)| (k, f.len())),
+            Some(("sn", 2))
+        );
+        assert!(
+            map.find_sound("e").is_none(),
+            "a sound with no files is not there"
+        );
+        assert!(map.find_sound("hh").is_none());
     }
 }
