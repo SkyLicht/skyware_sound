@@ -117,7 +117,7 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
     ok(
         &client,
         "track_set",
-        json!({ "track": "Bass", "volume_db": -4, "pan": -0.2 }),
+        json!({ "track": "Bass", "volume_db": -4, "pan": -0.2, "picture": "acid bass" }),
     )
     .await;
     ok(
@@ -131,6 +131,13 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
     assert_eq!(summary["tempoBpm"], 100.0);
     assert_eq!(summary["tracks"].as_array().unwrap().len(), 2);
     assert_eq!(summary["loop"]["endBar"], 17.0);
+    let bass = summary["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "Bass")
+        .unwrap();
+    assert_eq!(bass["picture"], "acid bass");
 
     let seam = ok(&client, "loop_check_seam", json!({})).await;
     assert_eq!(seam["seam"]["verdict"], "seamless", "{seam}");
@@ -148,6 +155,13 @@ async fn an_assistant_builds_and_exports_a_sixteen_bar_loop() {
     let view = session.view();
     assert_eq!(view.activity.len(), 9);
     assert!(view.activity.iter().all(|a| !a.undone));
+    let (text, failed) = call(
+        &client,
+        "track_set",
+        json!({ "track": "Bass", "picture": "kazoo" }),
+    )
+    .await;
+    assert!(failed && text.contains("no picture symbol"), "{text}");
 
     // The game runtime loads the export and plays it.
     let dir = tmp.path().join("game/audio");

@@ -30,8 +30,8 @@ use sky_model::summary::{clip_json, game_asset_json, game_json, project_summary,
 use sky_model::templates::{acid_project, demo_project, empty_project, techno_project};
 use sky_model::{
     ChannelRef, Clip, ClipContent, Command, EffectSlot, GameAsset, GameAssetKind, InstrumentSlot,
-    License, MAX_SFX_VARIATIONS, Origin, Project, StepClip, StepLane, Swing, TimeRange, Track,
-    TrackKind, Transaction,
+    License, MAX_SFX_VARIATIONS, Origin, Picture, Project, StepClip, StepLane, Swing, Symbol,
+    TimeRange, Track, TrackKind, Transaction,
 };
 use sky_session::{BankRequest, GameExportOptions, LoopExportOptions, Session};
 
@@ -680,6 +680,11 @@ pub struct TrackSetArgs {
     pub color: Option<String>,
     /// New position in the track list, 0 is the top.
     pub index: Option<usize>,
+    /// The symbol in the track's picture: synth, acid bass, drums, drum
+    /// machine, sampler, sample bank, audio, microphone, piano, strings,
+    /// hand drum, record, groovebox, noise, speaker or folder. "auto" goes
+    /// back to the one the track shows by itself.
+    pub picture: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1500,7 +1505,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Changes a track's name, color, position, or its mixer volume, pan, mute and solo. Use track \"master\" for the master volume."
+        description = "Changes a track's name, color, picture symbol, position, or its mixer volume, pan, mute and solo. Use track \"master\" for the master volume."
     )]
     async fn track_set(
         &self,
@@ -1512,8 +1517,9 @@ impl SkywareMcp {
         let mut cmds = Vec::new();
         match channel {
             ChannelRef::Master => {
-                if a.name.is_some() || a.color.is_some() || a.index.is_some() {
-                    return Err("the master has no name, color or position".into());
+                if a.name.is_some() || a.color.is_some() || a.index.is_some() || a.picture.is_some()
+                {
+                    return Err("the master has no name, color, picture or position".into());
                 }
             }
             ChannelRef::Track(id) => {
@@ -1528,6 +1534,21 @@ impl SkywareMcp {
                         id,
                         color: parse_color(c)?,
                     });
+                }
+                if let Some(text) = &a.picture {
+                    let picture = if text.trim().eq_ignore_ascii_case("auto") {
+                        None
+                    } else {
+                        let symbol = Symbol::parse(text).ok_or_else(|| {
+                            let names: Vec<&str> = Symbol::ALL.iter().map(|s| s.label()).collect();
+                            format!(
+                                "no picture symbol {text:?}; use auto or one of: {}",
+                                names.join(", ")
+                            )
+                        })?;
+                        Some(Picture::symbol(symbol))
+                    };
+                    cmds.push(Command::SetTrackPicture { id, picture });
                 }
                 if let Some(index) = a.index {
                     cmds.push(Command::MoveTrack { id, index });

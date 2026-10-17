@@ -38,6 +38,10 @@ const MAX_MAP_BYTES: u64 = 16 << 20;
 const WORKERS: usize = 8;
 /// The longest sound name a project accepts.
 const MAX_NAME: usize = 64;
+/// The largest cover image accepted.
+const MAX_COVER_BYTES: u64 = 8 << 20;
+/// How long a pack found to have no cover goes before it is looked at again.
+const COVER_RECHECK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Error)]
 pub enum LibraryError {
@@ -318,6 +322,22 @@ fn env_roots() -> Option<Vec<ureq::tls::Certificate<'static>>> {
     (!certs.is_empty()).then_some(certs)
 }
 
+/// The names a pack's cover image may have beside its sample map:
+/// `cover.png` beside a `strudel.json`, or the map's own name with an image
+/// extension, such as `vcsl.png` beside `vcsl.json`.
+pub fn cover_names(map_file: &str) -> Vec<String> {
+    let stem = map_file.rsplit_once('.').map_or(map_file, |(s, _)| s);
+    let stem = if stem.eq_ignore_ascii_case("strudel") {
+        "cover"
+    } else {
+        stem
+    };
+    ["png", "jpg", "jpeg"]
+        .iter()
+        .map(|e| format!("{stem}.{e}"))
+        .collect()
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -412,6 +432,80 @@ impl Library {
             map,
             offline,
         })
+    }
+
+    /// The cover image a pack brings beside its sample map, if any (see
+    /// [`cover_names`]): the file's bytes and its name. Covers from the
+    /// network are kept in the cache, and so is finding none, for a week.
+    pub fn cover(&self, pack: &Pack) -> Result<Option<(Vec<u8>, String)>, String> {
+        let location = pack.location.as_str();
+        if !is_url(location) {
+            let path = Path::new(location);
+            let (Some(dir), Some(file)) = (path.parent(), path.file_name()) else {
+                return Ok(None);
+            };
+            for name in cover_names(&file.to_string_lossy()) {
+                let p = dir.join(&name);
+                let Ok(meta) = std::fs::metadata(&p) else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                if meta.len() > MAX_COVER_BYTES {
+                    return Err(format!(
+                        "{} is larger than {} MB",
+                        p.display(),
+                        MAX_COVER_BYTES >> 20
+                    ));
+                }
+                return std::fs::read(&p)
+                    .map(|b| Some((b, name)))
+                    .map_err(|e| format!("cannot read {}: {e}", p.display()));
+            }
+            return Ok(None);
+        }
+        let base = location.split(['?', '#']).next().unwrap_or(location);
+        let Some((dir, file)) = base.rsplit_once('/') else {
+            return Ok(None);
+        };
+        let covers = self.cache.join("covers");
+        let names = cover_names(file);
+        let urls: Vec<String> = names.iter().map(|n| format!("{dir}/{n}")).collect();
+        for (name, url) in names.iter().zip(&urls) {
+            if let Ok(bytes) = std::fs::read(covers.join(cache_name(url))) {
+                return Ok(Some((bytes, name.clone())));
+            }
+        }
+        let none = covers.join(format!("{:016x}.none", fnv64(location)));
+        let fresh = std::fs::metadata(&none)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < COVER_RECHECK));
+        if fresh {
+            return Ok(None);
+        }
+        for (name, url) in names.iter().zip(&urls) {
+            match self.agent.get(url).call() {
+                Ok(mut response) => {
+                    let bytes = response
+                        .body_mut()
+                        .with_config()
+                        .limit(MAX_COVER_BYTES)
+                        .read_to_vec()
+                        .map_err(|e| format!("{url}: {e}"))?;
+                    if let Err(e) = write_atomic(&covers.join(cache_name(url)), &bytes) {
+                        tracing::warn!("cannot cache {url}: {e}");
+                    }
+                    return Ok(Some((bytes, name.clone())));
+                }
+                Err(ureq::Error::StatusCode(400..=499)) => continue,
+                Err(e) => return Err(format!("{url}: {e}")),
+            }
+        }
+        if let Err(e) = write_atomic(&none, b"") {
+            tracing::warn!("cannot cache that {location} has no cover: {e}");
+        }
+        Ok(None)
     }
 
     /// One file, decoded: from the cache, the network or a local folder.
@@ -534,6 +628,30 @@ mod tests {
             cache_name("https://x.org/b/Bass%20Drum%201/BD_hit v2.wav")
         );
         assert!(cache_name(&format!("https://x/{}.wav", "a".repeat(300))).len() < 80);
+    }
+
+    #[test]
+    fn covers_sit_beside_the_map() {
+        assert_eq!(
+            cover_names("strudel.json"),
+            ["cover.png", "cover.jpg", "cover.jpeg"]
+        );
+        assert_eq!(cover_names("vcsl.json")[0], "vcsl.png");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let map = dir.path().join("strudel.json");
+        std::fs::write(&map, r#"{"_base": "./", "bd": ["bd.wav"]}"#).expect("map");
+        let library = Library::new(dir.path().join("cache"));
+        let pack = library
+            .open(&PackSource::parse(&map.to_string_lossy(), None))
+            .expect("pack");
+        assert_eq!(library.cover(&pack).expect("looked"), None);
+        std::fs::write(dir.path().join("cover.jpg"), b"jpeg bytes").expect("cover");
+        let (bytes, name) = library.cover(&pack).expect("looked").expect("a cover");
+        assert_eq!(
+            (bytes.as_slice(), name.as_str()),
+            (&b"jpeg bytes"[..], "cover.jpg")
+        );
     }
 
     #[test]

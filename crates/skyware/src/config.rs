@@ -39,6 +39,12 @@ pub fn presets_file() -> Option<PathBuf> {
     ProjectDirs::from("", "", "Skyware Sound").map(|d| d.config_dir().join("presets.json"))
 }
 
+/// Where the pictures given to packs, banks and folders in the browser are
+/// kept, beside the browser's folders.
+pub fn pictures_file() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "Skyware Sound").map(|d| d.config_dir().join("pictures.json"))
+}
+
 fn token_path() -> anyhow::Result<PathBuf> {
     Ok(dirs()?.config_dir().join("mcp-token"))
 }

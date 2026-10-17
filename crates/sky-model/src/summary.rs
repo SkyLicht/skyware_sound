@@ -5,6 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::notes::format_note_list;
+use crate::picture::Picture;
 use crate::project::*;
 use crate::steps::{DEFAULT_GATE, StepClip, format_locks};
 
@@ -139,6 +140,11 @@ pub fn track_json(project: &Project, track: &Track, detail: bool) -> Value {
         "channel": channel_json(&track.channel),
         "clips": track.clips.iter().map(|c| clip_json(project, c, detail)).collect::<Vec<_>>(),
     });
+    match &track.picture {
+        Some(Picture::Symbol { symbol, .. }) => v["picture"] = json!(symbol.label()),
+        Some(Picture::Image(image)) => v["picture"] = json!(format!("image {}", image.name).trim()),
+        None => {}
+    }
     if let Some(inst) = &track.instrument {
         v["instrument"] = json!({
             "type": inst.kind.name(),
