@@ -327,6 +327,7 @@ pub fn show(app: &mut App, ui: &mut Ui, corner: Rect, rect: Rect, project: &Proj
         let r = region_rect(&app.arrange, rect, shown, row);
         let lit = selected == Some(asset.id);
         draw_region(&painter, &app.arrange, shown, r, lit);
+        crate::widgets::ai_glow(&painter, r, 3, app.ai.asset_glow(asset.id, app.now));
         // Only the part in view takes the pointer, so a lane cut short
         // leaves the tracks below alone.
         let hit = region_rect(&app.arrange, rect, asset, row).intersect(rect);
@@ -362,7 +363,7 @@ pub fn show(app: &mut App, ui: &mut Ui, corner: Rect, rect: Rect, project: &Proj
 }
 
 /// Picks an asset on the timeline; a loop also goes into the inspector.
-fn select(app: &mut App, project: &Project, id: AssetId) {
+pub(crate) fn select(app: &mut App, project: &Project, id: AssetId) {
     app.arrange.asset = Some(id);
     if let Some(GameAssetKind::Loop { .. }) = project.game.asset(id).map(|a| &a.kind) {
         app.inspector.target = Some(Target::Asset(id));

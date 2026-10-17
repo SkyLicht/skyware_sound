@@ -489,6 +489,9 @@ impl App {
         let shared = self.session.engine_shared();
         let master = shared.as_ref().map_or((0.0, 0.0), |s| s.master.take());
         self.mixer.master.update(master, dt);
+        self.mixer
+            .loudness
+            .update(shared.as_deref(), self.transport.playing);
         if self.mixer.meters.len() != project.tracks.len() {
             self.mixer
                 .meters

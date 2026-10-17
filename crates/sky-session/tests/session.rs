@@ -10,8 +10,8 @@ use sky_dsp::AudioData;
 use sky_io::{WavFormat, write_wav};
 use sky_model::templates::{demo_project, empty_project};
 use sky_model::{
-    Clip, ClipContent, Command, GameAsset, GameAssetKind, Origin, Project, TimeRange, Track,
-    Transaction,
+    ChannelRef, Clip, ClipContent, Command, GameAsset, GameAssetKind, Origin, Project, Target,
+    TimeRange, Track, Transaction,
 };
 use sky_session::{GameExportOptions, LoopExportOptions, Session, SessionError};
 
@@ -93,6 +93,7 @@ fn mcp_changes_show_in_the_activity_list_and_undo_from_there() {
     assert_eq!(view.activity.len(), 2);
     assert_eq!(view.activity[0].tool, "set_tempo");
     assert!(!view.activity[0].undone);
+    assert_eq!(view.activity[0].targets, vec![Target::Song]);
 
     // Undoing to the first AI change also undoes the user change after it.
     assert_eq!(session.undo_to(first).unwrap(), 3);
@@ -100,6 +101,36 @@ fn mcp_changes_show_in_the_activity_list_and_undo_from_there() {
     assert!(view.activity.iter().all(|a| a.undone));
     assert_eq!(view.project.tempo.initial_bpm(), 120.0);
     assert!(session.undo_to(first).is_err());
+}
+
+#[test]
+fn ai_activity_names_the_clips_and_effects_it_touched() {
+    let project = demo_project();
+    let clip = project.tracks[1].clips[0].id;
+    let pad = ChannelRef::Track(project.tracks[2].id);
+    let reverb = project.tracks[2].channel.effects[0].id;
+    let session = headless(project);
+    session
+        .apply(mcp(
+            "edit",
+            vec![
+                Command::SetClipName {
+                    id: clip,
+                    name: "Riff".into(),
+                },
+                Command::SetEffectEnabled {
+                    channel: pad,
+                    effect: reverb,
+                    enabled: false,
+                },
+            ],
+        ))
+        .unwrap();
+    let view = session.view();
+    assert_eq!(
+        view.activity[0].targets,
+        vec![Target::Clip(clip), Target::Effect(pad, reverb)]
+    );
 }
 
 #[test]

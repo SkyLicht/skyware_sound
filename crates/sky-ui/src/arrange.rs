@@ -166,6 +166,8 @@ pub struct ArrangeState {
     pub px_per_tick: f32,
     /// The tick at the left edge of the lanes.
     pub scroll: f64,
+    /// A track row to scroll into view on the next frame.
+    pub reveal_row: Option<usize>,
     pub snap: Snap,
     pub follow: bool,
     pub drag: Option<ClipDrag>,
@@ -204,6 +206,7 @@ impl Default for ArrangeState {
         Self {
             px_per_tick: DEFAULT_PX_PER_TICK,
             scroll: 0.0,
+            reveal_row: None,
             snap: Snap::default(),
             follow: true,
             drag: None,
@@ -256,6 +259,16 @@ impl ArrangeState {
         self.scrubbing = false;
         self.renaming = None;
         self.patterns = PatternCache::default();
+    }
+
+    /// Scrolls so `tick` is in view, a little in from the left, unless it
+    /// already is.
+    pub fn reveal_tick(&mut self, tick: Ticks) {
+        let visible = self.visible_ticks();
+        let t = tick as f64;
+        if t < self.scroll || t > self.scroll + visible * 0.9 {
+            self.scroll = (t - visible * 0.1).max(0.0);
+        }
     }
 
     /// Zooms so that `ticks` fill the visible lanes.
@@ -1050,17 +1063,22 @@ fn rows(app: &mut App, ui: &mut Ui, body: Rect, project: &Project) {
         return;
     }
     let count = project.tracks.len();
-    ScrollArea::vertical()
+    let mut area = ScrollArea::vertical()
         .id_salt("arrange_rows")
-        .auto_shrink([false, false])
-        .show_rows(&mut child, ROW_H, count, |ui, range| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for i in range {
-                if let Some(track) = project.tracks.get(i) {
-                    row(app, ui, project, track, i);
-                }
+        .auto_shrink([false, false]);
+    if let Some(row) = app.arrange.reveal_row.take() {
+        // The row in the middle of the view.
+        let offset = row as f32 * ROW_H - (body.height() - ROW_H) / 2.0;
+        area = area.vertical_scroll_offset(offset.max(0.0));
+    }
+    area.show_rows(&mut child, ROW_H, count, |ui, range| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for i in range {
+            if let Some(track) = project.tracks.get(i) {
+                row(app, ui, project, track, i);
             }
-        });
+        }
+    });
 }
 
 fn empty_state(app: &mut App, ui: &mut Ui, body: Rect) {
@@ -1572,6 +1590,7 @@ fn draw_clip(
         Stroke::new(1.0, theme::darken(color, 0.1))
     };
     p.rect_stroke(r, CornerRadius::same(3), stroke, StrokeKind::Inside);
+    crate::widgets::ai_glow(&p, r, 3, app.ai.clip_glow(clip.id, app.now));
 }
 
 #[allow(clippy::too_many_arguments)]

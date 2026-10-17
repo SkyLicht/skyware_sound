@@ -57,6 +57,12 @@ pub fn header(
         rect.y_range(),
         Stroke::new(1.0, theme::BG),
     );
+    crate::widgets::ai_glow(
+        &painter,
+        rect.shrink(1.0),
+        2,
+        app.ai.track_glow(track, app.now),
+    );
 
     let bg = ui.interact(rect, Id::new(("header", track.id)), Sense::click());
     if bg.clicked() {

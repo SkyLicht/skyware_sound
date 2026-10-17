@@ -37,7 +37,8 @@ use sky_library::{Library, LibraryError, PackSource};
 use sky_model::file::{self, Journal};
 use sky_model::{
     AudioSource, BankSample, Command, GameAsset, GameAssetKind, History, InstrumentSlot, License,
-    LicenseReport, ModelError, Origin, PoolEntry, Project, SampleBank, TrackKind, Transaction,
+    LicenseReport, ModelError, Origin, PoolEntry, Project, SampleBank, Target, TrackKind,
+    Transaction,
 };
 use thiserror::Error;
 
@@ -80,6 +81,9 @@ pub struct ActivityEntry {
     pub tool: String,
     pub label: String,
     pub undone: bool,
+    /// What the change touched, so the UI can point at it.
+    #[serde(skip)]
+    pub targets: Vec<Target>,
 }
 
 /// One step on the undo stack.
@@ -557,19 +561,34 @@ impl Session {
         let commands = tx.commands.clone();
         let seq = st.history.apply(&mut st.project, tx)?.seq;
         st.journal(&label, &commands);
-        if let Origin::Mcp { client, tool } = origin
-            && st.activity.last().is_none_or(|a| a.seq != seq)
-        {
-            st.activity.push(ActivityEntry {
-                seq,
-                time_unix_ms: now_ms(),
-                client,
-                tool,
-                label,
-                undone: false,
-            });
-            if st.activity.len() > MAX_ACTIVITY {
-                st.activity.remove(0);
+        if let Origin::Mcp { client, tool } = origin {
+            let mut targets = Vec::new();
+            for c in &commands {
+                c.targets(&mut targets);
+            }
+            match st.activity.last_mut() {
+                // A change that joined the last undo step adds to its entry.
+                Some(last) if last.seq == seq => {
+                    for t in targets {
+                        if !last.targets.contains(&t) {
+                            last.targets.push(t);
+                        }
+                    }
+                }
+                _ => {
+                    st.activity.push(ActivityEntry {
+                        seq,
+                        time_unix_ms: now_ms(),
+                        client,
+                        tool,
+                        label,
+                        undone: false,
+                        targets,
+                    });
+                    if st.activity.len() > MAX_ACTIVITY {
+                        st.activity.remove(0);
+                    }
+                }
             }
         }
         st.dirty = true;

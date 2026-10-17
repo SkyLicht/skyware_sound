@@ -32,7 +32,7 @@ use crate::waveform::Peaks;
 use crate::widgets::Gestures;
 use crate::workspace::Workspace;
 use crate::{
-    UiConfig, arrange, asset_lane, game, keys, menu, palette, pattern_editor, sounds, theme,
+    UiConfig, arrange, asset_lane, game, keys, menu, mixer, palette, pattern_editor, sounds, theme,
     velocity_lane,
 };
 
@@ -1486,6 +1486,285 @@ fn ai_changes_flash_the_indicator_and_can_be_undone() {
     h.time += 5.0;
     h.frames(1);
     assert!(!h.app.ai.flashing(h.app.now));
+}
+
+#[test]
+fn ai_changes_light_what_they_touched_and_show_it() {
+    use sky_model::ChannelRef;
+    let mut h = Harness::with_config(
+        demo_project(),
+        UiConfig {
+            mcp: Some(crate::McpInfo {
+                url: "http://127.0.0.1:7777/mcp".into(),
+                token: "secret-token".into(),
+            }),
+            ..UiConfig::default()
+        },
+    );
+    let drums = h.track_named("Drums");
+    let bass = h.track_named("Bass");
+    let pad = h.track_named("Pad");
+    let beat = drums.clips[0].id;
+    let reverb = pad.channel.effects[0].id;
+    let bass_level = |db: f32| Command::SetChannel {
+        channel: ChannelRef::Track(bass.id),
+        volume_db: Some(db),
+        pan: None,
+        mute: None,
+        solo: None,
+    };
+    // A change made here lights nothing.
+    assert!(
+        h.app
+            .session
+            .apply(Transaction::single(bass_level(-2.0)))
+            .is_ok()
+    );
+    h.frames(2);
+    assert!(h.app.ai.lit().is_empty());
+    // An assistant's changes light the clip, the strip and the effect,
+    // and the headers of the tracks they are on.
+    let changes = [
+        (
+            "Mute clip Beat",
+            "clip_set",
+            Command::SetClipMuted {
+                id: beat,
+                muted: true,
+            },
+        ),
+        ("Change Bass", "track_set", bass_level(-4.0)),
+        (
+            "Change Reverb on Pad",
+            "effect_set",
+            Command::SetEffectParam {
+                channel: ChannelRef::Track(pad.id),
+                effect: reverb,
+                param: "mix".into(),
+                value: Some(0.5),
+            },
+        ),
+    ];
+    for (label, tool, command) in changes {
+        let origin = Origin::Mcp {
+            client: "test-client".into(),
+            tool: tool.into(),
+        };
+        let tx = Transaction::new(label, origin, vec![command]);
+        assert!(h.app.session.apply(tx).is_ok());
+    }
+    h.frames(2);
+    let now = h.app.now;
+    let ai = &h.app.ai;
+    assert_eq!(ai.lit().len(), 3);
+    assert_eq!(ai.clip_glow(beat, now), 1.0);
+    assert_eq!(ai.channel_glow(ChannelRef::Track(bass.id), now), 1.0);
+    assert_eq!(ai.effect_glow(ChannelRef::Track(pad.id), reverb, now), 1.0);
+    for track in [&drums, &bass, &pad] {
+        assert_eq!(ai.track_glow(track, now), 1.0, "{}", track.name);
+    }
+    // Only the reverb changed on the pad's strip, and nothing on the master.
+    assert_eq!(ai.channel_glow(ChannelRef::Track(pad.id), now), 0.0);
+    assert_eq!(ai.channel_glow(ChannelRef::Master, now), 0.0);
+    h.every_tab();
+
+    // Show brings each change into view.
+    h.app.workspace.show(Tab::Ai);
+    h.accessible();
+    let show = |h: &mut Harness, label: &str| {
+        let row = h.find(label).unwrap_or_else(|| panic!("no row {label:?}"));
+        let button = h
+            .access
+            .iter()
+            .filter(|(l, r, _)| {
+                l == "Show" && (r.center().y - row.center().y).abs() < 8.0 && r.left() > row.right()
+            })
+            .map(|(_, r, _)| *r)
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap_or_else(|| panic!("no Show beside {label:?}"));
+        h.click(button.center());
+        h.frames(2);
+    };
+    show(&mut h, "Change Reverb on Pad");
+    assert!(h.app.workspace.is_front(Tab::Mixer));
+    assert_eq!(
+        h.app.mixer.open_effect,
+        Some((ChannelRef::Track(pad.id), reverb))
+    );
+    assert_eq!(h.app.sel.track, Some(pad.id));
+    h.app.workspace.show(Tab::Ai);
+    h.frames(3);
+    show(&mut h, "Mute clip Beat");
+    assert!(h.app.workspace.is_front(Tab::Editor));
+    assert_eq!(h.app.sel.clip, Some(beat));
+    assert_eq!(h.app.sel.clips, [beat]);
+
+    // An undone change goes dark at once; the others fade out.
+    let seq = h
+        .app
+        .view
+        .activity
+        .iter()
+        .find(|a| a.label == "Change Reverb on Pad")
+        .map(|a| a.seq)
+        .expect("the reverb change");
+    assert!(h.app.session.undo_to(seq).is_ok());
+    h.frames(2);
+    let now = h.app.now;
+    assert_eq!(
+        h.app.ai.effect_glow(ChannelRef::Track(pad.id), reverb, now),
+        0.0
+    );
+    assert_eq!(h.app.ai.clip_glow(beat, now), 1.0);
+    h.time += 5.0;
+    h.frames(1);
+    let fading = h.app.ai.clip_glow(beat, h.app.now);
+    assert!(fading > 0.0 && fading < 1.0, "{fading}");
+    h.time += 4.0;
+    h.frames(1);
+    assert!(h.app.ai.lit().is_empty());
+    assert!(!h.app.ai.flashing(h.app.now));
+}
+
+#[test]
+fn mixer_strips_line_up_and_fill_the_panel() {
+    let mut h = Harness::demo();
+    h.app.workspace.show(Tab::Mixer);
+    h.accessible();
+    // The level under each fader, and the insert slots, by strip.
+    let in_mixer = |h: &Harness, label: &str| -> Vec<Rect> {
+        let panel = h.panel_rect(Tab::Mixer);
+        let mut found: Vec<Rect> = h
+            .access
+            .iter()
+            .filter(|(l, r, role)| {
+                *role != Role::TextRun && panel.contains(r.center()) && l == label
+            })
+            .map(|(_, r, _)| *r)
+            .collect();
+        found.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        found
+    };
+    let levels = |h: &Harness| -> Vec<Rect> {
+        let panel = h.panel_rect(Tab::Mixer);
+        h.access
+            .iter()
+            .filter(|(l, r, role)| {
+                *role == Role::Label && panel.contains(r.center()) && l.ends_with(" dB")
+            })
+            .map(|(_, r, _)| *r)
+            .collect()
+    };
+    let same_row = |rects: &[Rect]| {
+        rects
+            .iter()
+            .all(|r| (r.center().y - rects[0].center().y).abs() < 1.5)
+    };
+    assert_eq!(mixer::slot_count(&h.project()), 2);
+    let before = levels(&h);
+    assert_eq!(before.len(), 4, "a level on every strip");
+    assert!(same_row(&before), "{before:?}");
+    let panel = h.panel_rect(Tab::Mixer);
+    assert!(
+        panel.bottom() - before[0].bottom() < 30.0,
+        "the faders fill the panel"
+    );
+    // Drums and Bass have no effects, Pad a reverb and the master a
+    // limiter: the first slot lines up across them.
+    let add = in_mixer(&h, "+ Effect");
+    assert_eq!(add.len(), 4);
+    let reverb = in_mixer(&h, "Reverb")[0];
+    let limiter = in_mixer(&h, "Limiter")[0];
+    assert!(
+        same_row(&[add[0], add[1], reverb, limiter]),
+        "{add:?} {reverb:?} {limiter:?}"
+    );
+    assert!(same_row(&[add[2], add[3]]));
+    assert!(add[2].top() > reverb.bottom());
+
+    // A third effect on one strip adds a slot to all of them; the levels
+    // stay put and the faders get shorter.
+    let drums = h.track_named("Drums").id;
+    for kind in [sky_dsp::EffectType::Delay, sky_dsp::EffectType::Reverb] {
+        h.app
+            .report(actions::add_effect(
+                &h.app.session,
+                sky_model::ChannelRef::Track(drums),
+                kind,
+            ))
+            .unwrap();
+    }
+    h.frames(3);
+    assert_eq!(mixer::slot_count(&h.project()), 3);
+    let after = levels(&h);
+    assert!(same_row(&after), "{after:?}");
+    assert_eq!(after[0].top(), before[0].top());
+    // Drums now has its "+ Effect" in the third slot, Bass in the first,
+    // Pad and the master in the second.
+    let add = in_mixer(&h, "+ Effect");
+    assert!(same_row(&add[2..]), "{add:?}");
+    assert!(add[0].top() > add[2].top() && add[2].top() > add[1].top());
+
+    // A taller window gives the faders the room.
+    h.screen = Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 1200.0));
+    h.frames(3);
+    let taller = levels(&h);
+    assert!(same_row(&taller));
+    assert!(taller[0].top() > after[0].top() + 100.0);
+    let panel = h.panel_rect(Tab::Mixer);
+    assert!(panel.bottom() - taller[0].bottom() < 30.0);
+}
+
+#[test]
+fn the_master_measures_loudness_while_playing() {
+    let mut h = Harness::with_engine(demo_project());
+    h.app.workspace.show(Tab::Mixer);
+    h.accessible();
+    let st = |h: &Harness| {
+        let l = &h.app.mixer.loudness;
+        (l.meter.momentary(), l.meter.integrated(), l.true_peak)
+    };
+    assert_eq!(st(&h), (None, None, 0.0));
+    assert!(h.find("LUFS").is_some() && h.find("dBTP").is_some());
+    h.run(Action::PlayStop);
+    // Two seconds of the song.
+    for _ in 0..40 {
+        h.heard();
+    }
+    h.frames(2);
+    let (momentary, integrated, true_peak) = st(&h);
+    assert!(momentary.is_some());
+    let integrated = integrated.expect("integrated loudness");
+    assert!((-30.0..-8.0).contains(&integrated), "{integrated}");
+    assert!(true_peak > 0.25, "{true_peak}");
+    assert!(h.find(&format!("{integrated:.1}")).is_some(), "the readout");
+    // Stopped, the integrated loudness and the peak stay.
+    h.run(Action::PlayStop);
+    for _ in 0..40 {
+        h.heard();
+    }
+    h.frames(2);
+    let (momentary, still, peak) = st(&h);
+    assert!(
+        momentary.is_none_or(|m| m < -40.0),
+        "only the reverb's tail: {momentary:?}"
+    );
+    assert_eq!(still, Some(integrated));
+    assert_eq!(peak, true_peak);
+    // Reset starts them again.
+    h.click_in(Tab::Mixer, "Reset");
+    let (_, integrated, peak) = st(&h);
+    assert_eq!((integrated, peak), (None, 0.0));
+    // So does pressing play.
+    h.app.mixer.loudness.true_peak = 4.0;
+    h.run(Action::PlayStop);
+    for _ in 0..10 {
+        h.heard();
+    }
+    h.frames(2);
+    let (_, again, peak) = st(&h);
+    assert!(again.is_some());
+    assert!(peak > 0.0 && peak < 4.0, "{peak}");
 }
 
 #[test]

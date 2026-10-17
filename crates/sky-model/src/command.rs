@@ -20,11 +20,29 @@ use crate::project::*;
 use crate::steps::StepClip;
 
 /// A mixer channel: the master or a track's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChannelRef {
     Master,
     Track(TrackId),
+}
+
+/// Something in a project a command changes, so it can be pointed at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Target {
+    /// The name, tempo, metre, key, loop or game export settings.
+    Song,
+    Marker(MarkerId),
+    /// A track's name, color or place.
+    Track(TrackId),
+    /// A track's instrument or one of its settings.
+    Instrument(TrackId),
+    /// A channel's level, pan, mute or solo, or which effects it has.
+    Channel(ChannelRef),
+    Effect(ChannelRef, EffectId),
+    Clip(ClipId),
+    Audio(AudioId),
+    Asset(AssetId),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -629,6 +647,83 @@ fn game_asset_index(project: &Project, id: AssetId) -> Result<usize, ModelError>
 }
 
 impl Command {
+    /// Adds what this command changes to `out`. What it removes is left
+    /// out, as there is nothing left to point at, except a channel that
+    /// loses an effect.
+    pub fn targets(&self, out: &mut Vec<Target>) {
+        use Command as C;
+        let mut add = |t: Target| {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        };
+        match self {
+            C::SetProjectName { .. }
+            | C::SetTempo { .. }
+            | C::SetTempoMap { .. }
+            | C::SetTimeSignature { .. }
+            | C::SetScale { .. }
+            | C::SetLoopRegion { .. }
+            | C::SetLoopEnabled { .. }
+            | C::SetGameExport { .. } => add(Target::Song),
+            C::AddMarker { marker } => add(Target::Marker(marker.id)),
+            C::RemoveMarker { .. }
+            | C::RemoveTrack { .. }
+            | C::RemoveClip { .. }
+            | C::RemovePoolAudio { .. }
+            | C::RemoveGameAsset { .. } => {}
+            C::AddTrack { track, .. } => {
+                add(Target::Track(track.id));
+                for clip in &track.clips {
+                    add(Target::Clip(clip.id));
+                }
+            }
+            C::MoveTrack { id, .. } | C::SetTrackName { id, .. } | C::SetTrackColor { id, .. } => {
+                add(Target::Track(*id));
+            }
+            C::SetChannel { channel, .. } | C::RemoveEffect { channel, .. } => {
+                add(Target::Channel(*channel));
+            }
+            C::SetInstrument { track, .. } | C::SetInstrumentParam { track, .. } => {
+                add(Target::Instrument(*track));
+            }
+            C::AddEffect {
+                channel, effect, ..
+            } => add(Target::Effect(*channel, effect.id)),
+            C::MoveEffect { channel, id, .. }
+            | C::SetEffectParam {
+                channel,
+                effect: id,
+                ..
+            }
+            | C::SetEffectEnabled {
+                channel,
+                effect: id,
+                ..
+            }
+            | C::SetEffectSidechain {
+                channel,
+                effect: id,
+                ..
+            } => add(Target::Effect(*channel, *id)),
+            C::AddClip { clip, .. } => add(Target::Clip(clip.id)),
+            C::MoveClip { id, .. }
+            | C::SetClipLength { id, .. }
+            | C::SetClipName { id, .. }
+            | C::SetClipMuted { id, .. }
+            | C::SetAudioClip { id, .. }
+            | C::AddNotes { clip: id, .. }
+            | C::RemoveNotes { clip: id, .. }
+            | C::UpdateNotes { clip: id, .. }
+            | C::SetPattern { clip: id, .. }
+            | C::SetSteps { clip: id, .. } => add(Target::Clip(*id)),
+            C::AddPoolAudio { entry, .. } => add(Target::Audio(entry.id)),
+            C::AddGameAsset { asset, .. } | C::UpdateGameAsset { asset } => {
+                add(Target::Asset(asset.id));
+            }
+        }
+    }
+
     /// A short description for history lists.
     pub fn describe(&self) -> &'static str {
         match self {

@@ -386,6 +386,22 @@ pub fn meter(ui: &mut Ui, level: &MeterLevel, size: Vec2) -> Response {
     })
 }
 
+/// Marks something an AI assistant just changed; `glow` runs from 1 when
+/// it changed down to 0.
+pub fn ai_glow(painter: &Painter, rect: Rect, radius: u8, glow: f32) {
+    if glow <= 0.0 {
+        return;
+    }
+    let r = CornerRadius::same(radius);
+    painter.rect_filled(rect, r, theme::AI.gamma_multiply(0.18 * glow));
+    painter.rect_stroke(
+        rect,
+        r,
+        Stroke::new(2.0, theme::AI.gamma_multiply(glow)),
+        StrokeKind::Inside,
+    );
+}
+
 /// A small toggle button that lights up in `on_color` when active.
 pub fn toggle(ui: &mut Ui, on: bool, text: &str, on_color: Color32, tip: &str) -> Response {
     let rich = egui::RichText::new(text).strong().color(if on {
