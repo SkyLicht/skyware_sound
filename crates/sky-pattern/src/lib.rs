@@ -243,6 +243,32 @@ impl Pattern {
         &self.source
     }
 
+    /// Every atom of the pattern and where it is in the text, in text
+    /// order, including atoms that may never play (such as one behind `?`).
+    ///
+    /// ```
+    /// use sky_pattern::Value;
+    ///
+    /// let pattern = sky_pattern::parse("bd*2 <sd cp?>, [hh c4]").unwrap();
+    /// let sounds: Vec<&str> = pattern
+    ///     .atoms()
+    ///     .into_iter()
+    ///     .filter_map(|(v, _)| match v {
+    ///         Value::Sound { name, .. } => Some(name.as_str()),
+    ///         _ => None,
+    ///     })
+    ///     .collect();
+    /// assert_eq!(sounds, ["bd", "sd", "cp", "hh"]);
+    /// ```
+    pub fn atoms(&self) -> Vec<(&Value, Span)> {
+        let mut out = Vec::new();
+        self.root
+            .atoms(&mut std::collections::HashSet::new(), &mut out);
+        out.sort_by_key(|(_, s)| (s.start, s.end));
+        out.dedup_by_key(|(_, s)| *s);
+        out
+    }
+
     /// All events whose onset `begin` lies in `[from, to)`, sorted by `begin`,
     /// then by `source.start`. Random choices depend only on `seed`, so the same
     /// query always gives the same answer.

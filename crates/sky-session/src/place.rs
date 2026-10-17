@@ -407,6 +407,7 @@ fn place_commands(
                     .map_or_else(|| t.name.clone(), |s| s.pack.clone()),
                 sounds: Default::default(),
                 pitched: None,
+                packs: Vec::new(),
             });
             let variations = bank.sounds.entry(sound.to_string()).or_default();
             variations.push(BankSample {

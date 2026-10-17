@@ -65,6 +65,27 @@ fn combine(nodes: &[Arc<Node>], op: fn(Bounds, Bounds) -> Bounds) -> Bounds {
 }
 
 impl Node {
+    /// Pushes every atom under this node. A node shared by several places,
+    /// as `x!100` shares `x`, is visited once.
+    pub fn atoms<'a>(
+        &'a self,
+        seen: &mut std::collections::HashSet<*const Node>,
+        out: &mut Vec<(&'a Value, Span)>,
+    ) {
+        if !seen.insert(self as *const Node) {
+            return;
+        }
+        match &self.kind {
+            Kind::Silence => {}
+            Kind::Atom { value, span } => out.push((value, *span)),
+            Kind::Seq(slots) => slots.iter().for_each(|s| s.node.atoms(seen, out)),
+            Kind::Stack(nodes) | Kind::Choice { alts: nodes, .. } => {
+                nodes.iter().for_each(|n| n.atoms(seen, out));
+            }
+            Kind::Fast { node, .. } | Kind::Degrade { node, .. } => node.atoms(seen, out),
+        }
+    }
+
     pub fn silence() -> Arc<Node> {
         new(Kind::Silence, Bounds::SILENT)
     }

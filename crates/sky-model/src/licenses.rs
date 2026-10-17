@@ -141,6 +141,7 @@ mod tests {
             name: name.into(),
             sounds,
             pitched: None,
+            packs: Vec::new(),
         });
         t.clips.push(Clip {
             id: sky_core::ClipId::new(),

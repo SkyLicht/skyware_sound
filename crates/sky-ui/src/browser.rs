@@ -325,6 +325,17 @@ impl BrowserState {
         }
     }
 
+    /// True once a pack's map has been asked for, whether it was read or
+    /// not.
+    pub fn pack_asked(&self, map: &str) -> bool {
+        self.packs.contains_key(map)
+    }
+
+    /// True when reading a pack's map failed.
+    pub fn pack_failed(&self, map: &str) -> bool {
+        matches!(self.packs.get(map), Some(Reading::Failed(_)))
+    }
+
     /// The first file of a pack's sound, with the pack, once it is read.
     pub fn pack_file(
         &self,
@@ -569,12 +580,18 @@ impl App {
 
     /// Reads a pack's sample map in the background, for the browser.
     pub fn read_browser_pack(&mut self, ctx: &Context, info: &PackInfo) {
-        let map = info.map.to_string();
+        self.read_pack_listing(ctx, PackSource::from(info));
+    }
+
+    /// Reads a pack's sample map in the background, kept by its address
+    /// for the browser and for completing the names of linked packs.
+    pub fn read_pack_listing(&mut self, ctx: &Context, source: PackSource) {
+        let map = source.map.clone();
         self.browser.packs.insert(map.clone(), Reading::Busy);
         let library = self.session.library();
-        let source = PackSource::from(info);
+        let name = source.name.clone();
         self.jobs
-            .spawn(ctx, Some(format!("Reading {}", info.name)), move || {
+            .spawn(ctx, Some(format!("Reading {name}")), move || {
                 JobOutput::BrowserPack {
                     result: library
                         .open(&source)

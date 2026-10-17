@@ -23,9 +23,11 @@ use thiserror::Error;
 
 pub mod map;
 pub mod packs;
+pub mod samples;
 
 pub use map::{MapFile, SampleMap, expand_github};
 pub use packs::{PACKS, PackInfo};
+pub use samples::{CallError, Samples, SamplesCall, find_samples};
 
 /// The most files one load may fetch. A bank of a drum machine is around a
 /// hundred; asking for a whole large pack at once is almost always a mistake.
