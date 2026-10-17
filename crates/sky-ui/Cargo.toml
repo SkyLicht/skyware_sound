@@ -36,6 +36,11 @@ serde_json.workspace = true
 # Native file dialogs. The portal backend talks to the desktop through a
 # runtime-loaded libdbus (falling back to zenity), so no GTK is needed to build.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# Reads the images people pick for pictures and shrinks them to keep in a
+# project; only the formats a picture can be made from.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+# Paste picture: an image or an image file copied in another app.
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 # eframe without default features leaves out winit's runtime-loaded Wayland

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Track headers: name, color, mute, solo and volume, left of each lane.
+//! Track headers: picture, name, mute, solo and volume, left of each lane.
+//! The picture opens the picture editor, which also sets the track's color.
 
 use egui::{
     Align, CornerRadius, Id, Key, Layout, Rect, RichText, Sense, Stroke, TextEdit, Ui, UiBuilder,
@@ -9,6 +10,7 @@ use sky_model::{ChannelRef, Project, Track, TrackKind};
 
 use crate::actions::{self, ChannelChange};
 use crate::app::{App, Tab};
+use crate::pictures::{self, Style, Target};
 use crate::theme;
 use crate::widgets::{self, FADER_FLOOR_DB, SILENT_DB};
 
@@ -74,8 +76,28 @@ pub fn header(
     }
     bg.context_menu(|ui| header_menu(app, ui, project, track, index));
 
+    let side = (rect.height() - 20.0).clamp(24.0, 44.0);
+    let pic = Rect::from_min_size(
+        pos2(rect.left() + 11.0, rect.center().y - side / 2.0),
+        vec2(side, side),
+    );
+    let shown = app.pictures.track_shown(project, track);
+    let in_header = ui.rect_contains_pointer(rect);
+    pictures::button(
+        app,
+        ui,
+        "header",
+        pic,
+        (side * 0.18).round(),
+        &shown,
+        Target::Track(track.id),
+        Style::Tile,
+        in_header,
+    )
+    .context_menu(|ui| header_menu(app, ui, project, track, index));
+
     let inner = Rect::from_min_max(
-        pos2(rect.left() + 12.0, rect.top() + 6.0),
+        pos2(pic.right() + 8.0, rect.top() + 6.0),
         pos2(rect.right() - 8.0, rect.bottom() - 5.0),
     );
     let mut child = ui.new_child(
@@ -90,16 +112,6 @@ pub fn header(
 
 fn first_row(app: &mut App, ui: &mut Ui, track: &Track) {
     ui.horizontal(|ui| {
-        let mut rgb = track.color;
-        let r = ui
-            .color_edit_button_srgb(&mut rgb)
-            .on_hover_text("Track color");
-        if r.changed() && rgb != track.color {
-            let key = app.gestures.key(r.id);
-            let res = actions::set_track_color(&app.session, track.id, rgb, Some(key));
-            app.report(res);
-        }
-
         let renaming = app
             .arrange
             .renaming
@@ -137,7 +149,15 @@ fn first_row(app: &mut App, ui: &mut Ui, track: &Track) {
                 .sense(Sense::click());
             let width = (ui.available_width() - buttons_w).max(30.0);
             let resp = ui
-                .add_sized([width, 18.0], name)
+                .allocate_ui_with_layout(
+                    vec2(width, 18.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_min_width(width);
+                        ui.add(name)
+                    },
+                )
+                .inner
                 .on_hover_text("Double-click to rename");
             if resp.clicked() {
                 app.sel.select_track(track.id);
@@ -179,16 +199,8 @@ fn first_row(app: &mut App, ui: &mut Ui, track: &Track) {
 
 fn second_row(app: &mut App, ui: &mut Ui, track: &Track) {
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [52.0, 18.0],
-            egui::Label::new(
-                RichText::new(kind_label(track))
-                    .small()
-                    .color(theme::TEXT_WEAK),
-            )
-            .truncate(),
-        );
-        ui.spacing_mut().slider_width = (ui.available_width() - 64.0).max(40.0);
+        // The picture shows what the track plays, so the volume gets the row.
+        ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(36.0);
         let db = track.channel.volume_db;
         let mut v = if db <= FADER_FLOOR_DB {
             FADER_FLOOR_DB - 1.0
@@ -249,6 +261,9 @@ fn header_menu(app: &mut App, ui: &mut Ui, project: &Project, track: &Track, ind
         app.sel.select_track(track.id);
         app.workspace.show(Tab::Instrument);
     }
+    ui.separator();
+    let at = ui.min_rect().right_top();
+    app.picture_menu(ui, &Target::Track(track.id), at);
     ui.separator();
     if ui
         .add_enabled(index > 0, egui::Button::new("Move up"))

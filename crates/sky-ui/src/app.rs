@@ -32,6 +32,7 @@ use crate::mixer::MixerState;
 use crate::palette::PaletteState;
 use crate::pattern_editor::PatternState;
 use crate::piano_roll::PianoState;
+use crate::pictures::{PictureState, PictureStore};
 use crate::presets::{PresetState, PresetStore};
 use crate::ruler_lanes::Lane;
 use crate::step_editor::StepState;
@@ -247,6 +248,8 @@ pub struct App {
     pub gestures: Gestures,
     pub devices: DeviceState,
     pub presets: PresetState,
+    /// Pictures of tracks, packs, banks and folders, and their editor.
+    pub pictures: PictureState,
     pub waveforms: WaveformCache,
     /// The panels, where they are, and the recent projects.
     pub workspace: Workspace,
@@ -301,6 +304,7 @@ impl App {
                 store: PresetStore::load(config.preset_store),
                 naming: None,
             },
+            pictures: PictureState::new(PictureStore::load(config.picture_store)),
             waveforms: WaveformCache::default(),
             workspace: Workspace::default(),
             about: false,
@@ -411,6 +415,7 @@ impl App {
         keys::window(self, &ctx);
         crate::dialogs::show(self, &ctx);
         crate::palette::show(self, &ctx);
+        crate::picture_editor::show(self, &ctx);
         crate::browser::overlays(self, &ctx);
         self.end_frame(&ctx);
     }
@@ -422,6 +427,11 @@ impl App {
             ctx.options_mut(|o| o.zoom_with_keyboard = false);
         }
         self.gestures.begin_frame(ctx);
+        self.pictures.begin_frame();
+        if self.pictures.waiting.is_some() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.pictures.waiting = None;
+            self.info("The dropped image was not used");
+        }
         for out in self.jobs.poll() {
             self.handle_job(ctx, out);
         }
@@ -478,6 +488,15 @@ impl App {
     }
 
     fn end_frame(&mut self, ctx: &Context) {
+        self.commit_picture_preview(ctx);
+        self.pictures.images.end_frame();
+        // Written once a drag that changes a picture is over.
+        if self.pictures.store.is_dirty()
+            && !ctx.input(|i| i.pointer.any_down())
+            && let Err(e) = self.pictures.store.flush()
+        {
+            self.error(e);
+        }
         let fast = self.transport.playing
             || self.arrange.gesture()
             || self.piano.gesture()
@@ -855,6 +874,8 @@ impl App {
             JobOutput::PackListed { map, result } => self.pack_listed(map, result),
             JobOutput::BankLoaded(result) => self.bank_loaded(result),
             JobOutput::Previewed { key, result } => self.preview_ready(key, result),
+            JobOutput::PictureLoaded { target, result } => self.picture_loaded(target, result),
+            JobOutput::CoverFound { key, cover } => self.cover_found(key, cover),
             JobOutput::SeamChecked {
                 target,
                 revision,

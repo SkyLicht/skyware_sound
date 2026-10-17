@@ -435,6 +435,7 @@ fn run_app(
         browser_store: config::browser_folders_file(),
         layout_store: config::layout_file(),
         preset_store: config::presets_file(),
+        picture_store: config::pictures_file(),
     };
     let result = sky_ui::run(session, config);
     if let Some((srv, _)) = server {
