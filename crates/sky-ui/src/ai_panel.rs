@@ -303,7 +303,7 @@ pub fn reveal(app: &mut App, targets: &[Target]) {
                 app.sel.select_track(track);
                 app.arrange.reveal_row = row_of(track);
             }
-            app.mixer.open_effect = Some((channel, id));
+            app.mixer.open_effect((channel, id));
             app.workspace.show(Tab::Mixer);
         }
         Target::Channel(channel) => {

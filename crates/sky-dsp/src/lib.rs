@@ -15,12 +15,14 @@ pub mod filters;
 pub mod instruments;
 pub mod loudness;
 pub mod params;
+pub mod presets;
 pub mod util;
 
 pub use audio::AudioData;
 pub use effects::{Effect, EffectType};
 pub use instruments::{Instrument, InstrumentAudio, InstrumentType};
 pub use params::{ParamKind, ParamSpec};
+pub use presets::Preset;
 
 /// The largest block any processor is asked to handle at once. Callers split
 /// longer device buffers into chunks of at most this size.
