@@ -141,6 +141,7 @@ fn processing_never_allocates() {
         muted: false,
         content: pattern,
     });
+    let piano_id = piano.id;
     project.tracks.push(piano);
     let compile = |project: &sky_model::Project, cache: &AudioCache, sr: u32, version: u64| {
         compile_with(project, cache, &libraries, sr, version)
@@ -170,6 +171,18 @@ fn processing_never_allocates() {
             25 => handle.send(EngineMsg::NoteOff {
                 track: synth,
                 pitch: 72,
+            }),
+            // The pedal held while keys are played to hear them.
+            26 => handle.send(EngineMsg::Controller {
+                track: piano_id,
+                controller: sky_dsp::SUSTAIN_PEDAL,
+                value: 127,
+            }),
+            27 => handle.send(EngineMsg::NoteOn {
+                track: piano_id,
+                pitch: 40,
+                velocity: 90,
+                frames: Some(500),
             }),
             30 => handle.send(EngineMsg::SoundOn {
                 track: bank_id,

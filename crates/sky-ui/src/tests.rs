@@ -2646,12 +2646,14 @@ fn the_piano_loads_plays_and_switches_from_the_instrument_tab() {
     }
     h.frames(3);
     h.quiet();
-    let keys = h.rect_of(crate::audition::keyboard_id(piano.id));
+    let keys = h.rect_of(crate::piano::keys_id(piano.id));
     let at = keys.left_bottom() + vec2(keys.width() / 2.0, -4.0);
     h.move_to(at);
     h.pointer(at, true);
     h.frame();
     assert!(h.heard() > 0.01);
+    let (held, _) = h.app.session.held_keys(piano.id);
+    assert_eq!(held.count_ones(), 1, "the key pressed lights up");
     h.pointer(at, false);
     h.frame();
 
@@ -2670,6 +2672,194 @@ fn the_piano_loads_plays_and_switches_from_the_instrument_tab() {
     h.app.piano_library_set(Err("no network".into()));
     assert!(h.app.notice.as_ref().is_some_and(|n| n.error));
     h.every_tab();
+}
+
+/// A project with a piano track, its built-in recordings loaded, open
+/// in the Instrument tab.
+fn piano_open(engine: bool) -> (Harness, TrackId) {
+    let mut project = demo_project();
+    project
+        .tracks
+        .push(Track::new_instrument("Piano", InstrumentType::Piano));
+    let mut h = if engine {
+        Harness::with_engine(project)
+    } else {
+        Harness::with_project(project)
+    };
+    let piano = h.track_named("Piano").id;
+    h.app.sel.select_track(piano);
+    h.app.workspace.show(Tab::Instrument);
+    h.app.session.load_libraries().expect("the built-in piano");
+    h.frames(3);
+    (h, piano)
+}
+
+#[test]
+fn the_piano_map_plays_the_layer_under_the_pointer_and_lights_the_pedal() {
+    let (mut h, piano) = piano_open(true);
+    h.quiet();
+    let map = h.rect_of(crate::piano::map_id(piano));
+    // Middle C is key 39 of the 88, near the top of the map: loud.
+    let col = map.width() / 88.0;
+    let c4 = pos2(map.left() + (60.0 - 21.0 + 0.5) * col, map.top() + 4.0);
+    h.move_to(c4);
+    h.pointer(c4, true);
+    h.frame();
+    assert_eq!(h.app.audition.held, Some((piano, 60)));
+    let loud = h.heard();
+    assert!(loud > 0.01, "{loud}");
+    assert_eq!(h.app.session.held_keys(piano), (1 << 60, false));
+    h.pointer(c4, false);
+    h.frame();
+    h.quiet();
+    assert_eq!(h.app.session.held_keys(piano), (0, false));
+    // Lower on the map plays softer.
+    let soft_at = pos2(c4.x, map.bottom() - 6.0);
+    h.move_to(soft_at);
+    h.pointer(soft_at, true);
+    h.frame();
+    let soft = h.heard();
+    assert!(soft < loud * 0.5, "{soft} vs {loud}");
+    h.pointer(soft_at, false);
+    h.frame();
+    h.quiet();
+
+    // The pedal light holds the pedal, which holds the key let go.
+    h.accessible();
+    let panel = h.panel_rect(Tab::Instrument);
+    assert!(panel.contains_rect(map), "{map:?} is in {panel:?}");
+    h.click_role("Pedal", Some(Role::Button));
+    h.heard();
+    assert_eq!(h.app.session.held_keys(piano), (0, true));
+    h.move_to(c4);
+    h.pointer(c4, true);
+    h.frame();
+    h.heard();
+    h.pointer(c4, false);
+    h.frame();
+    h.heard();
+    h.frame();
+    assert_eq!(h.app.audition.held, None);
+    assert_eq!(h.app.session.held_keys(piano), (1 << 60, true));
+    assert!(h.heard() > 0.01, "the pedal keeps it ringing");
+    h.click_role("Pedal", Some(Role::Button));
+    h.heard();
+    assert_eq!(h.app.session.held_keys(piano), (0, false));
+    // Stopping lets go of the pedal too.
+    h.click_role("Pedal", Some(Role::Button));
+    h.heard();
+    h.run(Action::PlayStop);
+    h.heard();
+    h.frame();
+    assert!(h.app.session.held_keys(piano).1, "playing keeps it down");
+    h.run(Action::PlayStop);
+    h.heard();
+    assert!(!h.app.session.held_keys(piano).1);
+    h.every_tab();
+}
+
+#[test]
+fn the_velocity_and_tone_handles_bend_the_piano() {
+    let (mut h, piano) = piano_open(false);
+    // A taller window, for the graphs under the keys to be in view.
+    h.screen = Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 1500.0));
+    h.frames(3);
+    let history = h.history_len();
+    let handle = h.rect_of(inst_view::handle_id(piano, "vel_curve")).center();
+    h.drag(handle, handle + vec2(0.0, -30.0));
+    let curve = instrument_param(&h, piano, "vel_curve");
+    assert!(curve > 0.2, "up is a lighter touch: {curve}");
+    assert_eq!(h.history_len(), history + 1, "one drag is one undo step");
+    let handle = h.rect_of(inst_view::handle_id(piano, "tone")).center();
+    h.drag(handle, handle + vec2(0.0, 40.0));
+    let tone = instrument_param(&h, piano, "tone");
+    assert!(tone < -4.0, "down is darker: {tone}");
+    // The handle sits where the piano's tilt puts the highs.
+    h.frames(2);
+    let plot_mid = h.rect_of(inst_view::handle_id(piano, "tone")).center();
+    let drawn = sky_dsp::curves::tone_tilt_db(tone, 8_000.0);
+    assert!(drawn < -2.0 && plot_mid.y > handle.y, "{drawn}");
+    h.double_click(plot_mid);
+    assert!(
+        h.track_named("Piano")
+            .instrument
+            .unwrap()
+            .param("tone")
+            .is_none_or(|t| t == 0.0)
+    );
+}
+
+#[test]
+fn the_piano_shows_its_license_and_how_its_download_goes() {
+    let (mut h, piano) = piano_open(false);
+    h.accessible();
+    h.frames(2);
+    assert!(h.find("CC0").is_some(), "the license badge");
+    let total = 33_294_287;
+    h.app.devices.download = Some(crate::piano::Download {
+        track: piano,
+        name: "Upright Piano KW",
+        done: Arc::new(std::sync::atomic::AtomicU64::new(10_000_000)),
+        total: Arc::new(std::sync::atomic::AtomicU64::new(total)),
+    });
+    h.frames(2);
+    assert!(
+        h.find("Downloading Upright Piano KW: 10.0 of 33.3 MB")
+            .is_some(),
+        "the progress bar"
+    );
+    // The list names each piano with its license and where it comes from.
+    h.click_label("Upright Piano KW (small)");
+    h.frames(3);
+    assert!(
+        h.find("Upright Piano KW (small)   CC0   built in")
+            .is_some()
+    );
+    assert!(
+        h.find("Upright Piano KW   CC0   33 MB download").is_some()
+            || h.find("Upright Piano KW   CC0   downloaded").is_some()
+    );
+    h.key(Key::Escape, Modifiers::NONE);
+    // Done or failed, the bar goes.
+    h.app.piano_library_set(Err("no network".into()));
+    assert!(h.app.devices.download.is_none());
+}
+
+#[test]
+fn the_piano_has_five_presets_to_compare_with_a_and_b() {
+    let (mut h, piano) = piano_open(false);
+    let names: Vec<&str> = InstrumentType::Piano
+        .presets()
+        .iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(names, ["Concert", "Soft", "Bright pop", "Felt", "Lo-fi"]);
+    h.accessible();
+    pick_preset(&mut h, "Default", "Felt");
+    let felt = &InstrumentType::Piano.presets()[3];
+    for spec in InstrumentType::Piano.params() {
+        let now = h
+            .track_named("Piano")
+            .instrument
+            .and_then(|i| i.param(spec.name))
+            .unwrap_or(spec.default);
+        assert_eq!(
+            now,
+            felt.value(spec.name).unwrap_or(spec.default),
+            "{}",
+            spec.name
+        );
+    }
+    // B starts as Felt; brighten it, then go back to A.
+    h.click_label("B");
+    h.frames(2);
+    let r = actions::set_instrument_param(&h.app.session, piano, "tone", Some(6.0), None);
+    h.app.report(r).unwrap();
+    h.frames(2);
+    h.click_label("A");
+    h.frames(2);
+    assert_eq!(instrument_param(&h, piano, "tone"), -9.0);
+    assert!(h.find("Felt").is_some());
 }
 
 #[test]

@@ -893,6 +893,34 @@ impl Session {
         })
     }
 
+    /// Moves a controller of a track's instrument to `value` (0-127) now,
+    /// such as the [`SUSTAIN_PEDAL`](sky_dsp::SUSTAIN_PEDAL) while keys
+    /// are played to hear them. Changes nothing in the project.
+    pub fn controller(
+        &self,
+        track: TrackId,
+        controller: u8,
+        value: u8,
+    ) -> Result<(), SessionError> {
+        self.instrument_track(track)?;
+        self.engine_rate()?;
+        self.send(EngineMsg::Controller {
+            track,
+            controller: controller.min(127),
+            value: value.min(127),
+        })
+    }
+
+    /// The keys a track's instrument holds now, one bit per key, and
+    /// whether its sustain pedal is down. Nothing without an engine.
+    pub fn held_keys(&self, track: TrackId) -> (u128, bool) {
+        let index = self.project().tracks.iter().position(|t| t.id == track);
+        self.engine_shared()
+            .zip(index)
+            .and_then(|(shared, i)| shared.track_keys(i).map(|tap| (tap.keys(), tap.pedal())))
+            .unwrap_or((0, false))
+    }
+
     /// Plays variation `variation` of a sound of a track's sample bank, as
     /// a pattern's `name:variation` would, whether or not the transport
     /// runs. Changes nothing in the project.

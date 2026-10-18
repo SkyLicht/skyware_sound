@@ -22,7 +22,7 @@ pub use acid::{ACCENT_THRESHOLD, Acid, ENV_OCTAVES as ACID_ENV_OCTAVES};
 pub use bank::{Bank, BankMap, KeyZone};
 pub use drums::DrumKit;
 pub use envelope::Adsr;
-pub use piano::Piano;
+pub use piano::{Piano, UNDAMPED_FROM as PIANO_UNDAMPED_FROM};
 pub use sampled::{SampleData, SampleLibrary, Zone};
 pub use sampler::Sampler;
 pub use synth::Synth;
@@ -42,6 +42,16 @@ pub trait Instrument: Send + 'static {
     /// A MIDI controller moved to `value` (0-127), such as the
     /// [`SUSTAIN_PEDAL`], down from 64. Instruments without one ignore it.
     fn controller(&mut self, _controller: u8, _value: u8) {}
+    /// Whether the sustain pedal is down, for an editor's pedal light.
+    fn pedal_down(&self) -> bool {
+        false
+    }
+    /// The keys held down, or held by the pedal, one bit per key from bit
+    /// 0, for an editor to light them. Instruments that do not keep track
+    /// say none.
+    fn held_keys(&self) -> u128 {
+        0
+    }
     /// Releases every held note, letting release tails ring out.
     fn all_notes_off(&mut self);
     /// Silences everything immediately.

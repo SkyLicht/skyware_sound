@@ -184,6 +184,19 @@ impl Session {
         download: bool,
         origin: Origin,
     ) -> Result<LibrarySet, SessionError> {
+        self.set_piano_library_reporting(track, name, download, origin, &mut |_, _| {})
+    }
+
+    /// [`set_piano_library`](Self::set_piano_library), reporting the bytes
+    /// downloaded and the total while a download runs.
+    pub fn set_piano_library_reporting(
+        &self,
+        track: TrackId,
+        name: &str,
+        download: bool,
+        origin: Origin,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<LibrarySet, SessionError> {
         let info = known(name)?;
         if info.kind != InstrumentType::Piano {
             return Err(SessionError::Invalid(format!(
@@ -204,7 +217,7 @@ impl Session {
                     info.size as f64 / 1e6
                 )));
             }
-            instruments.install(info, &mut |_, _| {})?;
+            instruments.install(info, progress)?;
         }
         // The built-in piano is what a slot without a library plays.
         let reference = (!info.is_bundled()).then(|| info.reference());
