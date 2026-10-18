@@ -8,8 +8,10 @@
 
 use std::cmp::{max, min};
 
-use crate::ast::{Kind, Node, Q};
-use crate::{Event, Time};
+use crate::ast::{Kind, MAX_LAYERS, Node, Q};
+use crate::controls::Controls;
+use crate::ops::{Arg, apply, f64_of, q_of};
+use crate::{Event, Time, Value};
 
 /// Queries are clamped to ±2^31 cycles (about 136 years of 2-second bars).
 const LIMIT: i128 = 1 << 31;
@@ -32,6 +34,15 @@ impl Frame {
     fn to_absolute(self, t: Q) -> Q {
         t * self.scale + self.offset
     }
+
+    fn to_local(self, t: Q) -> Q {
+        (t - self.offset) / self.scale
+    }
+}
+
+/// An event time inside the walk's arithmetic.
+fn q(t: Time) -> Q {
+    Q::new_raw(i128::from(*t.numer()), i128::from(*t.denom()))
 }
 
 /// A query bound as used by the walk.
@@ -54,7 +65,7 @@ pub(crate) fn bound_from_f64(cycles: f64) -> Q {
 
 /// Converts an event time back to the public type. The complexity limit
 /// guarantees it fits; the fallback only avoids a panic.
-fn to_time(q: Q) -> Time {
+pub(crate) fn to_time(q: Q) -> Time {
     match (i64::try_from(*q.numer()), i64::try_from(*q.denom())) {
         (Ok(numer), Ok(denom)) => Time::new_raw(numer, denom),
         _ => {
@@ -103,7 +114,11 @@ fn words(q: Q) -> [u64; 4] {
 fn walk(node: &Node, from: Q, to: Q, frame: Frame, seed: u64, out: &mut Vec<Event>) {
     match &node.kind {
         Kind::Silence => {}
-        Kind::Atom { value, span } => {
+        Kind::Atom {
+            value,
+            span,
+            controls,
+        } => {
             let mut cycle = from.ceil();
             while cycle < to {
                 out.push(Event {
@@ -111,6 +126,7 @@ fn walk(node: &Node, from: Q, to: Q, frame: Frame, seed: u64, out: &mut Vec<Even
                     end: to_time(frame.to_absolute(cycle + ONE)),
                     value: value.clone(),
                     source: *span,
+                    controls: *controls,
                 });
                 cycle += ONE;
             }
@@ -160,7 +176,12 @@ fn walk(node: &Node, from: Q, to: Q, frame: Frame, seed: u64, out: &mut Vec<Even
                 walk(&alts[pick], start, end, frame, seed, out);
             }
         }
-        Kind::Degrade { salt, prob, node } => {
+        Kind::Degrade {
+            salt,
+            prob,
+            invert,
+            node,
+        } => {
             let first = out.len();
             walk(node, from, to, frame, seed, out);
             let mut kept = first;
@@ -175,14 +196,254 @@ fn walk(node: &Node, from: Q, to: Q, frame: Frame, seed: u64, out: &mut Vec<Even
                         event.begin.denom().cast_unsigned(),
                     ],
                 );
-                if unit(h) >= *prob {
+                if (unit(h) >= *prob) != *invert {
                     out.swap(kept, i);
                     kept += 1;
                 }
             }
             out.truncate(kept);
         }
+        Kind::Shift { by, node } => {
+            let child_frame = Frame {
+                scale: frame.scale,
+                offset: frame.offset + by * frame.scale,
+            };
+            walk(node, from - by, to - by, child_frame, seed, out);
+        }
+        Kind::Rev(node) => {
+            for c in cycles(from, to) {
+                let cycle = Q::from_integer(c);
+                let (a, b) = (frame.to_absolute(cycle), frame.to_absolute(cycle + ONE));
+                let lo = frame.to_absolute(max(from, cycle));
+                let hi = frame.to_absolute(min(to, cycle + ONE));
+                for mut e in collect(node, cycle, cycle + ONE, frame, seed) {
+                    let begin = a + b - min(q(e.end), b);
+                    let end = a + b - q(e.begin);
+                    if lo <= begin && begin < hi && begin < end {
+                        e.begin = to_time(begin);
+                        e.end = to_time(end);
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        Kind::Iter { n, back, node } => {
+            for c in cycles(from, to) {
+                let cycle = Q::from_integer(c);
+                let start = max(from, cycle);
+                let end = min(to, cycle + ONE);
+                if start >= end {
+                    continue;
+                }
+                let step = Q::new(c.rem_euclid(*n), *n);
+                let by = if *back { -step } else { step };
+                // Child time runs `by` ahead of this node's.
+                let child_frame = Frame {
+                    scale: frame.scale,
+                    offset: frame.offset - by * frame.scale,
+                };
+                walk(node, start + by, end + by, child_frame, seed, out);
+            }
+        }
+        Kind::Cycles(nodes) => {
+            for c in cycles(from, to) {
+                let cycle = Q::from_integer(c);
+                let start = max(from, cycle);
+                let end = min(to, cycle + ONE);
+                if start < end {
+                    let pick = c.rem_euclid(nodes.len() as i128) as usize;
+                    walk(&nodes[pick], start, end, frame, seed, out);
+                }
+            }
+        }
+        Kind::CycleChance {
+            salt,
+            prob,
+            yes,
+            no,
+        } => {
+            for c in cycles(from, to) {
+                let cycle = Q::from_integer(c);
+                let start = max(from, cycle);
+                let end = min(to, cycle + ONE);
+                if start >= end {
+                    continue;
+                }
+                let [a, b, c, d] = words(frame.to_absolute(cycle));
+                let pick = if unit(hash(seed, &[*salt, a, b, c, d])) < *prob {
+                    yes
+                } else {
+                    no
+                };
+                walk(pick, start, end, frame, seed, out);
+            }
+        }
+        Kind::Ply { n, node } => {
+            let (lo, hi) = (frame.to_absolute(from), frame.to_absolute(to));
+            for e in collect(node, from - lookback(node), to, frame, seed) {
+                let begin = q(e.begin);
+                let len = (q(e.end) - begin) / *n;
+                for i in 0..*n {
+                    let b = begin + len * i;
+                    if lo <= b && b < hi {
+                        out.push(Event {
+                            begin: to_time(b),
+                            end: to_time(b + len),
+                            ..e.clone()
+                        });
+                    }
+                }
+            }
+        }
+        Kind::Struct { mask, node } => {
+            let marks = collect(mask, from, to, frame, seed);
+            if marks.is_empty() {
+                return;
+            }
+            let values = sorted(collect(node, from - lookback(node), to, frame, seed));
+            for m in marks {
+                for v in sounding(&values, m.begin) {
+                    out.push(Event {
+                        begin: m.begin,
+                        end: m.end,
+                        ..v.clone()
+                    });
+                }
+            }
+        }
+        Kind::Mask { mask, node } => {
+            let first = out.len();
+            walk(node, from, to, frame, seed, out);
+            if out.len() == first {
+                return;
+            }
+            let marks = sorted(collect(mask, from - lookback(mask), to, frame, seed));
+            let mut kept = first;
+            for i in first..out.len() {
+                if sounding(&marks, out[i].begin).next().is_some() {
+                    out.swap(kept, i);
+                    kept += 1;
+                }
+            }
+            out.truncate(kept);
+        }
+        Kind::Set { node, op, arg } => {
+            let first = out.len();
+            walk(node, from, to, frame, seed, out);
+            if out.len() == first {
+                return;
+            }
+            let events: Vec<Event> = out.drain(first..).collect();
+            match arg {
+                Arg::Const(value) => {
+                    for mut e in events {
+                        if apply(op, &mut e, value) {
+                            out.push(e);
+                        }
+                    }
+                }
+                Arg::Signal(signal) => {
+                    for mut e in events {
+                        let t = f64_of(frame.to_local(q(e.begin)));
+                        let value = Value::Number(to_time(q_of(signal.at(t, seed))));
+                        if apply(op, &mut e, &value) {
+                            out.push(e);
+                        }
+                    }
+                }
+                Arg::Pattern(arg) => {
+                    let values = sorted(collect(arg, from - lookback(arg), to, frame, seed));
+                    for e in events {
+                        for v in sounding(&values, e.begin) {
+                            let mut e = e.clone();
+                            if apply(op, &mut e, &v.value) {
+                                out.push(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Kind::Switch { arg, cases } => {
+            for a in collect(arg, from - lookback(arg), to, frame, seed) {
+                let start = max(from, frame.to_local(q(a.begin)));
+                let end = min(to, frame.to_local(q(a.end)));
+                if start >= end {
+                    continue;
+                }
+                if let Some((_, case)) = cases.iter().find(|(v, _)| *v == a.value) {
+                    walk(case, start, end, frame, seed, out);
+                }
+            }
+        }
+        Kind::Segment { n, signal, span } => {
+            let steps = Q::from_integer(*n);
+            let mut k = (from * steps).ceil();
+            while k < to * steps {
+                let t = k / steps;
+                let value = signal.at(f64_of(t), seed);
+                out.push(Event {
+                    begin: to_time(frame.to_absolute(t)),
+                    end: to_time(frame.to_absolute(t + steps.recip())),
+                    value: Value::Number(to_time(q_of(value))),
+                    source: *span,
+                    controls: Controls::default(),
+                });
+                k += ONE;
+            }
+        }
+        Kind::Swing { n, by, node } => {
+            // As Strudel's swingBy: the second half of each slice starts
+            // `by / 2` of a slice late.
+            let delay = by / (*n * 2);
+            let zero = Q::from_integer(0);
+            let (lo, hi) = (from - delay.max(zero), to - delay.min(zero));
+            for mut e in collect(node, lo, hi, frame, seed) {
+                let begin = frame.to_local(q(e.begin));
+                let slice = begin * *n;
+                if slice - slice.floor() >= Q::new(1, 2) {
+                    let (b, en) = (begin + delay, frame.to_local(q(e.end)) + delay);
+                    e.begin = to_time(frame.to_absolute(b));
+                    e.end = to_time(frame.to_absolute(en));
+                    if from <= b && b < to {
+                        out.push(e);
+                    }
+                } else if from <= begin && begin < to {
+                    out.push(e);
+                }
+            }
+        }
     }
+}
+
+/// The events of `node` with local onsets in `[from, to)`, unsorted.
+fn collect(node: &Node, from: Q, to: Q, frame: Frame, seed: u64) -> Vec<Event> {
+    let mut out = Vec::new();
+    if from < to {
+        walk(node, from, to, frame, seed, &mut out);
+    }
+    out
+}
+
+/// How far back, in a node's local cycles, an event can start and still
+/// sound now.
+fn lookback(node: &Node) -> Q {
+    Q::from_integer(i128::from(node.bounds.slow))
+}
+
+fn sorted(mut events: Vec<Event>) -> Vec<Event> {
+    events.sort_by_key(|a| (a.begin, a.source.start));
+    events
+}
+
+/// The events of `events` (sorted by onset) sounding at time `t`, at most
+/// [`MAX_LAYERS`] of them.
+fn sounding(events: &[Event], t: Time) -> impl Iterator<Item = &Event> {
+    let upto = events.partition_point(|e| e.begin <= t);
+    events[..upto]
+        .iter()
+        .filter(move |e| e.end > t)
+        .take(MAX_LAYERS as usize)
 }
 
 fn splitmix64(mut z: u64) -> u64 {
@@ -192,14 +453,14 @@ fn splitmix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn hash(seed: u64, parts: &[u64]) -> u64 {
+pub(crate) fn hash(seed: u64, parts: &[u64]) -> u64 {
     parts
         .iter()
         .fold(splitmix64(seed), |h, &part| splitmix64(h ^ part))
 }
 
 /// A hash mapped to `[0, 1)`.
-fn unit(h: u64) -> f64 {
+pub(crate) fn unit(h: u64) -> f64 {
     (h >> 11) as f64 / (1u64 << 53) as f64
 }
 

@@ -67,6 +67,7 @@ serde_json = "1"
 uuid = { version = "1.18", features = ["v4", "v7", "serde"] }
 num-rational = { version = "0.4", default-features = false, features = ["std"] }
 num-integer = "0.1"
+num-traits = { version = "0.2", default-features = false, features = ["std"] }
 rtrb = "0.3"
 arc-swap = "1.7"
 crossbeam-channel = "0.5"

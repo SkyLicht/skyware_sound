@@ -793,6 +793,53 @@ fn patterns_link_packs_and_load_the_sounds_they_name() {
 }
 
 #[test]
+fn strudel_code_loads_the_sounds_it_names() {
+    assert_eq!(
+        sky_session::pattern_sound_names(r#"s("hh*2 bd").struct("x ~ x").scale("C:minor")"#),
+        ["hh", "bd"]
+    );
+    assert_eq!(
+        sky_session::pattern_sound_names(r#"s("hh bd").bank("RolandTR909")"#),
+        ["RolandTR909_hh", "RolandTR909_bd"]
+    );
+    assert_eq!(
+        sky_session::pattern_sound_names(r#"note("c3").s("<piano saw>")"#),
+        ["piano", "saw"]
+    );
+
+    // A pack with RolandTR909_bd but no 909 hat: the hat falls back to the
+    // plain hh, and a name with neither is missing.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("machines");
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["tr909bd", "hh"] {
+        sine_file(&dir.join(format!("{name}.wav")), 0.2);
+    }
+    std::fs::write(
+        dir.join("strudel.json"),
+        r#"{ "RolandTR909_bd": "tr909bd.wav", "hh": "hh.wav" }"#,
+    )
+    .unwrap();
+    let mut project = empty_project("Strudel");
+    let track = Track::new_instrument("Beat", sky_dsp::InstrumentType::Bank);
+    let track_id = track.id;
+    project.tracks.push(track);
+    let session = headless(project);
+    session.set_library(sky_library::Library::new(tmp.path().join("cache")));
+    let request = sky_session::SoundsRequest {
+        link: vec![sky_library::PackSource::parse(&dir.to_string_lossy(), None)],
+        maps: Vec::new(),
+        names: sky_session::pattern_sound_names(r#"s("bd hh zz").bank("RolandTR909")"#),
+    };
+    let done = session
+        .load_pattern_sounds(track_id, &request, "Load", Vec::new(), Origin::User)
+        .unwrap();
+    let loaded: Vec<&str> = done.loaded.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(loaded, ["RolandTR909_bd", "hh"]);
+    assert_eq!(done.missing, ["RolandTR909_zz"]);
+}
+
+#[test]
 fn unknown_licenses_warn_and_bad_requests_change_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let pack = tmp.path().join("pack");

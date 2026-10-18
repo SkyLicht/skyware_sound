@@ -63,6 +63,19 @@ stacks layers, bd(3,8) is a Euclidean rhythm, ? drops events at random, and \
 note names or numbers (c3 e3 g3) play pitches. Drum names: bd sd hh oh cp rim \
 lt mt ht cr rd cb. Use pattern_query to check a pattern before writing it.\n\
 \n\
+Pattern text can also be Strudel code, which plays as written: \
+s(\"bd*2 sd\").fast(2).every(4, rev), note(\"c3 e3 g3\").s(\"sawtooth\").lpf(800), \
+n(\"0 2 4\").scale(\"C:minor\"), s(\"hh*8\").gain(sine.range(.4, 1)); lines \
+starting with $: play together. The strings are mini-notation. Supported: s, \
+note, n, stack, cat, seq, fast, slow, early, late, rev, palindrome, ply, iter, \
+every/firstOf, lastOf, chunk, within, off, superimpose, echo, sometimes and the \
+like, degradeBy, struct, mask, euclid, add, range, scale, bank, legato, the \
+controls gain, velocity, speed, lpf, resonance, attack, decay, sustain, release, \
+and signals (sine, saw, tri, square, rand, perlin, irand) with range and \
+segment. On a synth, sawtooth, square, triangle and sine pick its wave. Effects \
+such as room, delay or pan are left out with a warning: put effects on the \
+track's inserts instead. pattern_query and pattern_set report warnings.\n\
+\n\
 A pattern clip can also have controls: number patterns in the same notation, \
 read at the start of each note. {\"velocity\": \"127 60 90 60\"} accents \
 steps (0 skips a note); an instrument parameter's name sets it per note, as in \
@@ -590,7 +603,7 @@ pub struct ClipArg {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatternQueryArgs {
-    /// Mini-notation pattern text.
+    /// Mini-notation pattern text, or Strudel code.
     pub pattern: String,
     /// Read the pattern as numbers, the way a control pattern is. Default
     /// false.
@@ -776,7 +789,7 @@ pub struct ClipCreateArgs {
     pub name: Option<String>,
     /// For a MIDI clip: notes in the compact list form.
     pub notes: Option<String>,
-    /// For a pattern clip: mini-notation text.
+    /// For a pattern clip: mini-notation text, or Strudel code.
     pub pattern: Option<String>,
     /// Pattern cycle length in bars. Default 1.
     pub cycle_bars: Option<f64>,
@@ -865,7 +878,8 @@ pub struct StepsWriteArgs {
 pub struct PatternSetArgs {
     /// Pattern clip ID or name.
     pub clip: String,
-    /// New mini-notation. Default: unchanged. As in Strudel, a line
+    /// New mini-notation or Strudel code. Default: unchanged. As in
+    /// Strudel, a line
     /// samples('github:user/repo') links that pack to the track's sample
     /// bank (the track becomes one), and sounds the pattern names that the
     /// bank lacks then download from its linked packs; samples({ name:
@@ -1295,7 +1309,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Parses a mini-notation pattern and lists the events it plays, without changing the project. Times are in cycles as fractions.",
+        description = "Parses a mini-notation pattern or Strudel code and lists the events it plays, without changing the project. Times are in cycles as fractions; controls such as gain or lpf are listed by their Strudel names.",
         annotations(read_only_hint = true)
     )]
     async fn pattern_query(&self, Parameters(a): Parameters<PatternQueryArgs>) -> ToolResult {
@@ -1331,20 +1345,37 @@ impl SkywareMcp {
                     sky_pattern::Value::Sound { name, index } => (Some(name.clone()), *index),
                     _ => (None, 0),
                 };
-                json!({
+                let mut event = json!({
                     "begin": e.begin.to_string(),
                     "end": e.end.to_string(),
                     "sound": sound,
                     "index": index,
-                    "midi": e.value.midi_note(),
-                })
+                    "midi": e.note(),
+                });
+                if !e.controls.is_empty() {
+                    let controls: serde_json::Map<String, Value> = e
+                        .controls
+                        .iter()
+                        .map(|(c, v)| (c.name().to_string(), json!(v)))
+                        .collect();
+                    event["controls"] = Value::Object(controls);
+                }
+                event
             })
             .collect();
         let silent = events
             .iter()
-            .filter(|e| e.value.midi_note().is_none() && e.value.number().is_none())
+            .filter(|e| e.note().is_none() && e.value.number().is_none())
             .count();
         let mut v = json!({ "cycles": cycles, "eventCount": events.len(), "events": list });
+        let warnings: Vec<&str> = pattern
+            .warnings()
+            .iter()
+            .map(|w| w.message.as_str())
+            .collect();
+        if !warnings.is_empty() {
+            v["warnings"] = json!(warnings);
+        }
         if silent > 0 {
             v["warning"] = json!(format!(
                 "{silent} event(s) name a sound the drum kit does not have; they will be silent"
@@ -2051,7 +2082,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Changes a pattern clip: its mini-notation, cycle length, seed, control patterns (velocity or instrument parameters per note) or swing. Returns the clip."
+        description = "Changes a pattern clip: its mini-notation or Strudel code, cycle length, seed, control patterns (velocity or instrument parameters per note) or swing. Returns the clip, with warnings about Strudel functions it leaves out."
     )]
     async fn pattern_set(
         &self,
@@ -2144,6 +2175,13 @@ impl SkywareMcp {
         }
         if let Some(note) = note {
             v["note"] = json!(note);
+        }
+        if let ClipContent::Pattern { source, .. } = &clip.content
+            && let Ok(p) = sky_pattern::parse(source)
+            && !p.warnings().is_empty()
+        {
+            let warnings: Vec<&str> = p.warnings().iter().map(|w| w.message.as_str()).collect();
+            v["warnings"] = json!(warnings);
         }
         Ok(v.to_string())
     }

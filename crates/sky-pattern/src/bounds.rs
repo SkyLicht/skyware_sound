@@ -103,6 +103,43 @@ impl Bounds {
         }
     }
 
+    /// What a shift in time by `by` adds: its denominator, and one more
+    /// cycle's worth of events when it isn't whole. Shifts are at most a
+    /// few thousand cycles, so query magnitudes at most double.
+    pub fn shift(by: Q) -> Bounds {
+        let q = magnitude(*by.denom());
+        Bounds {
+            den: q,
+            slow: 1,
+            win: q,
+            fast: 2,
+            events: if q == 1 { 1 } else { 2 },
+        }
+    }
+
+    /// What splitting each event into `n` adds.
+    pub fn ply(n: Q) -> Bounds {
+        let n = magnitude(*n.numer());
+        Bounds {
+            den: n,
+            slow: 1,
+            win: n,
+            fast: 2,
+            events: n,
+        }
+    }
+
+    /// Bounds for events of `main` that look up values in `other`, each
+    /// taking up to `layers` of them.
+    pub fn lookup(main: Bounds, other: Bounds, layers: u64) -> Bounds {
+        let both = main.max(other);
+        Bounds {
+            fast: both.fast.saturating_mul(2),
+            events: main.events.saturating_mul(layers),
+            ..both
+        }
+    }
+
     /// The bounds of `self` applied on top of `inner`.
     pub fn then(self, inner: Bounds) -> Bounds {
         Bounds {

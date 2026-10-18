@@ -3,6 +3,7 @@
 //! pattern editor or the audio clip settings, depending on the clip.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{
@@ -16,7 +17,7 @@ use sky_library::samples::{blank_calls, strip_calls};
 use sky_library::{PackSource, Samples, find_samples};
 use sky_model::command::VELOCITY;
 use sky_model::{Clip, ClipContent, Command, Origin, Project, SampleBank, Swing, Track};
-use sky_pattern::{Span, Time};
+use sky_pattern::{Control, Span, Time};
 use sky_session::{SoundsLoaded, SoundsRequest, pattern_sound_names};
 
 use crate::actions::{self, AudioClipChange};
@@ -214,6 +215,8 @@ fn clip_header(app: &mut App, ui: &mut Ui, project: &Project, track: &Track, cli
 pub enum ParseStatus {
     Ok {
         events: usize,
+        /// What Strudel code asked for that the pattern leaves out.
+        warnings: Vec<String>,
     },
     Error {
         message: String,
@@ -258,6 +261,7 @@ pub fn parse_status(source: &str, seed: u64) -> ParseStatus {
             events: p
                 .query(Time::from_integer(0), Time::from_integer(1), seed)
                 .len(),
+            warnings: p.warnings().iter().map(|w| w.message.clone()).collect(),
         },
         Err(e) => ParseStatus::Error {
             line: line(e.offset),
@@ -265,6 +269,31 @@ pub fn parse_status(source: &str, seed: u64) -> ParseStatus {
             column: e.column,
         },
     }
+}
+
+/// The parts of pattern text that aren't mini-notation, sorted: its
+/// `samples(...)` calls and, in Strudel code, everything outside the
+/// strings. With them, where the text fails to parse.
+fn code_spans(text: &str) -> (Vec<Range<usize>>, Option<Range<usize>>) {
+    let calls = match find_samples(text) {
+        Ok(calls) => calls,
+        Err(e) => return (Vec::new(), Some(e.range)),
+    };
+    let plain = blank_calls(text, &calls);
+    let error = sky_pattern::parse(&plain)
+        .err()
+        .map(|e| e.offset..e.offset + e.len);
+    let mut spans: Vec<Range<usize>> = calls.into_iter().map(|c| c.range).collect();
+    spans.extend(sky_pattern::code_ranges(&plain));
+    spans.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for r in spans {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    (merged, error)
 }
 
 /// The track's sample bank, when it is one.
@@ -554,15 +583,7 @@ fn pattern_ui(
     let font = theme::mono(15.0);
     let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
         let text = buf.as_str();
-        let (code, error) = match find_samples(text) {
-            Ok(calls) => {
-                let error = sky_pattern::parse(&blank_calls(text, &calls))
-                    .err()
-                    .map(|e| e.offset..e.offset + e.len);
-                (calls.into_iter().map(|c| c.range).collect(), error)
-            }
-            Err(e) => (Vec::new(), Some(e.range)),
-        };
+        let (code, error) = code_spans(text);
         let lit: &[Span] = if text == source { &lit } else { &[] };
         let mut job = live_pattern::layout(text, &font, lit, error, &code);
         job.wrap.max_width = wrap;
@@ -633,6 +654,15 @@ fn pattern_ui(
     let next = caret.and_then(|caret| {
         let (start, word) = live_pattern::word_before(&st.text, caret)?;
         if st.dismissed.as_ref() == Some(&(st.text.clone(), caret)) {
+            return None;
+        }
+        // In Strudel code, sounds are named inside its strings.
+        let byte = st
+            .text
+            .char_indices()
+            .nth(start)
+            .map_or(st.text.len(), |(b, _)| b);
+        if code_spans(&st.text).0.iter().any(|r| r.contains(&byte)) {
             return None;
         }
         let names = live_pattern::completions(&word, &names);
@@ -706,7 +736,7 @@ fn pattern_ui(
             ui.spinner();
             ui.label(RichText::new("Loading the sounds it names…").color(theme::TEXT_WEAK));
         }
-        ParseStatus::Ok { events } => {
+        ParseStatus::Ok { events, warnings } => {
             ui.label(
                 RichText::new(format!(
                     "Valid · {events} event{} per cycle",
@@ -714,6 +744,9 @@ fn pattern_ui(
                 ))
                 .color(theme::OK),
             );
+            for w in warnings {
+                ui.label(RichText::new(w).small().color(theme::WARN));
+            }
             if changed {
                 ui.label(
                     RichText::new("Ctrl+Enter or click away to apply")
@@ -820,6 +853,23 @@ fn pattern_ui(
                 "samples('github:user/repo')",
                 "on a line of its own, as in Strudel: the sounds you name load from that pack",
             ),
+            (
+                "s(\"bd*2 sd\").fast(2)",
+                "Strudel code: mini-notation in quotes, functions after it",
+            ),
+            (
+                ".every(4, rev)",
+                "change every 4th cycle; x => x.add(12) works too",
+            ),
+            (
+                "note(\"c3 e3\").s(\"sawtooth\")",
+                "notes on a sound; a synth's wave follows sawtooth, square, triangle, sine",
+            ),
+            (
+                ".gain(\".5 1\").lpf(800)",
+                "gain, filter and envelope per note",
+            ),
+            ("$: s(\"hh*8\")", "lines starting with $: play together"),
         ] {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(code).monospace().color(theme::TEXT));
@@ -1254,7 +1304,13 @@ fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64, at: Option<f
             let b = (*e.begin.numer() as f64 / (*e.begin.denom()).max(1) as f64 - c as f64) as f32;
             let en = (*e.end.numer() as f64 / (*e.end.denom()).max(1) as f64 - c as f64) as f32;
             let label = match &e.value {
-                sky_pattern::Value::Sound { name, .. } => name.clone(),
+                sky_pattern::Value::Sound { name, .. } => match e.controls.get(Control::Note) {
+                    Some(_) => format!(
+                        "{name} {}",
+                        sky_core::music::note_name(e.note().unwrap_or(60))
+                    ),
+                    None => name.clone(),
+                },
                 sky_pattern::Value::Note(n) => sky_core::music::note_name(*n),
                 sky_pattern::Value::Number(_) => format_number(e.value.number().unwrap_or(0.0)),
             };
@@ -1264,7 +1320,7 @@ fn pattern_preview(ui: &mut Ui, text: &str, seed: u64, cycles: i64, at: Option<f
             notes.push((
                 x0 + b * cw,
                 x0 + en.min(1.0) * cw,
-                e.value.midi_note().unwrap_or(60),
+                e.note().unwrap_or(60),
                 label,
                 sounding,
             ));
