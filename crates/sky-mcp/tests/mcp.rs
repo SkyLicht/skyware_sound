@@ -350,7 +350,7 @@ async fn the_sustain_pedal_is_written_and_read_back() {
         json!({ "clip": "Chords", "pedal": "" }),
     )
     .await;
-    assert!(written.get("pedal").is_none());
+    assert_eq!(written["pedal"], "", "the lift is confirmed");
     let (e, is_error) = call(
         &client,
         "notes_write",

@@ -1037,6 +1037,14 @@ impl Session {
         // Close the journal first: saving deletes it.
         st.journal = None;
         file::save_project(&st.project, &dir)?;
+        // Save As: the old folder's journal holds changes that now live in
+        // the new one. Left there, they would be recovered into the old
+        // project the next time it opens.
+        if let Some(old) = st.path.take().filter(|old| *old != dir)
+            && let Err(e) = file::clear_journal(&old)
+        {
+            tracing::warn!("cannot clear the old crash journal: {e}");
+        }
         st.path = Some(dir.clone());
         st.dirty = false;
         st.status = Some(format!("Saved {}", dir.display()));

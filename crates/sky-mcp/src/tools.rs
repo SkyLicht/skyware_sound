@@ -2163,7 +2163,8 @@ impl SkywareMcp {
         let beyond = notes.iter().filter(|n| n.start >= clip.length).count();
         let mut v =
             json!({ "written": count, "noteCount": notes.len(), "notes": format_note_list(notes) });
-        if !pedal.is_empty() {
+        // Written pedal is always echoed, so lifting it all reads back "".
+        if a.pedal.is_some() || !pedal.is_empty() {
             v["pedal"] = json!(format_pedal_list(pedal));
         }
         let mut warnings = Vec::new();
