@@ -23,6 +23,9 @@ pub struct PackInfo {
     pub homepage: &'static str,
     /// One line on what is in it.
     pub about: &'static str,
+    /// The instrument library the pack is also, by id: into a new track it
+    /// opens as that instrument instead of a sample bank.
+    pub instrument: Option<&'static str>,
 }
 
 macro_rules! dough {
@@ -46,6 +49,7 @@ pub const PACKS: &[PackInfo] = &[
         homepage: "https://github.com/sgossner/VCSL",
         about: "Versilian Community Sample Library: orchestral, folk and percussion \
                 instruments, many pitched across the keyboard",
+        instrument: None,
     },
     PackInfo {
         id: "piano",
@@ -55,6 +59,7 @@ pub const PACKS: &[PackInfo] = &[
         credit: Some("Salamander Grand Piano by Alexander Holm (CC BY 3.0)"),
         homepage: "https://archive.org/details/SalamanderGrandPianoV3",
         about: "A Yamaha C5 grand piano, one sample every three semitones",
+        instrument: Some(crate::instruments::STRUDEL_PIANO),
     },
     PackInfo {
         id: "tidal-drum-machines",
@@ -65,6 +70,7 @@ pub const PACKS: &[PackInfo] = &[
         homepage: "https://github.com/ritchse/tidal-drum-machines",
         about: "71 classic drum machines as banks, such as RolandTR808, RolandTR909 \
                 and LinnDrum",
+        instrument: None,
     },
     PackInfo {
         id: "dirt-samples",
@@ -75,6 +81,7 @@ pub const PACKS: &[PackInfo] = &[
         homepage: "https://github.com/tidalcycles/Dirt-Samples",
         about: "Strudel's small selection from TidalCycles: casio, crow, insect, wind, \
                 jazz, metal, east, space and numbers",
+        instrument: None,
     },
     PackInfo {
         id: "emu-sp12",
@@ -85,6 +92,7 @@ pub const PACKS: &[PackInfo] = &[
         homepage: "https://github.com/ritchse/tidal-drum-machines",
         about: "The E-mu SP-12 drum machine as plain bd, sd, hh and more, with no bank \
                 prefix",
+        instrument: None,
     },
     PackInfo {
         id: "mridangam",
@@ -97,6 +105,7 @@ pub const PACKS: &[PackInfo] = &[
         ),
         homepage: "https://github.com/yaxu/mrid",
         about: "Strokes of the South Indian mridangam drum",
+        instrument: None,
     },
     PackInfo {
         id: "clean-breaks",
@@ -107,6 +116,7 @@ pub const PACKS: &[PackInfo] = &[
         homepage: "https://github.com/yaxu/clean-breaks",
         about: "Drum breaks cut from funk and soul records, whose rights stay with the \
                 records' owners",
+        instrument: None,
     },
 ];
 
@@ -131,6 +141,14 @@ mod tests {
         }
         assert_eq!(find("VCSL").map(|p| p.license), Some(License::Cc0));
         assert_eq!(find("Salamander Grand Piano").map(|p| p.id), Some("piano"));
+        // The piano pack is also a piano library, with the same license.
+        for p in PACKS {
+            if let Some(id) = p.instrument {
+                let lib = crate::find_instrument(id).expect("a known library");
+                assert_eq!((lib.license, lib.credit), (p.license, p.credit), "{}", p.id);
+            }
+        }
+        assert!(find("piano").is_some_and(|p| p.instrument.is_some()));
         assert!(find("nope").is_none());
     }
 }

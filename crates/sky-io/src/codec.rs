@@ -101,13 +101,15 @@ fn decode(
     if let Some(ext) = ext {
         hint.with_extension(ext);
     }
+    // An MP3 encoder adds about 25 ms of silence before the sound and
+    // pads the end; the LAME header says how much, so the sound starts on
+    // time.
+    let options = FormatOptions {
+        enable_gapless: true,
+        ..FormatOptions::default()
+    };
     let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
+        .format(&hint, mss, &options, &MetadataOptions::default())
         .map_err(|e| derr(e.to_string()))?;
     let mut format = probed.format;
     let track = format

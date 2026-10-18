@@ -2870,6 +2870,76 @@ fn big_pianos_offer_fewer_velocity_layers() {
 }
 
 #[test]
+fn the_piano_pack_opens_as_a_piano() {
+    let mut h = Harness::with_project(demo_project());
+    let ctx = h.ctx();
+    // Getting the library fails at once, before any download: its folder
+    // would be inside a file.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a file");
+    std::fs::write(&file, b"").unwrap();
+    h.app
+        .session
+        .set_instruments(sky_library::Instruments::new(file.join("instruments")));
+    let piano_pack = sky_library::PACKS
+        .iter()
+        .position(|p| p.id == "piano")
+        .unwrap();
+    h.app.open_load_sounds(None);
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    d.pack = Some(piano_pack);
+    // As if its sample map were being read, so the test does not read it.
+    d.reading = d.source().map(|s| s.map);
+    h.accessible();
+    assert!(h.find("Open as a Piano: Salamander (Strudel)").is_some());
+    assert!(h.find("Open as a Piano").is_some(), "the load button");
+    let project = h.project();
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    let lib = d.opens_as(&project).expect("opens as a piano");
+    assert_eq!(lib.id, sky_library::STRUDEL_PIANO);
+    // Off, or into a synth track, it loads as a sample bank.
+    d.as_instrument = false;
+    assert_eq!(d.opens_as(&project), None);
+    d.as_instrument = true;
+    d.track = project
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .map(|t| t.id);
+    assert_eq!(d.opens_as(&project), None);
+
+    d.track = None;
+    d.reading = None;
+    let before = project.tracks.len();
+    h.app.start_bank_load(&ctx);
+    assert!(h.app.dialogs.load_sounds.is_none(), "the dialog closes");
+    let track = h.app.sel.track.expect("the new track is selected");
+    let p = h.project();
+    assert_eq!(p.tracks.len(), before + 1);
+    let slot = p.track(track).unwrap().instrument.clone().unwrap();
+    assert_eq!(slot.kind, InstrumentType::Piano);
+    let download = h.app.devices.download.as_ref().expect("its progress bar");
+    assert_eq!(download.name, "Salamander (Strudel)");
+    h.frames(2);
+    assert!(h.app.workspace.is_front(Tab::Instrument));
+    h.wait_jobs();
+    assert!(h.app.devices.download.is_none());
+
+    // Into a piano track, the pack becomes its piano.
+    h.app.open_load_sounds(Some(track));
+    let d = h.app.dialogs.load_sounds.as_mut().expect("dialog");
+    d.pack = Some(piano_pack);
+    assert_eq!(d.track, Some(track));
+    h.app.start_bank_load(&ctx);
+    assert_eq!(h.project().tracks.len(), before + 1, "no new track");
+    assert_eq!(
+        h.app.devices.download.as_ref().map(|d| d.track),
+        Some(track)
+    );
+    h.wait_jobs();
+}
+
+#[test]
 fn the_piano_has_five_presets_to_compare_with_a_and_b() {
     let (mut h, piano) = piano_open(false);
     let names: Vec<&str> = InstrumentType::Piano

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! A simple keyboard sampler.
+//! A simple keyboard sampler. Voices play as the multi-sample engine's do
+//! (see [`voice`](super::voice)).
 
 use std::sync::Arc;
 
 use crate::AudioData;
-use crate::instruments::{Adsr, Instrument, instrument_state};
+use crate::instruments::voice::{self, Voice};
+use crate::instruments::{Instrument, instrument_state};
 use crate::params::ParamSpec;
 use crate::util::db_to_gain;
 
@@ -18,17 +20,9 @@ pub(crate) const SAMPLER_PARAMS: &[ParamSpec] = &[
     ParamSpec::linear("end", "End", 0.0, 1.0, 1.0, ""),
 ];
 
+/// Voices that may sound at once.
 const VOICES: usize = 16;
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Voice {
-    note: u8,
-    pos: f64,
-    rate: f64,
-    velocity: f32,
-    age: u64,
-    env: Adsr,
-}
+const SLOTS: usize = voice::slots(VOICES);
 
 pub struct Sampler {
     sample_rate: f32,
@@ -41,7 +35,7 @@ pub struct Sampler {
     /// Where notes start and stop in the sample, as shares of its length.
     start: f32,
     end: f32,
-    voices: [Voice; VOICES],
+    voices: [Voice; SLOTS],
     clock: u64,
 }
 
@@ -57,7 +51,7 @@ impl Sampler {
             gain: 1.0,
             start: 0.0,
             end: 1.0,
-            voices: [Voice::default(); VOICES],
+            voices: [Voice::default(); SLOTS],
             clock: 0,
         }
     }
@@ -82,30 +76,16 @@ impl Instrument for Sampler {
         let Some(sample) = &self.sample else {
             return;
         };
-        let i = self
-            .voices
-            .iter()
-            .position(|v| !v.env.is_active())
-            .unwrap_or_else(|| {
-                self.voices
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, v)| v.age)
-                    .map_or(0, |(i, _)| i)
-            });
+        let i = voice::free_slot(&mut self.voices, VOICES, self.sample_rate);
         self.clock += 1;
         let semis = pitch as f64 - self.root as f64;
         let rate = 2f64.powf(semis / 12.0) * sample.sample_rate as f64 / self.sample_rate as f64;
         let start = (self.start as f64 * sample.frames() as f64).floor();
+        let velocity = velocity as f32 / 127.0;
         let v = &mut self.voices[i];
-        v.note = pitch;
-        v.pos = start;
-        v.rate = rate;
-        v.velocity = velocity as f32 / 127.0;
-        v.age = self.clock;
+        *v = Voice::new(0, pitch, start, rate, velocity, self.clock);
         v.env
             .set(self.attack, 1.0, 1.0, self.release, self.sample_rate);
-        v.env.trigger();
     }
 
     fn note_off(&mut self, pitch: u8) {
@@ -113,7 +93,7 @@ impl Instrument for Sampler {
             return;
         }
         for v in &mut self.voices {
-            if v.note == pitch {
+            if v.key == pitch {
                 v.env.release();
             }
         }
@@ -135,28 +115,12 @@ impl Instrument for Sampler {
         let Some(sample) = &self.sample else {
             return;
         };
-        let (src_l, src_r) = (sample.left(), sample.right());
         // Notes stop at the end marker, or at the start one if they cross.
-        let end = (self.end.max(self.start) as f64 * src_l.len() as f64).ceil() as usize;
-        let len = end.min(src_l.len());
-        if len < 2 {
-            return;
-        }
+        let frames = sample.frames() as f64;
+        let start = (f64::from(self.start) * frames).floor();
+        let end = (f64::from(self.end) * frames).ceil().max(start) as usize;
         for v in self.voices.iter_mut().filter(|v| v.env.is_active()) {
-            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-                let i = v.pos as usize;
-                if i + 1 >= len {
-                    v.env.reset();
-                    break;
-                }
-                let frac = (v.pos - i as f64) as f32;
-                let sl = src_l[i] + (src_l[i + 1] - src_l[i]) * frac;
-                let sr = src_r[i] + (src_r[i + 1] - src_r[i]) * frac;
-                let g = v.env.tick() * v.velocity * self.gain;
-                *l += sl * g;
-                *r += sr * g;
-                v.pos += v.rate;
-            }
+            v.render(sample, end, self.gain, left, right);
         }
     }
 
@@ -200,5 +164,37 @@ mod tests {
         assert!(sounding.iter().all(|s| *s < 0.76));
         // Crossed markers play nothing.
         assert!(play(0.8, 0.2).iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn a_stolen_voice_fades_instead_of_clicking() {
+        // A sample that rises from silence to a steady level over its
+        // first millisecond.
+        let rise: Vec<f32> = (0..48_000)
+            .map(|i| (i as f32 / 48.0).min(1.0) * 0.5)
+            .collect();
+        let sample = Arc::new(AudioData::from_interleaved(&rise, 1, 48_000));
+        let mut s = Sampler::new(48_000.0, Some(sample));
+        let render = |s: &mut Sampler, frames: usize| {
+            let mut l = vec![0.0; frames];
+            let mut r = vec![0.0; frames];
+            s.render(&mut l, &mut r);
+            l
+        };
+        for _ in 0..VOICES {
+            s.note_on(60, 100);
+        }
+        let before = render(&mut s, 256);
+        s.note_on(60, 100);
+        let after = render(&mut s, 1_024);
+        // Started again from the top, the oldest note would drop from its
+        // level to silence in one step.
+        let level = 0.5 * 100.0 / 127.0;
+        let biggest = std::iter::once(after[0] - before[255])
+            .chain(after.windows(2).map(|w| w[1] - w[0]))
+            .fold(0.0f32, |m, d| m.max(d.abs()));
+        assert!(biggest < level / 10.0, "a step of {biggest}");
+        let sounding = s.voices.iter().filter(|v| v.env.is_active()).count();
+        assert_eq!(sounding, VOICES);
     }
 }

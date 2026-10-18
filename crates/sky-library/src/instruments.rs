@@ -22,13 +22,15 @@ use sky_dsp::instruments::{SampleData, SampleLibrary};
 use sky_model::{LibraryRef, License};
 
 use crate::LibraryError;
-use crate::{sfz, steinway_b};
+use crate::{sfz, steinway_b, strudel_piano};
 
 /// Files built into the program, by path under `instruments/`.
 static BUNDLED: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/bundled.rs"));
 
 /// The library a piano plays when its project names none.
 pub const DEFAULT_PIANO: &str = "upright-piano-kw-small";
+/// Strudel's piano pack as a library.
+pub const STRUDEL_PIANO: &str = "strudel-piano";
 /// Written into an installed library's folder, holding its archive's hash.
 const MARKER: &str = ".skyware-installed";
 /// Decoding threads.
@@ -196,6 +198,27 @@ pub const INSTRUMENTS: &[InstrumentInfo] = &[
             bytes: 741_757_374,
             sha256: "b7760e168494cf095344e217b0af013fc449ad033abbbdf1c65211cf11dc038b",
             sfz: "SalamanderGrandPiano-SFZ+FLAC-V3+20200602/SalamanderGrandPiano-V3+20200602.sfz",
+        },
+    },
+    InstrumentInfo {
+        id: STRUDEL_PIANO,
+        name: "Salamander (Strudel)",
+        kind: InstrumentType::Piano,
+        version: "2026-10-18",
+        description: "The piano Strudel plays for s(\"piano\"), from its piano pack: one \
+                      velocity layer of the Salamander grand, stereo MP3s, a recording every \
+                      three semitones. A 5 MiB download of 29 files.",
+        license: License::CcBy3,
+        credit: Some("Salamander Grand Piano by Alexander Holm (CC BY 3.0)"),
+        homepage: "https://archive.org/details/SalamanderGrandPianoV3",
+        size: 5_481_960,
+        layers: 1,
+        memory: 72_200_000,
+        source: InstrumentSource::Files {
+            base: strudel_piano::BASE,
+            files: strudel_piano::FILES,
+            sha256: strudel_piano::MANIFEST_SHA256,
+            sfz: "strudel-piano/piano.sfz",
         },
     },
 ];
@@ -1081,30 +1104,28 @@ mod tests {
         assert_eq!(entry_path("/"), None);
     }
 
-    #[test]
-    fn the_steinway_file_list_is_the_one_its_hash_names() {
+    /// Checks a library that downloads its files one by one against the
+    /// hash of its list, and that its built-in SFZ file plays every file
+    /// listed and only those. Returns the library and the parsed SFZ.
+    fn listed_files(id: &str, manifest: &str) -> (&'static InstrumentInfo, sfz::SfzInstrument) {
+        let info = find_instrument(id).expect("known");
+        let InstrumentSource::Files { files, sfz, .. } = info.source else {
+            panic!("downloads its files one by one");
+        };
         let mut list = String::new();
-        for (path, bytes, sha) in steinway_b::FILES {
+        for (path, bytes, sha) in files {
             list.push_str(&format!("{path}\t{bytes}\t{sha}\n"));
             assert!(entry_path(path).is_some(), "{path}");
             assert_eq!(sha.len(), 64, "{path}");
         }
-        assert_eq!(
-            hex(&Sha256::digest(list.as_bytes())),
-            steinway_b::MANIFEST_SHA256
-        );
-        let info = find_instrument("vcsl-steinway-b").expect("known");
-        let InstrumentSource::Files { files, sfz, .. } = info.source else {
-            panic!("downloads its files one by one");
-        };
+        assert_eq!(hex(&Sha256::digest(list.as_bytes())), manifest);
         let listed: u64 = files.iter().map(|f| f.1).sum();
         let built_in: u64 = BUNDLED
             .iter()
-            .filter(|(p, _)| p.starts_with("vcsl-steinway-b/"))
+            .filter(|(p, _)| p.starts_with(&format!("{}/", folder_of(sfz))))
             .map(|(_, b)| b.len() as u64)
             .sum();
         assert_eq!(info.size, listed + built_in);
-        // The SFZ file plays every file listed, and only those.
         let text = BUNDLED
             .iter()
             .find(|(p, _)| *p == sfz)
@@ -1117,6 +1138,27 @@ mod tests {
         paths.sort();
         assert_eq!(named, paths);
         assert!(parsed.skipped.is_empty(), "{:?}", parsed.skipped);
+        (info, parsed)
+    }
+
+    /// A library of silent recordings with the zones of `parsed`.
+    fn silent(info: &InstrumentInfo, parsed: sfz::SfzInstrument) -> SampleLibrary {
+        let silence = sky_dsp::AudioData {
+            sample_rate: 44_100,
+            channels: vec![vec![0.0; 16]],
+        };
+        SampleLibrary::new(
+            info.name,
+            (0..parsed.samples.len())
+                .map(|_| SampleData::from_audio(&silence))
+                .collect(),
+            parsed.zones,
+        )
+    }
+
+    #[test]
+    fn the_steinway_file_list_is_the_one_its_hash_names() {
+        let (info, parsed) = listed_files("vcsl-steinway-b", steinway_b::MANIFEST_SHA256);
         // Notes fade in over 4 ms and the release samples over 100 ms.
         for z in &parsed.zones {
             let fade = if z.trigger == Trigger::Attack {
@@ -1132,17 +1174,7 @@ mod tests {
             .filter(|z| z.trigger == Trigger::Attack)
             .count();
         assert_eq!((attack, parsed.zones.len() - attack), (126, 99));
-        let silence = sky_dsp::AudioData {
-            sample_rate: 44_100,
-            channels: vec![vec![0.0; 16]],
-        };
-        let lib = SampleLibrary::new(
-            info.name,
-            (0..parsed.samples.len())
-                .map(|_| SampleData::from_audio(&silence))
-                .collect(),
-            parsed.zones,
-        );
+        let lib = silent(info, parsed);
         assert_eq!(lib.key_range(), Some((21, 108)));
         // VCSL recorded the release up to D6; the keys above ring on.
         for key in 21..=108 {
@@ -1154,6 +1186,39 @@ mod tests {
             );
         }
         assert_eq!(info.layers, 3);
+    }
+
+    #[test]
+    fn the_strudel_piano_plays_its_nearest_recording_on_every_key() {
+        let (info, parsed) = listed_files(STRUDEL_PIANO, strudel_piano::MANIFEST_SHA256);
+        assert_eq!(parsed.samples.len(), 29);
+        let roots: Vec<u8> = parsed.zones.iter().map(|z| z.root).collect();
+        assert!(parsed.zones.iter().all(|z| z.release == 0.6));
+        let lib = silent(info, parsed);
+        assert_eq!(lib.key_range(), Some((21, 108)));
+        assert!(!lib.has_release_zones());
+        for key in 21..=108u8 {
+            assert_eq!(lib.layers(key), 1, "key {key}");
+            for vel in [1, 64, 127] {
+                let zones = lib.zones_at(Trigger::Attack, key, vel);
+                assert_eq!(zones.len(), 1, "key {key}");
+                let root = lib.zones()[zones[0] as usize].root;
+                // The nearest recording, the lower one of two as near, as
+                // the sample bank picks.
+                let nearest = roots
+                    .iter()
+                    .copied()
+                    .min_by_key(|r| (i32::from(*r) - i32::from(key)).abs())
+                    .expect("recordings");
+                assert_eq!(root, nearest, "key {key}");
+            }
+        }
+        assert_eq!(info.layers, 1);
+        assert_eq!(info.license, License::CcBy3);
+        assert_eq!(
+            info.credit,
+            crate::packs::find("piano").and_then(|p| p.credit)
+        );
     }
 
     #[test]

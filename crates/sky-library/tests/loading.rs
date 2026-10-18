@@ -594,11 +594,16 @@ fn file_libraries_download_each_file_and_resume() {
 
 /// Installs and loads a library from the folder `SKY_INSTRUMENTS` names,
 /// printing how long it took and the memory it uses.
-fn install_and_load(id: &str, layers: Option<u8>) -> sky_dsp::instruments::SampleLibrary {
-    let dir = std::env::var_os("SKY_INSTRUMENTS")
+/// Where the download tests keep libraries: `SKY_INSTRUMENTS`, or a folder
+/// in the temporary folder.
+fn downloads_dir() -> std::path::PathBuf {
+    std::env::var_os("SKY_INSTRUMENTS")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("skyware-sound-instruments-test"));
-    let instruments = Instruments::new(dir);
+        .unwrap_or_else(|| std::env::temp_dir().join("skyware-sound-instruments-test"))
+}
+
+fn install_and_load(id: &str, layers: Option<u8>) -> sky_dsp::instruments::SampleLibrary {
+    let instruments = Instruments::new(downloads_dir());
     let info = sky_library::find_instrument(id).unwrap();
     let started = std::time::Instant::now();
     instruments.install(info, &mut |_, _, _| {}).unwrap();
@@ -631,6 +636,30 @@ fn the_steinway_b_installs_and_loads() {
 }
 
 #[test]
+#[ignore = "downloads 5 MB from raw.githubusercontent.com"]
+fn the_strudel_piano_installs_and_loads() {
+    let lib = install_and_load(sky_library::STRUDEL_PIANO, None);
+    assert_eq!(lib.samples().len(), 29);
+    assert!(lib.is_stereo());
+    assert_eq!(lib.key_range(), Some((21, 108)));
+    let info = sky_library::find_instrument(sky_library::STRUDEL_PIANO).unwrap();
+    let memory = lib.bytes() as f64 / info.memory as f64;
+    assert!((memory - 1.0).abs() < 0.02, "{} bytes", lib.bytes());
+    // The MP3 encoder's delay is left out, so each note sounds within a
+    // few milliseconds of its start.
+    let sky_library::InstrumentSource::Files { files, .. } = info.source else {
+        panic!("downloads its files one by one");
+    };
+    let folder = Instruments::new(downloads_dir()).folder(info);
+    for (path, _, _) in files {
+        let audio = sky_io::read_audio(&folder.join(path)).unwrap();
+        assert_eq!(audio.sample_rate, 44_100);
+        let lead = audio.left().iter().position(|x| x.abs() > 1e-3).unwrap();
+        assert!(lead < 600, "{path} starts {lead} frames late");
+    }
+}
+
+#[test]
 #[ignore = "downloads 707 MB from freepats.zenvoid.org"]
 fn the_salamander_grand_installs_and_loads() {
     let all = install_and_load("salamander-grand-piano", None);
@@ -648,10 +677,7 @@ fn the_salamander_grand_installs_and_loads() {
 #[test]
 #[ignore = "downloads 33 MB from freepats.zenvoid.org"]
 fn the_full_upright_piano_installs_and_loads() {
-    let dir = std::env::var_os("SKY_INSTRUMENTS")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("skyware-sound-instruments-test"));
-    let instruments = Instruments::new(dir);
+    let instruments = Instruments::new(downloads_dir());
     let info = sky_library::find_instrument("upright-piano-kw").unwrap();
     let started = std::time::Instant::now();
     instruments.install(info, &mut |_, _, _| {}).unwrap();

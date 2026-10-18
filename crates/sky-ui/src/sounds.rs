@@ -12,7 +12,9 @@ use egui::{
 };
 use sky_core::TrackId;
 use sky_dsp::InstrumentType;
-use sky_library::{MAX_FILES, MapFile, PACKS, Pack, PackInfo, PackSource, packs};
+use sky_library::{
+    InstrumentInfo, MAX_FILES, MapFile, PACKS, Pack, PackInfo, PackSource, find_instrument, packs,
+};
 use sky_model::{
     Command, InstrumentSlot, License, LicenseReport, Origin, Project, SampleBank, Track, TrackKind,
     Transaction,
@@ -59,6 +61,8 @@ pub struct LoadSoundsDialog {
     pub add: bool,
     /// Play each sound as it is clicked.
     pub hear: bool,
+    /// Open a pack that is also an instrument library as that instrument.
+    pub as_instrument: bool,
     pub listing: Option<Listing>,
     /// The map address being read now.
     pub reading: Option<String>,
@@ -80,6 +84,22 @@ impl LoadSoundsDialog {
         }
         let known = packs::find(&text).is_some();
         Some(PackSource::parse(&text, (!known).then_some(self.license)))
+    }
+
+    /// The instrument library the chosen pack is also, when it would go
+    /// into a new track or a track of that instrument.
+    pub fn instrument(&self, project: &Project) -> Option<&'static InstrumentInfo> {
+        let info = find_instrument(self.pack.and_then(|i| PACKS.get(i))?.instrument?)?;
+        let fits = match self.track.and_then(|t| project.track(t).ok()) {
+            Some(t) => t.instrument.as_ref().is_some_and(|i| i.kind == info.kind),
+            None => true,
+        };
+        fits.then_some(info)
+    }
+
+    /// The instrument library the load opens as, rather than a bank.
+    pub fn opens_as(&self, project: &Project) -> Option<&'static InstrumentInfo> {
+        self.instrument(project).filter(|_| self.as_instrument)
     }
 
     /// The listing of the pack as chosen now, once read.
@@ -157,13 +177,6 @@ pub fn bank_of(track: &Track) -> Option<&SampleBank> {
         .filter(|i| i.kind == InstrumentType::Bank)
         .and_then(|i| i.bank.as_ref())
         .filter(|b| !b.sounds.is_empty())
-}
-
-fn is_bank_track(track: &Track) -> bool {
-    track
-        .instrument
-        .as_ref()
-        .is_some_and(|i| i.kind == InstrumentType::Bank)
 }
 
 /// The packs a bank's sounds came from, with their licenses and credits.
@@ -279,6 +292,7 @@ impl App {
             chosen: BTreeSet::new(),
             add: false,
             hear: true,
+            as_instrument: true,
             listing: None,
             reading: None,
             running: false,
@@ -341,12 +355,19 @@ impl App {
     }
 
     /// Loads the chosen sounds in the background, adding a track first
-    /// when the dialog has none.
+    /// when the dialog has none. A pack that is also an instrument library
+    /// opens as that instrument instead.
     pub fn start_bank_load(&mut self, ctx: &Context) {
         let project = self.view.project.clone();
         let Some(d) = self.dialogs.load_sounds.as_mut() else {
             return;
         };
+        if let Some(info) = d.opens_as(&project) {
+            let track = d.track.filter(|t| project.track(*t).is_ok());
+            self.dialogs.load_sounds = None;
+            self.open_instrument(ctx, info, track);
+            return;
+        }
         let Some(source) = d.source() else {
             d.result = Some(Err(
                 "Choose a pack, or type the address of its strudel.json".into(),
@@ -413,6 +434,32 @@ impl App {
                         .map_err(|e| e.to_string()),
                 )
             });
+    }
+
+    /// Has `track`, or a new track after the selected one, play the
+    /// instrument library `info`, downloading it in the background when
+    /// this computer does not have it.
+    fn open_instrument(
+        &mut self,
+        ctx: &Context,
+        info: &'static InstrumentInfo,
+        track: Option<TrackId>,
+    ) {
+        let track = match track {
+            Some(t) => t,
+            None => {
+                let kind = actions::NewTrack::Instrument(info.kind);
+                let r = actions::add_track(&self.session, kind, self.sel.track);
+                let Some(t) = self.report(r) else {
+                    return;
+                };
+                self.refresh();
+                t
+            }
+        };
+        self.sel.select_track(track);
+        self.workspace.show(Tab::Instrument);
+        self.get_piano_library(ctx, track, info, None);
     }
 
     pub fn bank_loaded(&mut self, result: Result<BankLoaded, String>) {
@@ -697,12 +744,20 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
             .map(|(_, n)| n)
             .sum()
     };
-    let instrument_tracks: Vec<(TrackId, String, bool)> = project
+    let instrument_tracks: Vec<(TrackId, String, Option<InstrumentType>)> = project
         .tracks
         .iter()
         .filter(|t| t.kind == TrackKind::Instrument)
-        .map(|t| (t.id, t.name.clone(), is_bank_track(t)))
+        .map(|t| (t.id, t.name.clone(), t.instrument.as_ref().map(|i| i.kind)))
         .collect();
+    // The instrument library the pack is also, and whether this load
+    // opens as it.
+    let pack_instrument = d
+        .pack
+        .and_then(|i| PACKS.get(i))
+        .and_then(|p| p.instrument)
+        .and_then(find_instrument);
+    let opens_as = d.opens_as(&project);
     let target_sounds = d
         .track
         .and_then(|t| project.track(t).ok())
@@ -814,8 +869,11 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
                         .selected_text(into)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut d.track, None, "A new track");
-                            for (id, name, is_bank) in &instrument_tracks {
-                                let label = if *is_bank {
+                            for (id, name, kind) in &instrument_tracks {
+                                let keeps = *kind == Some(InstrumentType::Bank)
+                                    || (d.as_instrument
+                                        && pack_instrument.is_some_and(|i| *kind == Some(i.kind)));
+                                let label = if keeps {
                                     name.clone()
                                 } else {
                                     format!("{name} (becomes a sample bank)")
@@ -824,6 +882,21 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
                             }
                         });
                     ui.end_row();
+
+                    if let Some(info) = d.instrument(&project) {
+                        ui.label("");
+                        ui.checkbox(
+                            &mut d.as_instrument,
+                            format!("Open as a {}: {}", info.kind.label(), info.name),
+                        )
+                        .on_hover_text(format!(
+                            "The pack is also a {} library, with its velocity curve, release \
+                             and sustain pedal. Off, it loads as a sample bank whose sounds \
+                             patterns play by name.",
+                            info.kind.label().to_lowercase()
+                        ));
+                        ui.end_row();
+                    }
 
                     if listed && !banks.is_empty() {
                         ui.label("Bank");
@@ -1029,10 +1102,10 @@ pub fn load_sounds_dialog(app: &mut App, ctx: &Context) {
                 ui.label(RichText::new("Loading…").color(theme::TEXT_WEAK));
             } else {
                 let can = source.is_some() && !reading && files <= MAX_FILES;
-                let label = if d.chosen.is_empty() {
-                    "Load".to_string()
-                } else {
-                    format!("Load {}", d.chosen.len())
+                let label = match opens_as {
+                    Some(info) => format!("Open as a {}", info.kind.label()),
+                    None if d.chosen.is_empty() => "Load".to_string(),
+                    None => format!("Load {}", d.chosen.len()),
                 };
                 if ui
                     .add_enabled(can, egui::Button::new(RichText::new(label).strong()))

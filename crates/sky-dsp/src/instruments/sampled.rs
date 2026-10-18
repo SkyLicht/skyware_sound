@@ -26,7 +26,7 @@ pub const MAX_VOICES: usize = 96;
 /// Voice slots: the sounding voices plus room for stolen ones to fade.
 const SLOTS: usize = MAX_VOICES + 32;
 /// How long a stolen voice takes to fade out.
-const STEAL_MS: f32 = 5.0;
+pub(crate) const STEAL_MS: f32 = 5.0;
 /// How long the note a key still sounds takes to fade when the key is
 /// struck again.
 const RESTRIKE_MS: f32 = 50.0;
@@ -533,7 +533,7 @@ impl Default for Voice {
 
 /// Hermite 4-point interpolation between `x0` and `x1` at `t`.
 #[inline]
-fn cubic(xm1: f32, x0: f32, x1: f32, x2: f32, t: f32) -> f32 {
+pub(crate) fn cubic(xm1: f32, x0: f32, x1: f32, x2: f32, t: f32) -> f32 {
     let c1 = 0.5 * (x1 - xm1);
     let c2 = xm1 - 2.5 * x0 + 2.0 * x1 - 0.5 * x2;
     let c3 = 0.5 * (x2 - xm1) + 1.5 * (x0 - x1);
