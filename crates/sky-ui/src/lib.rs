@@ -23,6 +23,7 @@ mod dialogs;
 mod edit;
 mod fx_view;
 mod game;
+mod glyphs;
 mod graph;
 mod inst_view;
 mod jobs;
@@ -35,6 +36,8 @@ mod palette;
 mod params;
 mod pattern_editor;
 mod piano_roll;
+mod picture_editor;
+mod pictures;
 mod presets;
 mod ruler_lanes;
 mod sounds;
@@ -77,6 +80,9 @@ pub struct UiConfig {
     /// The file that keeps the user's instrument and effect presets; `None`
     /// keeps them only while the app runs.
     pub preset_store: Option<std::path::PathBuf>,
+    /// The file that keeps the pictures given to packs, banks and folders
+    /// in the browser; `None` keeps them only while the app runs.
+    pub picture_store: Option<std::path::PathBuf>,
 }
 
 /// Opens the main window and runs until it is closed.

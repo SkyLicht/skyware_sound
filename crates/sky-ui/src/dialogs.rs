@@ -38,6 +38,8 @@ pub enum PathPurpose {
     BrowseFolder,
     /// Where Help > Keyboard shortcuts saves its web page.
     ShortcutsPage,
+    /// An image for a picture.
+    PictureImage,
 }
 
 impl PathPurpose {
@@ -52,6 +54,7 @@ impl PathPurpose {
             PathPurpose::GameFolder => "Game export folder",
             PathPurpose::BrowseFolder => "Add a folder to the browser",
             PathPurpose::ShortcutsPage => "Save the keyboard shortcuts",
+            PathPurpose::PictureImage => "Choose a picture",
         }
     }
 
@@ -68,6 +71,7 @@ impl PathPurpose {
             PathPurpose::GameFolder => "Your game's audio folder, such as assets/audio",
             PathPurpose::BrowseFolder => "A folder of WAV, FLAC, OGG or MP3 samples",
             PathPurpose::ShortcutsPage => "A web page ending in .html",
+            PathPurpose::PictureImage => "A PNG, JPEG, WebP, BMP or GIF image",
         }
     }
 }
@@ -264,6 +268,9 @@ fn native_pick(purpose: PathPurpose, default: &Path) -> Option<PathBuf> {
             .pick_file(),
         PathPurpose::ExportWavFile => d.add_filter("WAV", &["wav"]).save_file(),
         PathPurpose::ShortcutsPage => d.add_filter("Web page", &["html"]).save_file(),
+        PathPurpose::PictureImage => d
+            .add_filter("Image", &crate::pictures::IMAGE_EXTENSIONS[..])
+            .pick_file(),
     }
 }
 
@@ -305,6 +312,9 @@ impl App {
                 .and_then(|p| p.parent().map(Path::to_path_buf))
                 .unwrap_or_else(default_dir),
             PathPurpose::ShortcutsPage => default_dir().join("Skyware Sound shortcuts.html"),
+            PathPurpose::PictureImage => directories::UserDirs::new()
+                .and_then(|d| d.picture_dir().map(Path::to_path_buf))
+                .unwrap_or_else(default_dir),
         }
     }
 
@@ -338,6 +348,7 @@ impl App {
                 | PathPurpose::ImportAudio
                 | PathPurpose::SoundPack
                 | PathPurpose::BrowseFolder
+                | PathPurpose::PictureImage
         ) && !text.ends_with(std::path::MAIN_SEPARATOR)
         {
             text.push(std::path::MAIN_SEPARATOR);
@@ -483,6 +494,22 @@ impl App {
                     return Some(msg);
                 }
                 self.info(format!("Saved the shortcuts to {}", path.display()));
+            }
+            PathPurpose::PictureImage => {
+                if !path.is_file() {
+                    let msg = format!("{} is not a file", path.display());
+                    self.error(msg.clone());
+                    return Some(msg);
+                }
+                let target = self
+                    .pictures
+                    .choosing
+                    .take()
+                    .or_else(|| self.pictures.editor.as_ref().map(|e| e.target.clone()));
+                match target {
+                    Some(t) => self.load_picture_file(ctx, t, path),
+                    None => self.error("The picture editor was closed before the image was chosen"),
+                }
             }
         }
         None

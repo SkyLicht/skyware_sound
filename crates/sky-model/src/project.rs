@@ -12,6 +12,7 @@ use sky_core::{
 use sky_dsp::{EffectType, InstrumentType};
 
 use crate::error::ModelError;
+use crate::picture::Picture;
 use crate::steps::StepClip;
 
 /// The project file format version this build writes.
@@ -370,6 +371,10 @@ pub struct Track {
     pub name: String,
     pub kind: TrackKind,
     pub color: [u8; 3],
+    /// The picture in the track's header and mixer strip. Without one a
+    /// track shows a symbol for what it plays, or its sample pack's picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<Picture>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument: Option<InstrumentSlot>,
     pub channel: Channel,
@@ -384,6 +389,7 @@ impl Track {
             name: name.into(),
             kind: TrackKind::Audio,
             color: [86, 156, 214],
+            picture: None,
             instrument: None,
             channel: Channel::default(),
             clips: Vec::new(),
@@ -402,6 +408,7 @@ impl Track {
                 InstrumentType::Bank => [214, 176, 86],
                 InstrumentType::Acid => [196, 214, 70],
             },
+            picture: None,
             instrument: Some(InstrumentSlot::new(instrument)),
             channel: Channel::default(),
             clips: Vec::new(),

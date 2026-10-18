@@ -21,11 +21,24 @@ use crate::actions::{self, ChannelChange};
 use crate::app::{Action, App};
 use crate::fx_view::{self, REDUCTION_RANGE, ReductionLevel};
 use crate::params::{Edits, param_grid};
+use crate::pictures::{self, PictureState, Style, Target};
 use crate::presets::{self, Device, Kind};
 use crate::theme;
 use crate::widgets::{self, MeterLevel};
 
 const STRIP_W: f32 = 132.0;
+/// The picture at the top of a strip, when the panel has room for it.
+const PICTURE_H: f32 = 52.0;
+/// With less room than this the picture is a small tile beside the name.
+const PICTURE_MIN: f32 = 34.0;
+/// The small tile beside the name.
+const PICTURE_SMALL: f32 = 20.0;
+/// What a strip needs besides its picture, insert slots and fader: the
+/// name, the pan row, the level under the fader and the gaps between.
+const STRIP_REST: f32 = 105.0;
+/// The fader keeps this much height before the picture takes any, which
+/// leaves room for the master's loudness readouts beside it.
+const FADER_ROOM: f32 = 130.0;
 /// The master's loudness meter and readout, beside its fader.
 const LOUDNESS_W: f32 = 104.0;
 /// One insert slot, and the gap under it.
@@ -191,7 +204,6 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                             project,
                             channel_ref: ChannelRef::Track(track.id),
                             name: &track.name,
-                            color: theme::track_color(track.color),
                             channel: &track.channel,
                             meter: &meter,
                             selected,
@@ -211,7 +223,6 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                         project,
                         channel_ref: ChannelRef::Master,
                         name: "Master",
-                        color: theme::ACCENT,
                         channel: &project.master,
                         meter: &meter,
                         selected: false,
@@ -227,7 +238,6 @@ struct Strip<'a> {
     project: &'a Project,
     channel_ref: ChannelRef,
     name: &'a str,
-    color: Color32,
     channel: &'a Channel,
     meter: &'a MeterLevel,
     selected: bool,
@@ -240,7 +250,6 @@ fn strip(app: &mut App, ui: &mut Ui, s: Strip) {
         project,
         channel_ref,
         name,
-        color,
         channel,
         meter,
         selected,
@@ -261,15 +270,32 @@ fn strip(app: &mut App, ui: &mut Ui, s: Strip) {
         ui.set_min_height(ui.available_height());
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            // Name with the track color underneath.
-            let (rect, _) = ui.allocate_exact_size(vec2(width, 3.0), Sense::hover());
-            ui.painter().rect_filled(rect, CornerRadius::same(1), color);
+            // The picture, then the name. A short panel keeps its height
+            // for the fader, and the picture becomes a small tile beside
+            // the name.
+            let effects_h = slots as f32 * (SLOT_H + SLOT_GAP) - SLOT_GAP;
+            let room = ui.available_height() - STRIP_REST - effects_h - FADER_ROOM;
+            let in_strip = ui.rect_contains_pointer(ui.max_rect());
+            let big = room >= PICTURE_MIN;
+            if big {
+                let (rect, _) =
+                    ui.allocate_exact_size(vec2(width, room.min(PICTURE_H)), Sense::hover());
+                strip_picture(app, ui, project, channel_ref, rect, Style::Banner, in_strip);
+            }
             let label = ui
-                .add(
-                    egui::Label::new(RichText::new(name).strong().color(theme::TEXT))
-                        .truncate()
-                        .sense(Sense::click()),
-                )
+                .horizontal(|ui| {
+                    if !big {
+                        let (rect, _) = ui
+                            .allocate_exact_size(egui::Vec2::splat(PICTURE_SMALL), Sense::hover());
+                        strip_picture(app, ui, project, channel_ref, rect, Style::Tile, in_strip);
+                    }
+                    ui.add(
+                        egui::Label::new(RichText::new(name).strong().color(theme::TEXT))
+                            .truncate()
+                            .sense(Sense::click()),
+                    )
+                })
+                .inner
                 .on_hover_text("Click to select");
             if let ChannelRef::Track(id) = channel_ref
                 && label.clicked()
@@ -385,6 +411,39 @@ fn strip(app: &mut App, ui: &mut Ui, s: Strip) {
     });
     let glow = app.ai.channel_glow(channel_ref, app.now);
     widgets::ai_glow(ui.painter(), response.response.rect, 5, glow);
+}
+
+/// A strip's picture: a track's opens the picture editor, the master's
+/// is only shown.
+fn strip_picture(
+    app: &mut App,
+    ui: &mut Ui,
+    project: &Project,
+    channel_ref: ChannelRef,
+    rect: Rect,
+    style: Style,
+    in_strip: bool,
+) {
+    let radius = if style == Style::Banner { 5.0 } else { 4.0 };
+    match channel_ref {
+        ChannelRef::Track(id) => {
+            if let Ok(track) = project.track(id) {
+                let shown = app.pictures.track_shown(project, track);
+                let target = Target::Track(id);
+                pictures::button(
+                    app, ui, "mixer", rect, radius, &shown, target, style, in_strip,
+                );
+            }
+        }
+        ChannelRef::Master => pictures::paint(
+            ui.painter(),
+            rect,
+            radius,
+            &PictureState::master_shown(),
+            &mut app.pictures.images,
+            style,
+        ),
+    }
 }
 
 /// The insert slots: the channel's effects, then "+ Effect", then empty

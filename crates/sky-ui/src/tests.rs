@@ -5620,3 +5620,304 @@ fn inserts_drag_to_a_new_place() {
     assert_eq!(order(&h, bass.id), [ids[2], ids[0], ids[1]]);
     assert!(order(&h, drums.id).is_empty());
 }
+
+/// A small opaque PNG file.
+fn picture_file(path: &Path, rgb: [u8; 3]) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).expect("folder");
+    }
+    let image = image::RgbImage::from_pixel(40, 24, image::Rgb(rgb));
+    image.save(path).expect("write png");
+}
+
+fn picture_id(place: &str, target: &crate::pictures::Target) -> Id {
+    crate::pictures::button_id(place, target)
+}
+
+#[test]
+fn a_tracks_picture_changes_from_its_header_and_undoes() {
+    use crate::pictures::{Shown, Target};
+    use sky_model::{Picture, Symbol};
+
+    let mut h = Harness::demo();
+    h.accessible();
+    let track = h.project().tracks[0].clone();
+    let target = Target::Track(track.id);
+    assert_eq!(track.picture, None);
+    let shown = h.app.shown_of(&target).expect("shown");
+    assert!(
+        matches!(shown, Shown::Symbol { symbol, .. } if symbol == crate::pictures::track_symbol(&track)),
+        "a track shows what it plays: {shown:?}"
+    );
+
+    // Clicking the picture in the header opens the editor for it.
+    h.click(h.rect_of(picture_id("header", &target)).center());
+    assert_eq!(
+        h.app.pictures.editor.as_ref().map(|e| e.target.clone()),
+        Some(target.clone())
+    );
+    h.frames(2);
+
+    // A symbol is one undo step, and follows the track's color.
+    let history = h.history_len();
+    h.click_label("drum machine");
+    let p = h.project();
+    assert_eq!(
+        p.track(track.id).expect("track").picture,
+        Some(Picture::symbol(Symbol::DrumMachine))
+    );
+    assert_eq!(h.history_len(), history + 1);
+
+    // A swatch sets the track's color.
+    h.click_label("#e25c54");
+    assert_eq!(
+        h.project().track(track.id).expect("track").color,
+        [226, 92, 84]
+    );
+    assert_eq!(h.history_len(), history + 2);
+
+    // Undo takes both back.
+    h.key(Key::Z, Modifiers::COMMAND);
+    h.key(Key::Z, Modifiers::COMMAND);
+
+    // A change made by a drag shows at once and is one undo step when the
+    // drag ends.
+    let history = h.history_len();
+    let image = sky_model::PictureImage::new(vec![1, 2, 3], "x.png");
+    h.pointer(pos2(700.0, 700.0), true);
+    h.frame();
+    for zoom in [1.5, 2.0, 2.5] {
+        let mut zoomed = image.clone();
+        zoomed.zoom = zoom;
+        h.app
+            .set_picture(&target, Some(Picture::Image(zoomed)), true);
+        h.frame();
+    }
+    assert_eq!(
+        h.history_len(),
+        history,
+        "nothing yet while the drag goes on"
+    );
+    assert!(
+        matches!(h.app.shown_of(&target), Some(Shown::Image { image, .. }) if image.zoom == 2.5)
+    );
+    h.pointer(pos2(700.0, 700.0), false);
+    h.frame();
+    assert_eq!(h.history_len(), history + 1);
+    assert!(matches!(
+        &h.project().track(track.id).expect("track").picture,
+        Some(Picture::Image(i)) if i.zoom == 2.5
+    ));
+    h.key(Key::Z, Modifiers::COMMAND);
+    let back = h.project().track(track.id).expect("track").clone();
+    assert_eq!((back.picture, back.color), (None, track.color));
+
+    // Done closes it, and what was picked is offered again.
+    h.click_label("drum machine");
+    h.click_label("Done");
+    assert!(h.app.pictures.editor.is_none());
+    assert_eq!(
+        h.app.pictures.store.recent(),
+        [Picture::symbol(Symbol::DrumMachine)]
+    );
+
+    // The mixer strip shows it too, and opens the same editor.
+    h.app.workspace.show(Tab::Mixer);
+    h.frames(3);
+    h.click(h.rect_of(picture_id("mixer", &target)).center());
+    assert!(h.app.pictures.editor.is_some());
+    h.frames(2);
+    h.click_label("Reset to default");
+    assert_eq!(h.project().track(track.id).expect("track").picture, None);
+}
+
+#[test]
+fn pack_pictures_are_kept_on_this_computer() {
+    use crate::browser::{pack_key, pack_target, row_id};
+    use crate::pictures::PictureStore;
+    use sky_library::PACKS;
+    use sky_model::{Picture, Symbol};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = dir.path().join("pictures.json");
+    let mut h = Harness::with_config(
+        empty_project("Pictures"),
+        UiConfig {
+            picture_store: Some(store.clone()),
+            ..UiConfig::default()
+        },
+    );
+    h.offline_packs();
+    h.accessible();
+    let (vcsl, piano) = (&PACKS[0], &PACKS[1]);
+    let target = pack_target(vcsl);
+
+    // The pack's row shows its picture; clicking it opens the editor
+    // rather than the pack.
+    h.click(h.rect_of(picture_id("browser", &target)).center());
+    assert!(!h.app.browser.is_expanded(&pack_key(vcsl)));
+    assert!(h.app.pictures.editor.is_some());
+    h.frames(2);
+    h.click_label("piano");
+    let mine = Picture::Symbol {
+        symbol: Symbol::Piano,
+        color: Some([200, 150, 60]),
+    };
+    assert_eq!(h.app.pictures.store.get(&pack_key(vcsl)), Some(&mine));
+    // No undo step: it is not part of the project.
+    assert_eq!(h.history_len(), 0);
+    h.click_label("Done");
+    h.frames(2);
+    assert_eq!(
+        PictureStore::load(Some(store.clone())).get(&pack_key(vcsl)),
+        Some(&mine)
+    );
+
+    // Copy picture and Paste picture from the rows' menus.
+    h.right_click(h.rect_of(row_id(&pack_key(vcsl))).center());
+    h.click_label("Copy picture");
+    h.right_click(h.rect_of(row_id(&pack_key(piano))).center());
+    h.click_label("Paste picture");
+    assert_eq!(h.app.pictures.store.get(&pack_key(piano)), Some(&mine));
+    h.right_click(h.rect_of(row_id(&pack_key(vcsl))).center());
+    h.click_label("Reset picture");
+    assert_eq!(h.app.pictures.store.get(&pack_key(vcsl)), None);
+    h.frames(2);
+    let again = PictureStore::load(Some(store));
+    assert_eq!(again.get(&pack_key(vcsl)), None);
+    assert_eq!(again.get(&pack_key(piano)), Some(&mine));
+}
+
+#[test]
+fn dropped_images_become_pictures() {
+    use crate::pictures::Target;
+    use sky_model::Picture;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let red = dir.path().join("red.png");
+    let blue = dir.path().join("blue.png");
+    picture_file(&red, [220, 30, 30]);
+    picture_file(&blue, [30, 30, 220]);
+    let mut h = Harness::demo();
+    let track = h.project().tracks[1].id;
+    let target = Target::Track(track);
+    let drop = |h: &mut Harness, path: &Path| {
+        h.dropped = vec![Arc::new(TestFile(path.to_path_buf())) as egui::DroppedFileHandle];
+        h.frame();
+        h.wait_jobs();
+        h.frames(2);
+    };
+
+    // Into the open picture editor.
+    h.click(h.rect_of(picture_id("header", &target)).center());
+    drop(&mut h, &red);
+    let picture = h.project().track(track).expect("track").picture.clone();
+    let Some(Picture::Image(image)) = picture else {
+        panic!("an image: {picture:?}");
+    };
+    assert_eq!(image.name, "red.png");
+    assert_eq!(&image.data[..3], &[0xff, 0xd8, 0xff], "kept as a JPEG");
+    assert!(
+        h.app
+            .pictures
+            .images
+            .texture(&h.ctx(), &image.data)
+            .is_some()
+    );
+    h.app.close_picture_editor();
+
+    // Dropped where no picture is known, it waits for a click on one.
+    h.move_to(pos2(900.0, 880.0));
+    drop(&mut h, &blue);
+    assert_eq!(h.app.pictures.waiting.as_deref(), Some(blue.as_path()));
+    h.click(h.rect_of(picture_id("header", &target)).center());
+    h.wait_jobs();
+    h.frames(2);
+    let picture = h.project().track(track).expect("track").picture.clone();
+    assert!(
+        matches!(&picture, Some(Picture::Image(i)) if i.name == "blue.png"),
+        "{picture:?}"
+    );
+    assert!(h.app.pictures.editor.is_none(), "the click only placed it");
+
+    // Esc lets a waiting image go.
+    h.move_to(pos2(900.0, 880.0));
+    drop(&mut h, &red);
+    assert!(h.app.pictures.waiting.is_some());
+    h.key(Key::Escape, Modifiers::NONE);
+    assert!(h.app.pictures.waiting.is_none());
+
+    // A file that is not an image says so in the editor.
+    let fake = dir.path().join("fake.png");
+    std::fs::write(&fake, "not an image").expect("fake");
+    h.click(h.rect_of(picture_id("header", &target)).center());
+    drop(&mut h, &fake);
+    let error = h.app.pictures.editor.as_ref().and_then(|e| e.error.clone());
+    assert!(error.is_some_and(|e| e.contains("fake.png")));
+}
+
+#[test]
+fn packs_show_as_tiles_with_a_card() {
+    use crate::browser::{pack_key, row_id};
+    use sky_library::PACKS;
+
+    let mut h = Harness::with_project(empty_project("Tiles"));
+    h.offline_packs();
+    h.accessible();
+    h.click_label("Tiles view");
+    assert!(h.app.browser.tiles);
+    h.frames(2);
+    let tile = row_id(&format!("tile:{}", PACKS[2].id));
+    assert!(h.ctx.read_response(row_id(&pack_key(&PACKS[2]))).is_none());
+
+    // Clicking a tile shows the pack's card at the bottom.
+    h.click(h.rect_of(tile).center() + vec2(0.0, 10.0));
+    assert_eq!(h.app.browser.card, Some(PACKS[2].id));
+    h.frames(2);
+    assert!(h.find("Close the pack card").is_some());
+
+    // Show sounds goes to the list with the pack open.
+    h.click_label("Show sounds");
+    h.frames(2);
+    assert!(!h.app.browser.tiles);
+    assert!(h.app.browser.is_expanded(&pack_key(&PACKS[2])));
+    assert!(h.ctx.read_response(row_id(&pack_key(&PACKS[2]))).is_some());
+    h.click_label("Close the pack card");
+    assert_eq!(h.app.browser.card, None);
+}
+
+#[test]
+fn folders_and_packs_bring_their_own_covers() {
+    use crate::browser::folder_key;
+    use crate::pictures::Shown;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let samples = dir.path().join("Kicks");
+    tone_file(&samples.join("kick.wav"), 0.1);
+    picture_file(&samples.join("cover.png"), [10, 200, 120]);
+    let mut h = Harness::with_project(empty_project("Covers"));
+    h.offline_packs();
+    h.app.browser.add_folder(samples.clone());
+    h.frames(2);
+    h.wait_jobs();
+    h.frames(2);
+    let key = folder_key(&samples);
+    let shown = h
+        .app
+        .pictures
+        .browser_shown(&key, &crate::pictures::folder_default(&samples));
+    assert!(
+        matches!(&shown, Shown::Image { image, .. } if image.name == "cover.png"),
+        "{shown:?}"
+    );
+    // A picture someone picks wins over the cover.
+    h.app.pictures.store.set(
+        &key,
+        Some(sky_model::Picture::symbol(sky_model::Symbol::Drums)),
+    );
+    let shown = h
+        .app
+        .pictures
+        .browser_shown(&key, &crate::pictures::folder_default(&samples));
+    assert!(matches!(shown, Shown::Symbol { .. }));
+}

@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use sky_core::{ClipId, EffectId, NoteId, PPQ, TempoMap, Ticks, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::{
-    AbCompare, ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Project,
-    StepClip, StepLane, Swing, Track, Transaction,
+    AbCompare, ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Picture,
+    Project, StepClip, StepLane, Swing, Track, Transaction,
 };
 use sky_session::Session;
 
@@ -129,6 +129,16 @@ pub fn set_track_color(
     key: Option<u64>,
 ) -> ActionResult<u64> {
     single(session, Command::SetTrackColor { id, color }, key)
+}
+
+/// Gives a track its own picture, or takes it away with `None`.
+pub fn set_track_picture(
+    session: &Session,
+    id: TrackId,
+    picture: Option<Picture>,
+    key: Option<u64>,
+) -> ActionResult<u64> {
+    single(session, Command::SetTrackPicture { id, picture }, key)
 }
 
 /// Changes any of a channel's fader, pan, mute or solo.

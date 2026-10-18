@@ -70,6 +70,18 @@ fn every_command_undoes_exactly() {
             id: drums,
             name: "Kit".into(),
         },
+        Command::SetTrackPicture {
+            id: drums,
+            picture: Some(Picture::symbol(Symbol::DrumMachine)),
+        },
+        Command::SetTrackPicture {
+            id: bass,
+            picture: Some(Picture::Image(PictureImage::new(vec![1, 2, 3], "bass.png"))),
+        },
+        Command::SetTrackPicture {
+            id: drums,
+            picture: None,
+        },
         Command::SetChannel {
             channel: ChannelRef::Track(bass),
             volume_db: Some(-6.0),
@@ -1179,4 +1191,41 @@ fn commands_name_what_they_change() {
             Target::Track(lead_id),
         ]
     );
+}
+
+#[test]
+fn track_pictures_are_checked_and_saved() {
+    let mut project = demo_project();
+    let mut history = History::new();
+    let drums = project.tracks[0].id;
+    let mut image = PictureImage::new(vec![7; 16], "kit.jpg");
+    image.zoom = 9.0;
+    let err = try_apply(
+        &mut history,
+        &mut project,
+        Command::SetTrackPicture {
+            id: drums,
+            picture: Some(Picture::Image(image.clone())),
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("zoom"), "{err}");
+    assert_eq!(project.tracks[0].picture, None);
+
+    image.zoom = 2.0;
+    image.tint = 0.4;
+    try_apply(
+        &mut history,
+        &mut project,
+        Command::SetTrackPicture {
+            id: drums,
+            picture: Some(Picture::Image(image.clone())),
+        },
+    )
+    .unwrap();
+    let json = file::project_to_json(&project);
+    let back = file::project_from_json(&json).unwrap();
+    assert_eq!(back.tracks[0].picture, Some(Picture::Image(image)));
+    // Tracks without one leave it out of the file.
+    assert_eq!(json.matches("\"picture\"").count(), 1);
 }

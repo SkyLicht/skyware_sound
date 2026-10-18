@@ -11,9 +11,11 @@ use crate::browser::{FolderIndex, PackListing};
 use crate::dialogs::{LoopSummary, PathPurpose, WavSummary};
 use crate::game::GameSummary;
 use crate::loop_inspector::{Checked, Target};
+use crate::pictures;
 use crate::waveform::Peaks;
 use sky_core::{AudioId, ClipId, Ticks};
 use sky_library::Pack;
+use sky_model::PictureImage;
 use sky_session::{BankLoaded, ImportedFiles, Placed, SoundsLoaded};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,6 +78,17 @@ pub enum JobOutput {
     Previewed {
         key: PreviewKey,
         result: Result<Rendered, String>,
+    },
+    /// An image read for a picture.
+    PictureLoaded {
+        target: pictures::Target,
+        result: Result<PictureImage, String>,
+    },
+    /// The cover image a pack or folder brings, if it has one, by browser
+    /// key.
+    CoverFound {
+        key: String,
+        cover: Option<PictureImage>,
     },
     /// A loop rendered for the Loop inspector, with its seam checked.
     SeamChecked {

@@ -16,6 +16,7 @@ use sky_core::{
 };
 
 use crate::error::ModelError;
+use crate::picture::Picture;
 use crate::project::*;
 use crate::steps::StepClip;
 
@@ -97,6 +98,13 @@ pub enum Command {
     SetTrackColor {
         id: TrackId,
         color: [u8; 3],
+    },
+    /// Sets a track's picture; `None` goes back to the one it shows by
+    /// itself.
+    SetTrackPicture {
+        id: TrackId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picture: Option<Picture>,
     },
     #[serde(rename_all = "camelCase")]
     SetChannel {
@@ -742,7 +750,10 @@ impl Command {
                     add(Target::Clip(clip.id));
                 }
             }
-            C::MoveTrack { id, .. } | C::SetTrackName { id, .. } | C::SetTrackColor { id, .. } => {
+            C::MoveTrack { id, .. }
+            | C::SetTrackName { id, .. }
+            | C::SetTrackColor { id, .. }
+            | C::SetTrackPicture { id, .. } => {
                 add(Target::Track(*id));
             }
             C::SetChannel { channel, .. } | C::RemoveEffect { channel, .. } => {
@@ -811,6 +822,7 @@ impl Command {
             Command::MoveTrack { .. } => "Move track",
             Command::SetTrackName { .. } => "Rename track",
             Command::SetTrackColor { .. } => "Recolor track",
+            Command::SetTrackPicture { .. } => "Change track picture",
             Command::SetChannel { .. } => "Change mixer",
             Command::SetInstrument { .. } => "Change instrument",
             Command::SetInstrumentParam { .. } => "Change instrument parameter",
@@ -960,6 +972,14 @@ impl Command {
                 let t = project.track_mut(id)?;
                 let old = std::mem::replace(&mut t.color, color);
                 Command::SetTrackColor { id, color: old }
+            }
+            Command::SetTrackPicture { id, picture } => {
+                if let Some(p) = &picture {
+                    p.check()?;
+                }
+                let t = project.track_mut(id)?;
+                let old = std::mem::replace(&mut t.picture, picture);
+                Command::SetTrackPicture { id, picture: old }
             }
             Command::SetChannel {
                 channel,
