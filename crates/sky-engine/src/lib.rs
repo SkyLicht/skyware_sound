@@ -30,7 +30,7 @@ pub mod offline;
 pub mod preview;
 pub mod shared;
 
-pub use compile::{AudioCache, compile};
+pub use compile::{AudioCache, LibraryCache, compile, compile_with};
 pub use engine::{Engine, EngineHandle, EngineMsg, create_engine};
 pub use offline::{render, render_intro_loop, render_loop, render_one_shot};
 pub use preview::Preview;

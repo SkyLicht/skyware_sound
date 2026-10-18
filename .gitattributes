@@ -1,0 +1,2 @@
+# Instrument files built into the program keep their exact bytes.
+crates/sky-library/instruments/** -text

@@ -21,10 +21,16 @@ use sky_dsp::AudioData;
 use sky_model::License;
 use thiserror::Error;
 
+pub mod instruments;
 pub mod map;
 pub mod packs;
 pub mod samples;
+pub mod sfz;
 
+pub use instruments::{
+    DEFAULT_PIANO, INSTRUMENTS, InstrumentInfo, InstrumentSource, InstrumentStatus, Instruments,
+    find_instrument,
+};
 pub use map::{MapFile, SampleMap, expand_github};
 pub use packs::{PACKS, PackInfo};
 pub use samples::{CallError, Samples, SamplesCall, find_samples};
@@ -53,6 +59,8 @@ pub enum LibraryError {
     Select(String),
     #[error("none of the {count} files could be loaded; the first problem was: {first}")]
     NothingLoaded { count: usize, first: String },
+    #[error("{0}")]
+    Instrument(String),
 }
 
 /// Where to load a pack from and what its license is.

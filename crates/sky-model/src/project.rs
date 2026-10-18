@@ -407,6 +407,7 @@ impl Track {
                 InstrumentType::Sampler => [86, 190, 140],
                 InstrumentType::Bank => [214, 176, 86],
                 InstrumentType::Acid => [196, 214, 70],
+                InstrumentType::Piano => [92, 150, 214],
             },
             picture: None,
             instrument: Some(InstrumentSlot::new(instrument)),
@@ -433,6 +434,10 @@ pub struct InstrumentSlot {
     /// The sounds a sample bank plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bank: Option<SampleBank>,
+    /// The instrument library a piano plays. Without one, the piano plays
+    /// the small Upright Piano KW built into the program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<LibraryRef>,
     /// The other side of an A/B comparison, once one is started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare: Option<AbCompare>,
@@ -445,6 +450,7 @@ impl InstrumentSlot {
             params: BTreeMap::new(),
             sample: None,
             bank: None,
+            library: None,
             compare: None,
         }
     }
@@ -453,6 +459,47 @@ impl InstrumentSlot {
     pub fn param(&self, name: &str) -> Option<f32> {
         let spec = sky_dsp::params::find(self.kind.params(), name)?;
         Some(self.params.get(name).copied().unwrap_or(spec.default))
+    }
+
+    /// The key a piano's loaded library is shared under: its id and
+    /// version, or an empty key for the built-in piano it plays without one.
+    pub fn library_key(&self) -> String {
+        self.library
+            .as_ref()
+            .map(LibraryRef::key)
+            .unwrap_or_default()
+    }
+}
+
+/// What a piano without a library plays: the small CC0 upright built into
+/// Skyware Sound.
+pub const BUILT_IN_PIANO: &str = "Upright Piano KW (small)";
+
+/// An instrument library a project uses. Libraries are hundreds of MB, so
+/// they live in a shared folder outside projects; the project names the
+/// library and keeps its license for export credits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryRef {
+    /// A stable name such as `upright-piano-kw`.
+    pub id: String,
+    /// What people see, such as `Upright Piano KW`.
+    pub name: String,
+    /// The library's release, such as `2022-02-21`.
+    pub version: String,
+    /// SHA-256 of the archive the library was installed from, in hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub license: License,
+    /// The credit line the license asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<String>,
+}
+
+impl LibraryRef {
+    /// `id@version`, the key a loaded copy is shared under.
+    pub fn key(&self) -> String {
+        format!("{}@{}", self.id, self.version)
     }
 }
 

@@ -306,6 +306,57 @@ fn swaps_keep_held_notes_sounding() {
 }
 
 #[test]
+fn pianos_play_the_library_they_are_given() {
+    use sky_dsp::instruments::{SampleData, SampleLibrary, Zone};
+    use sky_engine::{LibraryCache, compile_with};
+
+    let mut p = Project::new("piano");
+    p.loop_enabled = false;
+    let mut t = Track::new_instrument("Piano", InstrumentType::Piano);
+    t.clips.push(Clip {
+        id: ClipId::new(),
+        name: "long".into(),
+        start: 0,
+        length: PPQ * 16,
+        muted: false,
+        content: ClipContent::Midi {
+            notes: vec![Note::new(0, PPQ * 16, 60, 100)],
+        },
+    });
+    p.tracks.push(t);
+    let tone: Vec<f32> = (0..SR as usize * 4)
+        .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / SR as f32).sin() * 0.5)
+        .collect();
+    let audio = AudioData {
+        sample_rate: SR,
+        channels: vec![tone],
+    };
+    let library = Arc::new(SampleLibrary::new(
+        "tone",
+        vec![SampleData::from_audio(&audio)],
+        vec![Zone::new(0, 69)],
+    ));
+    // A slot without a library plays the built-in piano, cached under "".
+    let mut libraries = LibraryCache::new();
+    let peak = |buf: &[f32]| buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+
+    // Until its library is loaded, the piano is silent.
+    let (mut handle, mut engine) =
+        create_engine(compile_with(&p, &AudioCache::new(), &libraries, SR, 1));
+    handle.send(EngineMsg::Play);
+    let mut l = vec![0.0; 4_800];
+    let mut r = vec![0.0; 4_800];
+    engine.process_planar(&mut l, &mut r);
+    assert_eq!(peak(&l), 0.0);
+
+    libraries.insert(String::new(), library);
+    let snap = compile_with(&p, &AudioCache::new(), &libraries, SR, 2);
+    let out = render(snap, 0, 4_800, false);
+    assert!(peak(out.left()) > 0.01);
+    assert!(out.left().iter().all(|s| s.is_finite()));
+}
+
+#[test]
 fn pattern_clips_play_on_the_grid() {
     // "~ bd" over a one-bar cycle at 120 BPM: the kick lands half way
     // through each bar, at 48 000 and 144 000 samples.

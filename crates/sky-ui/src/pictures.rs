@@ -733,6 +733,7 @@ pub fn track_symbol(track: &Track) -> Symbol {
         (_, Some(InstrumentType::Sampler)) => Symbol::Sampler,
         (_, Some(InstrumentType::Bank)) => Symbol::SampleBank,
         (_, Some(InstrumentType::Acid)) => Symbol::AcidBass,
+        (_, Some(InstrumentType::Piano)) => Symbol::Piano,
         (_, None) => Symbol::Synth,
     }
 }

@@ -52,6 +52,7 @@ impl InstrumentType {
             InstrumentType::Sampler => SAMPLER,
             InstrumentType::Bank => BANK,
             InstrumentType::Acid => ACID,
+            InstrumentType::Piano => PIANO,
         }
     }
 }
@@ -389,6 +390,31 @@ const BANK: &[Preset] = &[
     p("Held notes", &[("one_shot", 0.0), ("release", 300.0)]),
     p("Soft", &[("attack", 15.0), ("release", 300.0)]),
     p("Pitched down", &[("tune", -5.0)]),
+];
+
+const PIANO: &[Preset] = &[
+    p("Concert", &[("dynamics", 36.0), ("vel_curve", -0.2)]),
+    p(
+        "Soft",
+        &[("tone", -4.0), ("dynamics", 20.0), ("release", 140.0)],
+    ),
+    p(
+        "Bright pop",
+        &[("tone", 5.0), ("vel_curve", 0.3), ("dynamics", 18.0)],
+    ),
+    p(
+        "Felt",
+        &[("tone", -9.0), ("dynamics", 24.0), ("release", 60.0)],
+    ),
+    p(
+        "Lo-fi",
+        &[
+            ("tone", -6.0),
+            ("tune", -18.0),
+            ("width", 0.0),
+            ("dynamics", 14.0),
+        ],
+    ),
 ];
 
 const ACID: &[Preset] = &[

@@ -23,6 +23,7 @@ pub fn kind_label(track: &Track) -> &'static str {
             sky_dsp::InstrumentType::Sampler => "Sampler",
             sky_dsp::InstrumentType::Bank => "Sample bank",
             sky_dsp::InstrumentType::Acid => "Acid bass",
+            sky_dsp::InstrumentType::Piano => "Piano",
         },
         (TrackKind::Instrument, None) => "No instrument",
     }

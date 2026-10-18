@@ -16,7 +16,7 @@ use crate::waveform::Peaks;
 use sky_core::{AudioId, ClipId, Ticks};
 use sky_library::Pack;
 use sky_model::PictureImage;
-use sky_session::{BankLoaded, ImportedFiles, Placed, SoundsLoaded};
+use sky_session::{BankLoaded, ImportedFiles, LibrarySet, Placed, SoundsLoaded};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +53,8 @@ pub enum JobOutput {
         result: Result<Arc<Pack>, String>,
     },
     BankLoaded(Result<BankLoaded, String>),
+    /// A track's piano library changed, downloaded first if need be.
+    PianoLibrary(Result<LibrarySet, String>),
     /// What a pattern asked for, loaded with the pattern change.
     PatternSounds {
         clip: ClipId,

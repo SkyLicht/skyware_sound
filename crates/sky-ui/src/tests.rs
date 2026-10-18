@@ -2629,6 +2629,51 @@ fn the_instrument_keyboard_plays_the_track() {
 }
 
 #[test]
+fn the_piano_loads_plays_and_switches_from_the_instrument_tab() {
+    let mut project = demo_project();
+    project
+        .tracks
+        .push(Track::new_instrument("Piano", InstrumentType::Piano));
+    let mut h = Harness::with_engine(project);
+    let piano = h.track_named("Piano");
+    h.app.sel.select_track(piano.id);
+    h.app.workspace.show(Tab::Instrument);
+    // The built-in piano loads in the background while frames go on.
+    let started = std::time::Instant::now();
+    while !h.app.session.libraries_ready() {
+        assert!(started.elapsed() < Duration::from_secs(30), "never loaded");
+        h.frame();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.frames(3);
+    h.quiet();
+    let keys = h.rect_of(crate::audition::keyboard_id(piano.id));
+    let at = keys.left_bottom() + vec2(keys.width() / 2.0, -4.0);
+    h.move_to(at);
+    h.pointer(at, true);
+    h.frame();
+    assert!(h.heard() > 0.01);
+    h.pointer(at, false);
+    h.frame();
+
+    // Choosing a piano for another track makes it one and shows it.
+    let pad = h.track_named("Pad");
+    let r = h
+        .app
+        .session
+        .set_piano_library(pad.id, sky_library::DEFAULT_PIANO, false, Origin::User)
+        .map_err(|e| e.to_string());
+    h.app.piano_library_set(r);
+    assert_eq!(h.app.sel.track, Some(pad.id));
+    assert!(h.app.workspace.is_front(Tab::Instrument));
+    let kind = h.track_named("Pad").instrument.map(|i| i.kind);
+    assert_eq!(kind, Some(InstrumentType::Piano));
+    h.app.piano_library_set(Err("no network".into()));
+    assert!(h.app.notice.as_ref().is_some_and(|n| n.error));
+    h.every_tab();
+}
+
+#[test]
 fn game_loops_and_sfx_sets_are_heard_as_they_export() {
     let mut h = Harness::with_engine(demo_project());
     let ctx = h.ctx();

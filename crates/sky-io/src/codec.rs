@@ -73,13 +73,32 @@ fn read_with_symphonia(path: &Path) -> Result<AudioData, IoError> {
         path: display.clone(),
         message: e.to_string(),
     })?;
+    let ext = path.extension().and_then(|e| e.to_str());
+    decode(Box::new(file), ext, &display)
+}
+
+/// Decodes a file held in memory, such as one built into the program.
+/// `name` is the file's name, for its extension and for errors.
+pub fn decode_audio<B>(bytes: B, name: &str) -> Result<AudioData, IoError>
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    let ext = Path::new(name).extension().and_then(|e| e.to_str());
+    decode(Box::new(std::io::Cursor::new(bytes)), ext, name)
+}
+
+fn decode(
+    source: Box<dyn symphonia::core::io::MediaSource>,
+    ext: Option<&str>,
+    display: &str,
+) -> Result<AudioData, IoError> {
     let derr = |m: String| IoError::Decode {
-        path: display.clone(),
+        path: display.to_string(),
         message: m,
     };
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = ext {
         hint.with_extension(ext);
     }
     let probed = symphonia::default::get_probe()

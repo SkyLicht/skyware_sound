@@ -101,6 +101,11 @@ General MIDI number, or its pitched sound (piano) when it has one. Packs keep \
 their license: exports list the credits they need and warn about unknown \
 licenses.\n\
 \n\
+The piano (instrument piano) plays a recorded piano with velocity layers and \
+release sounds. It starts with a small built-in upright; instrument_libraries \
+lists the others and piano_library switches a track to one, downloading it \
+once. Libraries live outside the project, which names the one it needs.\n\
+\n\
 Step clips (steps_write) work like a drum machine or an acid bass: lanes of \
 steps, one token per step. On drums give a lane per piece (note bd, sd, cp, hh, \
 oh); for a bass line give one lane whose steps play notes, such as \
@@ -132,8 +137,15 @@ pub struct SkywareMcp {
 /// The permission each tool needs.
 fn required(tool: &str) -> Permission {
     match tool {
-        "project_summary" | "track_get" | "clip_get" | "catalog" | "history" | "pattern_query"
-        | "analyze" | "loop_check_seam" => Permission::ReadOnly,
+        "project_summary"
+        | "track_get"
+        | "clip_get"
+        | "catalog"
+        | "history"
+        | "pattern_query"
+        | "analyze"
+        | "loop_check_seam"
+        | "instrument_libraries" => Permission::ReadOnly,
         "project_open"
         | "project_save"
         | "audio_import"
@@ -142,6 +154,7 @@ fn required(tool: &str) -> Permission {
         | "system_check"
         | "sound_packs"
         | "bank_load"
+        | "piano_library"
         | "game_export_settings"
         | "game_export" => Permission::Files,
         _ => Permission::Edit,
@@ -159,6 +172,11 @@ fn origin(ctx: &RequestContext<RoleServer>, tool: &str) -> Origin {
         client,
         tool: tool.into(),
     }
+}
+
+/// The instrument names tracks take, for messages.
+fn instrument_names() -> String {
+    names(InstrumentType::ALL.iter().map(|t| t.name()))
 }
 
 fn round(x: f64, places: i32) -> f64 {
@@ -669,7 +687,8 @@ pub struct TrackCreateArgs {
     pub name: String,
     /// instrument (default) or audio.
     pub kind: Option<String>,
-    /// For instrument tracks: synth (default), acid, drums, sampler or bank.
+    /// For instrument tracks: synth (default), piano, acid, drums, sampler
+    /// or bank.
     pub instrument: Option<String>,
     /// Instrument parameters, such as {"wave": "square", "cutoff": 800}.
     pub params: Option<BTreeMap<String, Value>>,
@@ -707,7 +726,8 @@ pub struct TrackSetArgs {
 pub struct InstrumentSetArgs {
     /// Track ID or name.
     pub track: String,
-    /// Replace the instrument: synth, drums, sampler or bank. Parameters reset.
+    /// Replace the instrument: synth, piano, acid, drums, sampler or bank.
+    /// Parameters reset.
     #[serde(rename = "type")]
     pub kind: Option<String>,
     /// Parameters to set; null restores a default.
@@ -748,6 +768,17 @@ pub struct BankLoadArgs {
     /// For a pack that is not in the list: its license, such as CC0-1.0,
     /// CC-BY-4.0 or unknown (the default). Only say what the pack states.
     pub license: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PianoLibraryArgs {
+    /// Track ID or name. It becomes a piano if it is another instrument;
+    /// a piano keeps its settings.
+    pub track: String,
+    /// A library from instrument_libraries, by id or name.
+    pub library: String,
+    /// Download the library when it is not here yet. Default true.
+    pub download: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1533,7 +1564,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Adds a track: an instrument track with a synth, Acid bass, drum kit, sampler or sample bank, or an audio track. Returns its ID. Load sounds into a bank track with bank_load."
+        description = "Adds a track: an instrument track with a synth, piano, Acid bass, drum kit, sampler or sample bank, or an audio track. Returns its ID. Load sounds into a bank track with bank_load."
     )]
     async fn track_create(
         &self,
@@ -1552,7 +1583,7 @@ impl SkywareMcp {
             "instrument" | "midi" => {
                 let name = a.instrument.as_deref().unwrap_or("synth");
                 let kind = InstrumentType::from_name(name).ok_or_else(|| {
-                    format!("instrument {name:?} is not one of synth, acid, drums, sampler, bank")
+                    format!("instrument {name:?} is not one of {}", instrument_names())
                 })?;
                 Track::new_instrument(a.name.clone(), kind)
             }
@@ -1704,7 +1735,7 @@ impl SkywareMcp {
         let mut slot = match &a.kind {
             Some(name) => {
                 InstrumentSlot::new(InstrumentType::from_name(name).ok_or_else(|| {
-                    format!("instrument {name:?} is not one of synth, drums, sampler, bank")
+                    format!("instrument {name:?} is not one of {}", instrument_names())
                 })?)
             }
             None => track
@@ -2489,6 +2520,65 @@ impl SkywareMcp {
             Ok(v.to_string())
         })
         .await
+    }
+
+    #[tool(
+        description = "Lists the recorded instrument libraries the piano can play: each one's id, size, license and whether it is downloaded.",
+        annotations(read_only_hint = true)
+    )]
+    async fn instrument_libraries(&self) -> ToolResult {
+        let libraries: Vec<Value> = self
+            .session
+            .instrument_libraries()
+            .into_iter()
+            .map(|s| {
+                let i = s.info;
+                json!({
+                    "id": i.id,
+                    "name": i.name,
+                    "instrument": i.kind.name(),
+                    "version": i.version,
+                    "about": i.description,
+                    "license": i.license.id(),
+                    "credit": i.credit,
+                    "homepage": i.homepage,
+                    "megabytes": round(i.size as f64 / 1e6, 1),
+                    "builtIn": i.is_bundled(),
+                    "downloaded": s.installed,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "libraries": libraries,
+            "folder": self.session.instruments().dir().display().to_string(),
+        })
+        .to_string())
+    }
+
+    #[tool(
+        description = "Makes a track a piano that plays a library from instrument_libraries, as one undo step, downloading the library first if needed (tens of MB, checked against its SHA-256). A track that is a piano already keeps its settings."
+    )]
+    async fn piano_library(
+        &self,
+        Parameters(a): Parameters<PianoLibraryArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> ToolResult {
+        let project = self.session.project();
+        let track = find_track(&project, &a.track)?;
+        let session = self.session.clone();
+        let origin = origin(&ctx, "piano_library");
+        let download = a.download.unwrap_or(true);
+        let set = blocking(move || {
+            session
+                .set_piano_library(track, &a.library, download, origin)
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+        let mut v = serde_json::to_value(&set).map_err(|e| e.to_string())?;
+        v["track"] = json!(track.to_string());
+        v["license"] = json!(set.license.id());
+        v["memoryMb"] = json!(round(set.memory_mb, 1));
+        Ok(v.to_string())
     }
 
     #[tool(

@@ -3,6 +3,7 @@
 //! levels in dB, only parameters that differ from their defaults.
 
 use serde_json::{Value, json};
+use sky_dsp::InstrumentType;
 
 use crate::notes::format_note_list;
 use crate::picture::Picture;
@@ -153,6 +154,17 @@ pub fn track_json(project: &Project, track: &Track, detail: bool) -> Value {
         });
         if let Some(bank) = &inst.bank {
             v["instrument"]["bank"] = bank_json(project, bank, detail);
+        }
+        if inst.kind == InstrumentType::Piano {
+            v["instrument"]["library"] = match &inst.library {
+                Some(l) => json!({
+                    "id": l.id,
+                    "name": l.name,
+                    "version": l.version,
+                    "license": l.license.id(),
+                }),
+                None => json!({ "name": BUILT_IN_PIANO, "license": License::Cc0.id() }),
+            };
         }
     }
     v

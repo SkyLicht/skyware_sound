@@ -29,11 +29,12 @@ use sky_dsp::analysis::{self, SeamReport};
 use sky_dsp::util::db_to_gain;
 use sky_engine::compile::CompiledBank;
 use sky_engine::{
-    AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, Preview, compile, create_engine,
+    AudioCache, Engine, EngineHandle, EngineMsg, EngineShared, LibraryCache, Preview, compile_with,
+    create_engine,
 };
 use sky_game::{AssetAudio, AssetExport, ExportSet, Exported, LoopExport};
 use sky_io::{WavFormat, read_audio, write_wav};
-use sky_library::{Library, LibraryError, PackSource};
+use sky_library::{Instruments, Library, LibraryError, PackSource};
 use sky_model::file::{self, Journal};
 use sky_model::{
     AudioSource, BankSample, Command, GameAsset, GameAssetKind, History, InstrumentSlot, License,
@@ -42,9 +43,11 @@ use sky_model::{
 };
 use thiserror::Error;
 
+mod libraries;
 mod pattern_sounds;
 mod place;
 
+pub use libraries::LibrarySet;
 pub use pattern_sounds::{SoundsLoaded, SoundsRequest, pattern_sound_names};
 pub use place::{AudioInput, AudioTarget, ImportedFiles, Placed, audio_clip, sound_name};
 
@@ -256,6 +259,7 @@ fn game_export_dir(project: &Project, path: Option<&Path>) -> Result<PathBuf, Se
 fn render_asset(
     project: &Project,
     audio: &AudioCache,
+    libraries: &LibraryCache,
     asset: &GameAsset,
     total_seconds: &mut f64,
 ) -> Result<RenderedAsset, SessionError> {
@@ -273,7 +277,7 @@ fn render_asset(
             let i = intro_start.map_or(s, to_sample).min(s);
             *total_seconds += ((s - i) + 2 * (e - s)) as f64 / sr as f64;
             Session::check_length(*total_seconds)?;
-            let snap = compile(project, audio, sr, 0);
+            let snap = compile_with(project, audio, libraries, sr, 0);
             let out = if i < s {
                 sky_engine::render_intro_loop(snap, i, s, e)
             } else {
@@ -300,7 +304,7 @@ fn render_asset(
                 *total_seconds += (e - s) as f64 / sr as f64 + tail;
                 Session::check_length(*total_seconds)?;
                 let frames = (e - s) as usize + (tail * sr as f64) as usize;
-                let snap = compile(project, audio, sr, 0);
+                let snap = compile_with(project, audio, libraries, sr, 0);
                 // Only what starts in the variation, so the tail does not
                 // pick up the next one.
                 let mut out = sky_engine::render_one_shot(snap, s, e, frames);
@@ -393,6 +397,12 @@ struct State {
     snapshot_version: u64,
     activity: Vec<ActivityEntry>,
     audio: AudioCache,
+    /// Instrument libraries loaded for the project's pianos.
+    libraries: LibraryCache,
+    /// Libraries being loaded in the background, and those that failed
+    /// (with why), so they are not tried again until asked.
+    loading: std::collections::HashSet<String>,
+    failed: HashMap<String, String>,
     engine_rate: Option<u32>,
     status: Option<String>,
 }
@@ -401,6 +411,8 @@ struct Inner {
     state: Mutex<State>,
     /// Where sound packs come from; never locked with `state`.
     library: Mutex<Library>,
+    /// Where instrument libraries come from; never locked with `state`.
+    instruments: Mutex<Instruments>,
     /// Locked after `state` when both are needed, never before.
     engine: Mutex<Option<EngineHandle>>,
     shared: ArcSwapOption<EngineShared>,
@@ -547,9 +559,22 @@ impl State {
             snapshot_version: 0,
             activity: Vec::new(),
             audio: AudioCache::new(),
+            libraries: LibraryCache::new(),
+            loading: Default::default(),
+            failed: HashMap::new(),
             engine_rate: None,
             status: None,
         }
+    }
+
+    fn compile(&self, sample_rate: u32) -> sky_engine::compile::EngineSnapshot {
+        compile_with(
+            &self.project,
+            &self.audio,
+            &self.libraries,
+            sample_rate,
+            self.snapshot_version,
+        )
     }
 
     /// Records applied commands so a crash loses nothing. A journal that
@@ -592,7 +617,7 @@ impl Session {
         let mut shared_out = None;
         if let Some(sr) = engine_rate {
             state.snapshot_version += 1;
-            let snap = compile(&state.project, &state.audio, sr, state.snapshot_version);
+            let snap = state.compile(sr);
             let (handle, engine) = create_engine(snap);
             shared_out = Some(handle.shared().clone());
             handle_out = Some(handle);
@@ -603,13 +628,16 @@ impl Session {
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
             library: Mutex::new(Library::default()),
+            instruments: Mutex::new(Instruments::default()),
             engine: Mutex::new(handle_out),
             shared: ArcSwapOption::new(shared_out),
             view: ArcSwap::from_pointee(view),
             last_preview: AtomicU64::new(0),
         });
         spawn_housekeeping(Arc::downgrade(&inner));
-        (Session { inner }, engine_out)
+        let session = Session { inner };
+        session.load_libraries_later(&mut lock(&session.inner.state));
+        (session, engine_out)
     }
 
     /// The latest published view. Cheap; never blocks.
@@ -629,9 +657,12 @@ impl Session {
 
     fn publish(&self, st: &mut State, recompile: bool) {
         st.revision += 1;
+        if recompile {
+            self.load_libraries_later(st);
+        }
         if recompile && let Some(sr) = st.engine_rate {
             st.snapshot_version += 1;
-            let snap = compile(&st.project, &st.audio, sr, st.snapshot_version);
+            let snap = st.compile(sr);
             if let Some(h) = lock(&self.inner.engine).as_mut() {
                 h.send(EngineMsg::Swap(Box::new(snap)));
             }
@@ -939,11 +970,11 @@ impl Session {
     /// Renders a game asset exactly as [`export_game`](Self::export_game)
     /// would, without writing anything, so it can be heard first.
     pub fn render_game_asset(&self, name: &str) -> Result<RenderedAsset, SessionError> {
-        let (project, audio) = self.render_inputs();
+        let (project, audio, libraries) = self.render_inputs()?;
         let asset = project.game.find(name).ok_or_else(|| {
             SessionError::Invalid(format!("the project has no game asset {name:?}"))
         })?;
-        render_asset(&project, &audio, asset, &mut 0.0)
+        render_asset(&project, &audio, &libraries, asset, &mut 0.0)
     }
 
     /// Creates a new engine at `sample_rate`, replacing any old one, and
@@ -951,7 +982,7 @@ impl Session {
     pub fn attach_engine(&self, sample_rate: u32) -> Engine {
         let mut st = lock(&self.inner.state);
         st.snapshot_version += 1;
-        let snap = compile(&st.project, &st.audio, sample_rate, st.snapshot_version);
+        let snap = st.compile(sample_rate);
         let (handle, engine) = create_engine(snap);
         self.inner.shared.store(Some(handle.shared().clone()));
         *lock(&self.inner.engine) = Some(handle);
@@ -1213,16 +1244,26 @@ impl Session {
 
     // ----- rendering -----
 
-    fn render_inputs(&self) -> (Arc<Project>, AudioCache) {
-        let (project, audio, _) = self.export_inputs();
-        (project, audio)
+    fn render_inputs(&self) -> Result<(Arc<Project>, AudioCache, LibraryCache), SessionError> {
+        let (project, audio, libraries, _) = self.export_inputs()?;
+        Ok((project, audio, libraries))
     }
 
-    /// The project and its audio, with where it is saved, all at one moment.
-    fn export_inputs(&self) -> (Arc<Project>, AudioCache, Option<PathBuf>) {
+    /// The project, its audio and its instrument libraries, with where it
+    /// is saved, all at one moment. Libraries not loaded yet are loaded
+    /// first, so a render never misses a piano.
+    fn export_inputs(
+        &self,
+    ) -> Result<(Arc<Project>, AudioCache, LibraryCache, Option<PathBuf>), SessionError> {
+        self.load_libraries()?;
         let st = lock(&self.inner.state);
         let audio: HashMap<_, _> = st.audio.clone();
-        (Arc::new(st.project.clone()), audio, st.path.clone())
+        Ok((
+            Arc::new(st.project.clone()),
+            audio,
+            st.libraries.clone(),
+            st.path.clone(),
+        ))
     }
 
     fn check_length(seconds: f64) -> Result<(), SessionError> {
@@ -1248,21 +1289,21 @@ impl Session {
                 "the range must start at or after 0 and end after it starts".into(),
             ));
         }
-        let (project, audio) = self.render_inputs();
+        let (project, audio, libraries) = self.render_inputs()?;
         let sr = project.sample_rate;
         let s = project.tempo.tick_to_sample(start, sr);
         let e = project.tempo.tick_to_sample(end, sr);
         let tail = tail_seconds.clamp(0.0, 60.0);
         Self::check_length((e - s) as f64 / sr as f64 + tail)?;
         let frames = (e - s) as usize + (tail * sr as f64) as usize;
-        let snap = compile(&project, &audio, sr, 0);
+        let snap = compile_with(&project, &audio, &libraries, sr, 0);
         Ok(sky_engine::render(snap, s, frames, false))
     }
 
     /// Renders the loop `range` (or the project's loop region) so that it
     /// repeats seamlessly: tails from the end carry into the start.
     pub fn render_loop(&self, range: Option<(Ticks, Ticks)>) -> Result<AudioData, SessionError> {
-        let (project, audio) = self.render_inputs();
+        let (project, audio, libraries) = self.render_inputs()?;
         let (start, end) = range.unwrap_or((project.loop_region.start, project.loop_region.end));
         if end <= start || start < 0 {
             return Err(SessionError::Invalid("the loop range is empty".into()));
@@ -1271,7 +1312,7 @@ impl Session {
         let s = project.tempo.tick_to_sample(start, sr);
         let e = project.tempo.tick_to_sample(end, sr);
         Self::check_length((e - s) as f64 / sr as f64 * 2.0)?;
-        let snap = compile(&project, &audio, sr, 0);
+        let snap = compile_with(&project, &audio, &libraries, sr, 0);
         Ok(sky_engine::render_loop(snap, s, e, 2))
     }
 
@@ -1371,7 +1412,7 @@ impl Session {
     pub fn export_game(&self, opts: &GameExportOptions) -> Result<GameExported, SessionError> {
         // Taken together, so a save or a new project during the render does
         // not change which project the export belongs to.
-        let (project, audio, path) = self.export_inputs();
+        let (project, audio, libraries, path) = self.export_inputs()?;
         let game = &project.game;
         if game.assets.is_empty() {
             return Err(SessionError::Invalid(
@@ -1410,7 +1451,13 @@ impl Session {
         let mut total_seconds = 0.0;
         let mut rendered = Vec::with_capacity(selected.len());
         for asset in &selected {
-            rendered.push(render_asset(&project, &audio, asset, &mut total_seconds)?);
+            rendered.push(render_asset(
+                &project,
+                &audio,
+                &libraries,
+                asset,
+                &mut total_seconds,
+            )?);
         }
 
         let licenses = sky_model::license_report(&project);
