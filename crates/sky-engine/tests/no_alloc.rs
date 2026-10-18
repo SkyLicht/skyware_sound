@@ -56,6 +56,7 @@ fn processing_never_allocates() {
         )]
         .into(),
         pitched: None,
+        packs: Vec::new(),
     });
     bank.clips.push(Clip {
         id: ClipId::new(),

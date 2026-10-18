@@ -101,14 +101,47 @@ fn color(kind: Kind) -> Color32 {
     }
 }
 
+/// The color of `samples(...)` calls in pattern text.
+const CODE: Color32 = Color32::from_rgb(110, 200, 190);
+
 /// The pattern text with each piece in its color, the atoms in `lit` (the
-/// steps sounding now) lit up, and `error` underlined.
-pub fn layout(src: &str, font: &FontId, lit: &[Span], error: Option<Range<usize>>) -> LayoutJob {
+/// steps sounding now) lit up, and `error` underlined. `code` is where the
+/// text's `samples(...)` calls are, which are not mini-notation.
+pub fn layout(
+    src: &str,
+    font: &FontId,
+    lit: &[Span],
+    error: Option<Range<usize>>,
+    code: &[Range<usize>],
+) -> LayoutJob {
     let mut job = LayoutJob::default();
-    for (kind, r) in tokens(src) {
+    // The calls read as spaces, so the notation around them keeps its colors.
+    let mut plain = src.as_bytes().to_vec();
+    for r in code {
+        plain[r.clone()].fill(b' ');
+    }
+    let plain = String::from_utf8_lossy(&plain);
+    let mut pieces = Vec::new();
+    for (kind, r) in tokens(&plain) {
+        let mut at = r.start;
+        for c in code.iter().filter(|c| c.start < r.end && r.start < c.end) {
+            if at < c.start {
+                pieces.push((Some(kind), at..c.start));
+            }
+            pieces.push((None, c.start.max(at)..c.end.min(r.end)));
+            at = c.end.min(r.end);
+        }
+        if at < r.end {
+            pieces.push((Some(kind), at..r.end));
+        }
+    }
+    for (kind, r) in pieces {
+        if r.is_empty() || !src.is_char_boundary(r.start) || !src.is_char_boundary(r.end) {
+            continue;
+        }
         let overlaps = |a: usize, b: usize| a < r.end && r.start < b;
-        let mut format = TextFormat::simple(font.clone(), color(kind));
-        if matches!(kind, Kind::Sound | Kind::Note | Kind::Number)
+        let mut format = TextFormat::simple(font.clone(), kind.map_or(CODE, color));
+        if kind.is_some_and(|k| matches!(k, Kind::Sound | Kind::Note | Kind::Number))
             && lit.iter().any(|s| overlaps(s.start, s.end))
         {
             format.background = theme::ACCENT;
@@ -457,6 +490,31 @@ mod tests {
             .filter(|(k, _)| *k != Kind::Space)
             .map(|(k, r)| (k, &src[r]))
             .collect()
+    }
+
+    #[test]
+    fn samples_calls_keep_their_text_in_their_own_color() {
+        let src = "samples('github:a/b') // é\nbd sd";
+        let code: Vec<Range<usize>> = sky_library::find_samples(src)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.range)
+            .collect();
+        assert_eq!(code, vec![0..21]);
+        let job = layout(src, &FontId::monospace(14.0), &[], None, &code);
+        assert_eq!(job.text, src);
+        let colors: Vec<(&str, Color32)> = job
+            .sections
+            .iter()
+            .map(|s| {
+                (
+                    &src[s.byte_range.start.0..s.byte_range.end.0],
+                    s.format.color,
+                )
+            })
+            .collect();
+        assert_eq!(colors[0], ("samples('github:a/b')", CODE));
+        assert!(colors.contains(&("bd", color(Kind::Sound))), "{colors:?}");
     }
 
     #[test]

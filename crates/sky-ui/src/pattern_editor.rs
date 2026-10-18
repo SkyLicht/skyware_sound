@@ -10,13 +10,18 @@ use egui::{
     Key, Modifiers, Order, Rect, RichText, ScrollArea, Sense, Slider, Stroke, StrokeKind, TextEdit,
     Ui, vec2,
 };
-use sky_core::{ClipId, PPQ, Ticks};
+use sky_core::{ClipId, PPQ, Ticks, TrackId};
+use sky_dsp::InstrumentType;
+use sky_library::samples::{blank_calls, strip_calls};
+use sky_library::{PackSource, Samples, find_samples};
 use sky_model::command::VELOCITY;
-use sky_model::{Clip, ClipContent, Project, Swing, Track};
+use sky_model::{Clip, ClipContent, Command, Origin, Project, SampleBank, Swing, Track};
 use sky_pattern::{Span, Time};
+use sky_session::{SoundsLoaded, SoundsRequest, pattern_sound_names};
 
 use crate::actions::{self, AudioClipChange};
 use crate::app::App;
+use crate::jobs::JobOutput;
 use crate::live_pattern::{self, Grid, RESOLUTIONS, Row};
 use crate::theme;
 
@@ -45,6 +50,8 @@ pub struct PatternState {
     /// Grid rows added or emptied on the grid, by clip: the text can't
     /// hold a row with no hits.
     pub grid_rows: Vec<(ClipId, String)>,
+    /// The clip whose pattern waits for the sounds it asked for.
+    pub loading: Option<ClipId>,
 }
 
 #[cfg(test)]
@@ -230,18 +237,212 @@ impl ParseStatus {
     }
 }
 
+/// The pattern's parse result. Its `samples(...)` calls are not
+/// mini-notation, so they are read on their own.
 pub fn parse_status(source: &str, seed: u64) -> ParseStatus {
-    match sky_pattern::parse(source) {
+    let line = |offset: usize| source[..offset.min(source.len())].matches('\n').count() + 1;
+    let plain = match find_samples(source) {
+        Ok(calls) => blank_calls(source, &calls),
+        Err(e) => {
+            let at = e.range.start.min(source.len());
+            let line_start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+            return ParseStatus::Error {
+                line: line(at),
+                message: e.message,
+                column: source[line_start..at].chars().count() + 1,
+            };
+        }
+    };
+    match sky_pattern::parse(&plain) {
         Ok(p) => ParseStatus::Ok {
             events: p
                 .query(Time::from_integer(0), Time::from_integer(1), seed)
                 .len(),
         },
         Err(e) => ParseStatus::Error {
-            line: source[..e.offset.min(source.len())].matches('\n').count() + 1,
+            line: line(e.offset),
             message: e.message,
             column: e.column,
         },
+    }
+}
+
+/// The track's sample bank, when it is one.
+fn bank_of(track: &Track) -> Option<&SampleBank> {
+    track
+        .instrument
+        .as_ref()
+        .filter(|s| s.kind == InstrumentType::Bank)
+        .and_then(|s| s.bank.as_ref())
+}
+
+/// What applying `text` must load first, with the pattern as it is without
+/// its `samples(...)` calls; `None` when it can change at once. A sound the
+/// bank lacks is worth loading while a linked pack may have it: until the
+/// pack is read, or once it is read and has it.
+fn sounds_to_load(app: &App, track: &Track, text: &str) -> Option<(SoundsRequest, String)> {
+    let calls = find_samples(text).ok()?;
+    let source = strip_calls(text, &calls);
+    let mut request = SoundsRequest {
+        names: pattern_sound_names(&source),
+        ..Default::default()
+    };
+    for call in calls {
+        match call.samples {
+            Samples::Address(a) => request.link.push(PackSource::parse(&a, None)),
+            Samples::Map(m) => request.maps.push(m),
+        }
+    }
+    if request.link.is_empty() && request.maps.is_empty() {
+        let bank = bank_of(track).filter(|b| !b.packs.is_empty())?;
+        let worth = request
+            .names
+            .iter()
+            .filter(|n| bank.resolve(n).is_none())
+            .any(|n| {
+                bank.packs
+                    .iter()
+                    .any(|p| match app.browser.listing(&p.map) {
+                        Some(l) => l.pack.map.find_sound(n).is_some(),
+                        None => !app.browser.pack_failed(&p.map),
+                    })
+            });
+        if !worth {
+            return None;
+        }
+    }
+    Some((request, source))
+}
+
+/// One line on what loading a pattern's sounds did.
+fn sounds_summary(done: &SoundsLoaded) -> String {
+    let names = |v: &[String]| {
+        let mut s = v.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+        if v.len() > 8 {
+            s.push_str(&format!(" and {} more", v.len() - 8));
+        }
+        s
+    };
+    let mut parts = Vec::new();
+    for name in &done.linked {
+        let unknown = done
+            .packs
+            .iter()
+            .any(|p| &p.name == name && p.license == sky_model::License::Unknown);
+        parts.push(if unknown {
+            format!("Linked {name}, whose license is unknown, so exports will warn")
+        } else {
+            format!("Linked {name}")
+        });
+    }
+    let loaded: Vec<String> = done.loaded.iter().map(|(n, _)| n.clone()).collect();
+    if !loaded.is_empty() {
+        parts.push(format!("loaded {}", names(&loaded)));
+    }
+    if !done.missing.is_empty() {
+        parts.push(format!("no linked pack has {}", names(&done.missing)));
+    }
+    if let Some(first) = done.failed.first() {
+        parts.push(format!(
+            "{} could not load, such as {first}",
+            done.failed.len()
+        ));
+    }
+    if done.offline {
+        parts.push("the network is down, so saved copies of the packs were used".into());
+    }
+    let mut text = parts.join("; ");
+    if let Some(c) = text.get(..1) {
+        text = c.to_uppercase() + &text[1..];
+    }
+    if text.is_empty() {
+        "The pattern's sounds are all in the bank".into()
+    } else {
+        text
+    }
+}
+
+impl App {
+    /// Loads what a pattern's text asks for in the background, then changes
+    /// the pattern to `source`, as one undo step.
+    #[allow(clippy::too_many_arguments)]
+    fn start_pattern_sounds(
+        &mut self,
+        ctx: &Context,
+        track: TrackId,
+        clip: ClipId,
+        text: String,
+        source: String,
+        request: SoundsRequest,
+        seed: u64,
+        cycle: Ticks,
+    ) {
+        let project = self.session.project();
+        let Ok((_, c)) = project.find_clip(clip) else {
+            return;
+        };
+        let ClipContent::Pattern {
+            controls, swing, ..
+        } = &c.content
+        else {
+            return;
+        };
+        let then = vec![Command::SetPattern {
+            clip,
+            source: source.clone(),
+            seed,
+            cycle: cycle.max(1),
+            controls: controls.clone(),
+            swing: *swing,
+        }];
+        let label = format!("Load sounds for {}", c.name);
+        self.pattern.loading = Some(clip);
+        let session = self.session.clone();
+        self.jobs.spawn(ctx, Some(format!("{label}…")), move || {
+            let result = session
+                .load_pattern_sounds(track, &request, &label, then, Origin::User)
+                .map_err(|e| e.to_string());
+            JobOutput::PatternSounds {
+                clip,
+                text,
+                source,
+                seed,
+                cycle,
+                result,
+            }
+        });
+    }
+
+    pub fn pattern_sounds_loaded(
+        &mut self,
+        clip: ClipId,
+        text: &str,
+        source: String,
+        seed: u64,
+        cycle: Ticks,
+        result: Result<SoundsLoaded, String>,
+    ) {
+        if self.pattern.loading == Some(clip) {
+            self.pattern.loading = None;
+        }
+        self.refresh();
+        match result {
+            Ok(done) => {
+                // The box still holds what was applied: show the pattern as
+                // it is now, without its samples(...) lines.
+                if self.pattern.clip == Some(clip) && self.pattern.text == text {
+                    self.pattern.text = source.clone();
+                    self.pattern.synced = Some((source, seed, cycle));
+                }
+                let summary = sounds_summary(&done);
+                if done.failed.is_empty() {
+                    self.info(summary);
+                } else {
+                    self.error(summary);
+                }
+            }
+            Err(e) => self.error(format!("Pattern not applied: {e}")),
+        }
     }
 }
 
@@ -353,16 +554,48 @@ fn pattern_ui(
     let font = theme::mono(15.0);
     let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
         let text = buf.as_str();
-        let error = sky_pattern::parse(text)
-            .err()
-            .map(|e| e.offset..e.offset + e.len);
+        let (code, error) = match find_samples(text) {
+            Ok(calls) => {
+                let error = sky_pattern::parse(&blank_calls(text, &calls))
+                    .err()
+                    .map(|e| e.offset..e.offset + e.len);
+                (calls.into_iter().map(|c| c.range).collect(), error)
+            }
+            Err(e) => (Vec::new(), Some(e.range)),
+        };
         let lit: &[Span] = if text == source { &lit } else { &[] };
-        let mut job = live_pattern::layout(text, &font, lit, error);
+        let mut job = live_pattern::layout(text, &font, lit, error, &code);
         job.wrap.max_width = wrap;
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
 
-    ui.label(RichText::new("Pattern").color(theme::TEXT_WEAK));
+    let links = bank_of(track).map(|b| b.packs.clone()).unwrap_or_default();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Pattern").color(theme::TEXT_WEAK));
+        if !links.is_empty() {
+            ui.label(
+                RichText::new("· sounds you name load from")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+            for link in &links {
+                ui.label(RichText::new(&link.name).small().color(theme::TEXT_WEAK))
+                    .on_hover_text(format!("{}\n{}", link.map, link.license.label()));
+            }
+        }
+    });
+    // Read the linked packs, to offer their sounds' names.
+    for link in &links {
+        if !app.browser.pack_asked(&link.map) {
+            let source = PackSource {
+                name: link.name.clone(),
+                map: link.map.clone(),
+                license: link.license,
+                credit: link.credit.clone(),
+            };
+            app.read_pack_listing(&ctx, source);
+        }
+    }
     let out = TextEdit::multiline(&mut app.pattern.text)
         .id(text_id)
         .font(theme::mono(15.0))
@@ -380,8 +613,18 @@ fn pattern_ui(
     let has_focus = out.response.response.has_focus();
     let lost = out.response.response.lost_focus();
 
-    // Offer the track's sound names for the word before the caret.
-    let names = live_pattern::sound_names(track);
+    // Offer the track's sound names for the word before the caret, then
+    // those of its linked packs.
+    let mut names = live_pattern::sound_names(track);
+    for link in &links {
+        if let Some(l) = app.browser.listing(&link.map) {
+            for name in l.pack.map.sounds.keys() {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
     let st = &mut app.pattern;
     let caret = out
         .cursor_range
@@ -457,7 +700,12 @@ fn pattern_ui(
     let status = parse_status(&app.pattern.text, seed);
     let lines = app.pattern.text.lines().count();
     let changed = app.pattern.text != source;
+    let loading = app.pattern.loading == Some(clip.id);
     ui.horizontal(|ui| match &status {
+        _ if loading => {
+            ui.spinner();
+            ui.label(RichText::new("Loading the sounds it names…").color(theme::TEXT_WEAK));
+        }
         ParseStatus::Ok { events } => {
             ui.label(
                 RichText::new(format!(
@@ -480,13 +728,19 @@ fn pattern_ui(
             );
         }
     });
-    if (apply || (lost && !over_names)) && changed {
+    if (apply || (lost && !over_names)) && changed && !loading {
         match &status {
             ParseStatus::Ok { .. } => {
                 let text = app.pattern.text.clone();
-                let r = actions::set_pattern(&app.session, clip.id, &text, seed, cycle, None);
-                if app.report(r).is_some() {
-                    app.pattern.synced = Some((text, seed, cycle));
+                if let Some((request, new_source)) = sounds_to_load(app, track, &text) {
+                    app.start_pattern_sounds(
+                        &ctx, track.id, clip.id, text, new_source, request, seed, cycle,
+                    );
+                } else {
+                    let r = actions::set_pattern(&app.session, clip.id, &text, seed, cycle, None);
+                    if app.report(r).is_some() {
+                        app.pattern.synced = Some((text, seed, cycle));
+                    }
                 }
             }
             ParseStatus::Error { message, .. } => {
@@ -562,6 +816,10 @@ fn pattern_ui(
             ("hh*8?", "drop events at random"),
             ("bd(3,8)", "Euclidean rhythm"),
             ("c4 e4 g4", "notes; 60 64 67 also works"),
+            (
+                "samples('github:user/repo')",
+                "on a line of its own, as in Strudel: the sounds you name load from that pack",
+            ),
         ] {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(code).monospace().color(theme::TEXT));

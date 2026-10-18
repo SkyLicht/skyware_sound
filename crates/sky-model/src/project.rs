@@ -487,6 +487,25 @@ pub struct SampleBank {
     /// MIDI notes (36 `bd`, 38 `sd`, 42 `hh`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pitched: Option<String>,
+    /// Packs linked to the bank, as Strudel's
+    /// `samples('github:tidalcycles/dirt-samples')` links one: a sound a
+    /// pattern names that the bank lacks loads from the first that has it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<PackLink>,
+}
+
+/// A sound pack linked to a sample bank.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackLink {
+    /// The pack's name, such as `dirt-samples`.
+    pub name: String,
+    /// Its sample map as it was written: a `github:user/repo` shortcut, a
+    /// URL or a folder.
+    pub map: String,
+    pub license: License,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<String>,
 }
 
 /// One variation of a bank sound.

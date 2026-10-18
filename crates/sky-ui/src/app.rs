@@ -854,6 +854,14 @@ impl App {
             JobOutput::Peaks(id, peaks) => self.waveforms.insert(id, peaks),
             JobOutput::PackListed { map, result } => self.pack_listed(map, result),
             JobOutput::BankLoaded(result) => self.bank_loaded(result),
+            JobOutput::PatternSounds {
+                clip,
+                text,
+                source,
+                seed,
+                cycle,
+                result,
+            } => self.pattern_sounds_loaded(clip, &text, source, seed, cycle, result),
             JobOutput::Previewed { key, result } => self.preview_ready(key, result),
             JobOutput::SeamChecked {
                 target,

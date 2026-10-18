@@ -626,6 +626,172 @@ fn banks_load_from_packs_play_undo_and_credit_exports() {
     );
 }
 
+/// A pack folder like Dirt-Samples: plain names, `bd` with two variations.
+fn plain_pack_folder(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for name in ["bd0", "bd1", "sn", "hh"] {
+        sine_file(&dir.join(format!("{name}.wav")), 0.2);
+    }
+    std::fs::write(
+        dir.join("strudel.json"),
+        r#"{ "bd": ["bd0.wav", "bd1.wav"], "sn": "sn.wav", "hh": "hh.wav" }"#,
+    )
+    .unwrap();
+}
+
+fn set_pattern(clip: ClipId, source: &str) -> Command {
+    Command::SetPattern {
+        clip,
+        source: source.into(),
+        seed: 0,
+        cycle: PPQ * 4,
+        controls: Default::default(),
+        swing: Default::default(),
+    }
+}
+
+#[test]
+fn patterns_link_packs_and_load_the_sounds_they_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dirt");
+    plain_pack_folder(&dir);
+    let mut project = empty_project("Strudel");
+    let mut track = Track::new_instrument("Beat", sky_dsp::InstrumentType::Synth);
+    let clip = ClipId::new();
+    track.clips.push(Clip {
+        id: clip,
+        name: "Beat".into(),
+        start: 0,
+        length: PPQ * 4,
+        muted: false,
+        content: ClipContent::pattern("c4", 0, PPQ * 4),
+    });
+    let track_id = track.id;
+    project.tracks.push(track);
+    let session = headless(project);
+    session.set_library(sky_library::Library::new(tmp.path().join("cache")));
+    let bank = |session: &Session| {
+        let project = session.project();
+        let slot = project.track(track_id).unwrap().instrument.clone().unwrap();
+        assert_eq!(slot.kind, sky_dsp::InstrumentType::Bank);
+        slot.bank.unwrap()
+    };
+
+    // samples('…') links the pack, and the names the pattern uses load:
+    // sd plays the pack's sn.
+    let request = sky_session::SoundsRequest {
+        link: vec![sky_library::PackSource::parse(&dir.to_string_lossy(), None)],
+        maps: Vec::new(),
+        names: sky_session::pattern_sound_names("bd*2 [sd bd:1]"),
+    };
+    let done = session
+        .load_pattern_sounds(
+            track_id,
+            &request,
+            "Change pattern Beat",
+            vec![set_pattern(clip, "bd*2 [sd bd:1]")],
+            Origin::User,
+        )
+        .unwrap();
+    assert_eq!(done.linked, ["dirt"]);
+    assert_eq!(
+        done.loaded,
+        [
+            ("bd".to_string(), "dirt".to_string()),
+            ("sn".to_string(), "dirt".to_string())
+        ]
+    );
+    assert!(done.missing.is_empty() && done.failed.is_empty());
+    assert_eq!((done.new_files, done.reused_files), (3, 0));
+    let b = bank(&session);
+    assert_eq!(b.name, "dirt");
+    assert_eq!(b.packs.len(), 1);
+    assert_eq!(b.packs[0].license, sky_model::License::Unknown);
+    assert_eq!(
+        session.view().undo_label.as_deref(),
+        Some("Change pattern Beat")
+    );
+    let audio = session.render_range(0, PPQ * 4, 0.0).unwrap();
+    assert!(audio.peak() > 0.1, "peak {}", audio.peak());
+
+    // Later, a name the bank lacks loads from the linked pack; one no pack
+    // has is reported.
+    let request = sky_session::SoundsRequest {
+        names: sky_session::pattern_sound_names("bd hh zz"),
+        ..Default::default()
+    };
+    let more = session
+        .load_pattern_sounds(
+            track_id,
+            &request,
+            "Change pattern Beat",
+            vec![set_pattern(clip, "bd hh zz")],
+            Origin::User,
+        )
+        .unwrap();
+    assert!(more.linked.is_empty());
+    assert_eq!(more.loaded, [("hh".to_string(), "dirt".to_string())]);
+    assert_eq!(more.missing, ["zz"]);
+    assert_eq!(bank(&session).sounds.len(), 3);
+
+    // A map written in the pattern loads all of its sounds, from a base.
+    let base = dir.to_string_lossy().replace('\\', "/");
+    let text = format!("samples({{ kick: 'bd0.wav', 'hat': ['hh.wav'] }}, '{base}/')\nkick hat");
+    let calls = sky_library::find_samples(&text).unwrap();
+    let sky_library::Samples::Map(map) = &calls[0].samples else {
+        panic!("{calls:?}");
+    };
+    let request = sky_session::SoundsRequest {
+        maps: vec![map.clone()],
+        names: sky_session::pattern_sound_names(&sky_library::samples::strip_calls(&text, &calls)),
+        ..Default::default()
+    };
+    let written = session
+        .load_pattern_sounds(
+            track_id,
+            &request,
+            "Change pattern Beat",
+            Vec::new(),
+            Origin::User,
+        )
+        .unwrap();
+    assert_eq!(written.loaded.len(), 2);
+    assert_eq!(written.loaded[0].1, "Written samples");
+    assert_eq!(written.new_files + written.reused_files, 2);
+
+    // A pack that cannot be read is not linked, and nothing changes.
+    let before = session.view().revision;
+    let request = sky_session::SoundsRequest {
+        link: vec![sky_library::PackSource::parse(
+            &tmp.path().join("nope").to_string_lossy(),
+            None,
+        )],
+        ..Default::default()
+    };
+    let err = session
+        .load_pattern_sounds(track_id, &request, "x", Vec::new(), Origin::User)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot read the sample map"),
+        "{err}"
+    );
+    assert_eq!(session.view().revision, before);
+
+    // Each load is one undo step, pattern and sounds together.
+    session.undo().unwrap();
+    session.undo().unwrap();
+    assert_eq!(bank(&session).sounds.len(), 2);
+    session.undo().unwrap();
+    let project = session.project();
+    assert!(project.audio_pool.is_empty());
+    let t = project.track(track_id).unwrap();
+    assert_eq!(
+        t.instrument.as_ref().unwrap().kind,
+        sky_dsp::InstrumentType::Synth
+    );
+    assert!(matches!(&t.clips[0].content, ClipContent::Pattern { source, .. } if source == "c4"));
+}
+
 #[test]
 fn unknown_licenses_warn_and_bad_requests_change_nothing() {
     let tmp = tempfile::tempdir().unwrap();

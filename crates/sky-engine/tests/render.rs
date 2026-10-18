@@ -400,6 +400,7 @@ fn bank_project(clip: ClipContent, pitched: Option<&str>) -> (Project, AudioCach
         name: "Test".into(),
         sounds,
         pitched: pitched.map(str::to_string),
+        packs: Vec::new(),
     });
     t.clips.push(Clip {
         id: ClipId::new(),

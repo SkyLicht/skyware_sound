@@ -721,6 +721,113 @@ async fn an_assistant_loads_a_strudel_bank_and_exports_with_its_credits() {
     assert_eq!(summary["audioPool"].as_array().unwrap().len(), 3);
 }
 
+/// A pack folder with plain names, as Dirt-Samples has: bd, sn and hh.
+fn write_plain_pack(dir: &std::path::Path) {
+    write_pack(dir);
+    std::fs::write(
+        dir.join("strudel.json"),
+        r#"{"bd": ["bd0.wav", "bd1.wav"], "sn": "sd.wav", "hh": "c4.wav"}"#,
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assistant_links_a_pack_with_a_samples_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_plain_pack(&tmp.path().join("packs/dirt"));
+    let (session, _) = Session::new(empty_project("Strudel"), None);
+    session.set_library(sky_library::Library::new(tmp.path().join("cache")));
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Files, vec![tmp.path().to_path_buf()]),
+    ))
+    .await;
+    ok(
+        &client,
+        "track_create",
+        json!({ "name": "Beat", "instrument": "synth" }),
+    )
+    .await;
+    ok(
+        &client,
+        "clip_create",
+        json!({ "track": "Beat", "start_bar": 1, "length_bars": 1, "pattern": "c4" }),
+    )
+    .await;
+
+    // Strudel's line links the pack; the sounds the pattern names load,
+    // and the line is not kept.
+    let set = ok(
+        &client,
+        "pattern_set",
+        json!({ "clip": "Pattern", "pattern": "samples('packs/dirt')\nbd*2 sd" }),
+    )
+    .await;
+    assert_eq!(set["pattern"], "bd*2 sd", "{set}");
+    assert_eq!(set["sounds"]["linked"], json!(["dirt"]), "{set}");
+    assert_eq!(
+        set["sounds"]["loaded"],
+        json!([["bd", "dirt"], ["sn", "dirt"]])
+    );
+    assert!(set["licenseNote"].is_string());
+    let track = ok(&client, "track_get", json!({ "track": "Beat" })).await;
+    let bank = &track["instrument"]["bank"];
+    assert_eq!(bank["linked"][0]["pack"], "dirt", "{track}");
+    assert_eq!(bank["linked"][0]["license"], "unknown");
+
+    // A name the bank lacks loads from the linked pack later.
+    let more = ok(
+        &client,
+        "pattern_set",
+        json!({ "clip": "Pattern", "pattern": "bd hh zz" }),
+    )
+    .await;
+    assert_eq!(more["sounds"]["loaded"], json!([["hh", "dirt"]]), "{more}");
+    assert_eq!(more["sounds"]["missing"], json!(["zz"]));
+
+    // The line has its place in pattern_set, and pattern_query reads past it.
+    let (text, is_error) = call(
+        &client,
+        "clip_create",
+        json!({ "track": "Beat", "start_bar": 2, "length_bars": 1, "pattern": "samples('packs/dirt')\nbd" }),
+    )
+    .await;
+    assert!(is_error && text.contains("pattern_set"), "{text}");
+    let query = ok(
+        &client,
+        "pattern_query",
+        json!({ "pattern": "samples('github:a/b')\nbd sd" }),
+    )
+    .await;
+    assert_eq!(query["events"].as_array().map(Vec::len), Some(2), "{query}");
+
+    // Without the files permission nothing downloads.
+    let edit = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Edit, vec![]),
+    ))
+    .await;
+    let (text, is_error) = call(
+        &edit,
+        "pattern_set",
+        json!({ "clip": "Pattern", "pattern": "samples('github:a/b')\nbd" }),
+    )
+    .await;
+    assert!(is_error && text.contains("files permission"), "{text}");
+    let plain = ok(
+        &edit,
+        "pattern_set",
+        json!({ "clip": "Pattern", "pattern": "bd cp" }),
+    )
+    .await;
+    assert!(
+        plain["note"].as_str().is_some_and(|n| n.contains("cp")),
+        "{plain}"
+    );
+    client.cancel().await.unwrap();
+    edit.cancel().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_assistant_sets_up_game_assets_and_exports_them_for_the_engine() {
     let tmp = tempfile::tempdir().unwrap();
