@@ -257,8 +257,9 @@ fn strudel_packs_load_from_github() {
 }
 
 /// A tiny piano library packed the way FreePats packs theirs: one folder
-/// holding the SFZ file and its samples.
-fn piano_archive(dir: &Path) -> Vec<u8> {
+/// holding the SFZ file and its samples. With a `method`, every file is
+/// coded with it; without, the folder is packed as 7-Zip packs one.
+fn piano_archive(dir: &Path, method: Option<sevenz_rust2::EncoderMethod>) -> Vec<u8> {
     let lib = dir.join("src").join("Tiny-1");
     std::fs::create_dir_all(lib.join("samples")).unwrap();
     std::fs::write(
@@ -273,7 +274,20 @@ fn piano_archive(dir: &Path) -> Vec<u8> {
     )
     .unwrap();
     let archive = dir.join("tiny.7z");
-    sevenz_rust2::compress_to_path(dir.join("src"), &archive).unwrap();
+    match method {
+        None => sevenz_rust2::compress_to_path(dir.join("src"), &archive).unwrap(),
+        Some(method) => {
+            let mut writer = sevenz_rust2::ArchiveWriter::create(&archive).unwrap();
+            writer.set_content_methods(vec![method.into()]);
+            for name in ["Tiny-1/Tiny.sfz", "Tiny-1/samples/c4.wav"] {
+                let path = dir.join("src").join(name);
+                let entry = sevenz_rust2::ArchiveEntry::from_path(&path, name.to_string());
+                let file = std::fs::File::open(&path).unwrap();
+                writer.push_archive_entry(entry, Some(file)).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+    }
     std::fs::read(archive).unwrap()
 }
 
@@ -308,7 +322,7 @@ fn tiny_info(url: String, bytes: u64, sha256: String) -> InstrumentInfo {
 #[test]
 fn instrument_libraries_install_once_and_only_when_they_match() {
     let tmp = tempfile::tempdir().unwrap();
-    let archive = piano_archive(tmp.path());
+    let archive = piano_archive(tmp.path(), None);
     let mut files = HashMap::new();
     files.insert("/tiny.7z".to_string(), archive.clone());
     let server = Server::start(files);
@@ -364,6 +378,25 @@ fn instrument_libraries_install_once_and_only_when_they_match() {
 }
 
 #[test]
+fn deflate_archives_unpack() {
+    // FreePats packs the full Upright KW with DEFLATE.
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = piano_archive(tmp.path(), Some(sevenz_rust2::EncoderMethod::DEFLATE));
+    let mut files = HashMap::new();
+    files.insert("/tiny.7z".to_string(), archive.clone());
+    let server = Server::start(files);
+    let instruments = Instruments::new(tmp.path().join("instruments"));
+    let info = tiny_info(
+        format!("{}/tiny.7z", server.base),
+        archive.len() as u64,
+        sha256_hex(&archive),
+    );
+    instruments.install(&info, &mut |_, _| {}).unwrap();
+    assert_eq!(instruments.load(&info).unwrap().zones().len(), 1);
+    server.stop.store(true, Ordering::SeqCst);
+}
+
+#[test]
 #[ignore = "downloads 33 MB from freepats.zenvoid.org"]
 fn the_full_upright_piano_installs_and_loads() {
     let dir = std::env::var_os("SKY_INSTRUMENTS")
@@ -384,7 +417,7 @@ fn the_full_upright_piano_installs_and_loads() {
         lib.bytes() as f64 / 1e6,
         lib.is_stereo()
     );
-    assert_eq!(lib.samples().len(), 68);
+    assert_eq!(lib.samples().len(), 66);
     let (low, high) = lib.key_range().unwrap();
     assert!(low <= 21 && high >= 108, "{low}..{high}");
     assert!(lib.is_stereo());

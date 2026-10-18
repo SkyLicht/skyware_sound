@@ -95,7 +95,7 @@ pub const INSTRUMENTS: &[InstrumentInfo] = &[
         kind: InstrumentType::Piano,
         version: "2022-02-21",
         description: "The full Kawai upright from FreePats: two velocity layers, stereo, \
-                      44.1 kHz 24-bit, 68 samples. A 32 MiB download.",
+                      44.1 kHz 24-bit, 66 samples. A 32 MiB download.",
         license: License::Cc0,
         credit: None,
         homepage: "https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html#UprightKW",
