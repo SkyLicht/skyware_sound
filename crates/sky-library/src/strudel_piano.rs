@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The recordings of Strudel's piano pack that Skyware Sound downloads:
-//! each file of the `piano` sound in `felixroos/dough-samples`' `piano.json`,
-//! its size and its SHA-256. Checked by a test against [`MANIFEST_SHA256`].
+//! each file of the `piano` sound in `felixroos/dough-samples`' `piano.json`
+//! at the commit that was `main` on 2026-10-18, its size and its SHA-256.
+//! Checked by a test against [`MANIFEST_SHA256`].
 
 /// Where the files are, by their names appended to it.
-pub const BASE: &str = "https://raw.githubusercontent.com/felixroos/dough-samples/main/piano/";
+pub const BASE: &str = "https://raw.githubusercontent.com/felixroos/dough-samples/\
+                        9eacfc86ec4393e68a463ff52b01c19cfaa77f38/piano/";
 
 /// SHA-256 of the list as `path\tbytes\tsha256\n` lines, which names this
 /// set of files the way an archive's hash names an archive.
