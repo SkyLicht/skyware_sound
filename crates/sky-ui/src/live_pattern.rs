@@ -602,7 +602,7 @@ mod tests {
             start: 960,
             length: 1920,
             muted: false,
-            content: sky_model::ClipContent::Midi { notes: vec![] },
+            content: sky_model::ClipContent::midi(vec![]),
         };
         assert_eq!(cycle_at(&clip, 960, 1440.0), Some(0.5));
         assert_eq!(cycle_at(&clip, 960, 900.0), None);

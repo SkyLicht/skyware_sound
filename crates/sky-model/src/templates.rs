@@ -64,9 +64,7 @@ pub fn demo_project() -> Project {
         start: 0,
         length: bar * bars,
         muted: false,
-        content: ClipContent::Midi {
-            notes: parse_note_list(&line.join(", ")).unwrap_or_default(),
-        },
+        content: ClipContent::midi(parse_note_list(&line.join(", ")).unwrap_or_default()),
     });
 
     let mut pad = Track::new_instrument("Pad", InstrumentType::Synth);
@@ -88,12 +86,10 @@ pub fn demo_project() -> Project {
         start: 0,
         length: bar * bars,
         muted: false,
-        content: ClipContent::Midi {
-            notes: parse_note_list(
-                "A3+C4+E4 1 v80, F3+A3+C4 1 v80, C3+E3+G3+C4 1 v80, G3+B3+D4 1 v80",
-            )
-            .unwrap_or_default(),
-        },
+        content: ClipContent::midi(
+            parse_note_list("A3+C4+E4 1 v80, F3+A3+C4 1 v80, C3+E3+G3+C4 1 v80, G3+B3+D4 1 v80")
+                .unwrap_or_default(),
+        ),
     });
 
     p.master

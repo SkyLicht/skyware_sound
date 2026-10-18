@@ -113,9 +113,7 @@ fn parameter_patterns_set_each_note_and_other_notes_get_the_usual_value() {
         clip(
             bar,
             bar,
-            ClipContent::Midi {
-                notes: vec![Note::new(0, PPQ / 4, 42, 100)],
-            },
+            ClipContent::midi(vec![Note::new(0, PPQ / 4, 42, 100)]),
         ),
     ])]);
     let peaks = beat_peaks(&play(&p, BEAT * 5));
@@ -174,9 +172,7 @@ fn ducked(kick_source: &str, duck: Option<&[(&str, f32)]>) -> Vec<f32> {
     bass.clips.push(clip(
         0,
         bar,
-        ClipContent::Midi {
-            notes: vec![Note::new(0, bar, 57, 100)],
-        },
+        ClipContent::midi(vec![Note::new(0, bar, 57, 100)]),
     ));
     if let Some(params) = duck {
         bass.channel.effects.push(
@@ -234,9 +230,7 @@ fn synced_effects_follow_the_project_tempo() {
     let mut p = project(vec![drums(vec![clip(
         0,
         PPQ,
-        ClipContent::Midi {
-            notes: vec![Note::new(0, PPQ / 4, 36, 127)],
-        },
+        ClipContent::midi(vec![Note::new(0, PPQ / 4, 36, 127)]),
     )])]);
     p.tempo = TempoMap::constant(150.0);
     p.tracks[0]

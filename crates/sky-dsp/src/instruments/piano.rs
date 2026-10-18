@@ -5,12 +5,16 @@
 //! decides how hard each note plays: velocity goes through a curve, then
 //! picks the velocity layer and the gain. A mono library is spread across
 //! the stereo field by key, as a piano sounds from the bench.
+//!
+//! The sustain pedal (controller 64) holds keys after they come up, and
+//! plays the library's pedal recordings when it has them. The top keys
+//! have no dampers and ring on, as on an acoustic piano.
 
 use std::sync::Arc;
 
 use crate::MAX_BLOCK;
-use crate::instruments::Instrument;
 use crate::instruments::sampled::{NoteShape, SampleLibrary, SampleVoices};
+use crate::instruments::{Instrument, SUSTAIN_PEDAL};
 use crate::params::ParamSpec;
 use crate::util::db_to_gain;
 
@@ -21,6 +25,7 @@ pub(crate) const PIANO_PARAMS: &[ParamSpec] = &[
     ParamSpec::log("release", "Release", 10.0, 400.0, 100.0, "%"),
     ParamSpec::linear("width", "Width", -100.0, 100.0, 100.0, "%"),
     ParamSpec::linear("tune", "Tune", -100.0, 100.0, 0.0, "ct"),
+    ParamSpec::linear("pedal_noise", "Pedal noise", -60.0, 12.0, 0.0, "dB"),
     ParamSpec::linear("gain", "Gain", -60.0, 12.0, 0.0, "dB"),
 ];
 
@@ -31,15 +36,42 @@ const KEY_SPREAD: f32 = 0.6;
 /// Recorded pianos are normalized close to full scale. This brings a key
 /// down to where a synth note peaks, so chords have room.
 const HEADROOM_DB: f32 = -9.0;
+/// The lowest key without a damper, F#6: from here up the strings ring on
+/// after the key comes up.
+const UNDAMPED_FROM: u8 = 90;
+
+/// How the piano shapes each key, apart from its velocity.
+#[derive(Clone, Copy)]
+struct Feel {
+    dynamics: f32,
+    release: f32,
+    width: f32,
+    tune: f32,
+}
+
+impl Feel {
+    /// The shape of `key` played at `curved` velocity (0 to 1).
+    fn shape(&self, key: u8, curved: f32) -> NoteShape {
+        // From the bench, low keys sit on the left.
+        let place = ((f32::from(key) - 64.5) / 44.0).clamp(-1.0, 1.0);
+        NoteShape {
+            gain: db_to_gain(-self.dynamics * (1.0 - curved)),
+            tune: self.tune / 100.0,
+            pan: 0.0,
+            mono_pan: place * self.width * KEY_SPREAD,
+            width: self.width,
+            release: self.release,
+        }
+    }
+}
 
 pub struct Piano {
     voices: SampleVoices,
     tone: f32,
     vel_curve: f32,
-    dynamics: f32,
-    release: f32,
-    width: f32,
-    tune: f32,
+    feel: Feel,
+    /// The pedal recordings' gain.
+    pedal_noise: f32,
     gain: f32,
     tilt_coeff: f32,
     /// The tone control's low-pass state, left and right.
@@ -49,14 +81,19 @@ pub struct Piano {
 
 impl Piano {
     pub fn new(sample_rate: f32, library: Arc<SampleLibrary>) -> Self {
+        let mut voices = SampleVoices::new(sample_rate, library);
+        voices.set_undamped_from(UNDAMPED_FROM);
         Self {
-            voices: SampleVoices::new(sample_rate, library),
+            voices,
             tone: 0.0,
             vel_curve: 0.0,
-            dynamics: 30.0,
-            release: 1.0,
-            width: 1.0,
-            tune: 0.0,
+            feel: Feel {
+                dynamics: 30.0,
+                release: 1.0,
+                width: 1.0,
+                tune: 0.0,
+            },
+            pedal_noise: 1.0,
             gain: db_to_gain(HEADROOM_DB),
             tilt_coeff: 1.0 - (-std::f32::consts::TAU * TILT_HZ / sample_rate).exp(),
             tilt: [0.0; 2],
@@ -75,16 +112,7 @@ impl Piano {
     }
 
     fn shape(&self, key: u8, curved: f32) -> NoteShape {
-        // From the bench, low keys sit on the left.
-        let place = ((f32::from(key) - 64.5) / 44.0).clamp(-1.0, 1.0);
-        NoteShape {
-            gain: db_to_gain(-self.dynamics * (1.0 - curved)),
-            tune: self.tune / 100.0,
-            pan: 0.0,
-            mono_pan: place * self.width * KEY_SPREAD,
-            width: self.width,
-            release: self.release,
-        }
+        self.feel.shape(key, curved)
     }
 }
 
@@ -93,10 +121,11 @@ impl Instrument for Piano {
         match name {
             "tone" => self.tone = value,
             "vel_curve" => self.vel_curve = value.clamp(-1.0, 1.0),
-            "dynamics" => self.dynamics = value.max(0.0),
-            "release" => self.release = value.max(1.0) / 100.0,
-            "width" => self.width = value.clamp(-100.0, 100.0) / 100.0,
-            "tune" => self.tune = value,
+            "dynamics" => self.feel.dynamics = value.max(0.0),
+            "release" => self.feel.release = value.max(1.0) / 100.0,
+            "width" => self.feel.width = value.clamp(-100.0, 100.0) / 100.0,
+            "tune" => self.feel.tune = value,
+            "pedal_noise" => self.pedal_noise = db_to_gain(value),
             "gain" => self.gain = db_to_gain(value + HEADROOM_DB),
             _ => return false,
         }
@@ -115,6 +144,21 @@ impl Instrument for Piano {
         // scales them by the note's own gain.
         let shape = self.shape(pitch, 1.0);
         self.voices.note_off(pitch, &shape);
+    }
+
+    fn controller(&mut self, controller: u8, value: u8) {
+        if controller != SUSTAIN_PEDAL {
+            return;
+        }
+        let feel = self.feel;
+        let noise = NoteShape {
+            gain: self.pedal_noise,
+            width: feel.width,
+            ..NoteShape::default()
+        };
+        // Keys the pedal lets go of release as they would have on key up.
+        self.voices
+            .set_pedal(value >= 64, &noise, |key| feel.shape(key, 1.0));
     }
 
     fn all_notes_off(&mut self) {
@@ -238,6 +282,40 @@ mod tests {
         assert!((flat - 1.0).abs() < 0.05, "{flat}");
         assert!(brightness(12.0) > flat * 1.5);
         assert!(brightness(-12.0) < flat * 0.8);
+    }
+
+    #[test]
+    fn the_pedal_holds_notes_and_the_top_keys_ring_on() {
+        // Upright KW has a 0.6 s release; this library's is 1 ms.
+        let lib = library();
+        let level_after = |pedal: bool, key: u8| {
+            let mut p = Piano::new(48_000.0, lib.clone());
+            if pedal {
+                p.controller(SUSTAIN_PEDAL, 127);
+            }
+            p.note_on(key, 100);
+            let _ = render(&mut p, 2_400);
+            p.note_off(key);
+            peak(&render(&mut p, 9_600).0[4_800..])
+        };
+        assert!(level_after(false, 60) < 1e-3);
+        assert!(level_after(true, 60) > 0.05);
+        // The test library ends at 72, so the top keys are tried on 72 with
+        // the dampers starting lower.
+        let mut p = Piano::new(48_000.0, lib.clone());
+        p.voices.set_undamped_from(72);
+        p.note_on(72, 100);
+        let _ = render(&mut p, 2_400);
+        p.note_off(72);
+        assert!(peak(&render(&mut p, 9_600).0[4_800..]) > 0.05);
+        // Other controllers change nothing; small pedal values are up.
+        let mut p = Piano::new(48_000.0, lib);
+        p.controller(1, 127);
+        p.controller(SUSTAIN_PEDAL, 63);
+        assert!(!p.voices.pedal());
+        p.controller(SUSTAIN_PEDAL, 64);
+        assert!(p.voices.pedal());
+        assert!(p.set_param("pedal_noise", -12.0));
     }
 
     impl Piano {

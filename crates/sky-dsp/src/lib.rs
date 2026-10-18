@@ -20,7 +20,7 @@ pub mod util;
 
 pub use audio::AudioData;
 pub use effects::{Effect, EffectType};
-pub use instruments::{Instrument, InstrumentAudio, InstrumentType};
+pub use instruments::{Instrument, InstrumentAudio, InstrumentType, SUSTAIN_PEDAL};
 pub use params::{ParamKind, ParamSpec};
 pub use presets::Preset;
 

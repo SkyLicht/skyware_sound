@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The audio callback path must never allocate, including snapshot swaps,
-//! transport changes, loop wraps, live notes and previews.
+//! transport changes, loop wraps, live notes, previews and the sustain
+//! pedal.
 
 use std::sync::Arc;
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
-use sky_core::{AudioId, ClipId};
+use sky_core::{AudioId, ClipId, PPQ};
+use sky_dsp::instruments::{SampleData, SampleLibrary, Zone};
 use sky_dsp::{AudioData, EffectType, InstrumentType};
-use sky_engine::{AudioCache, EngineMsg, Preview, compile, create_engine};
+use sky_engine::{AudioCache, EngineMsg, LibraryCache, Preview, compile_with, create_engine};
 use sky_model::templates::demo_project;
-use sky_model::{BankSample, Clip, ClipContent, EffectSlot, SampleBank, Swing, Track};
+use sky_model::{BankSample, Clip, ClipContent, EffectSlot, Note, Pedal, SampleBank, Swing, Track};
 
 #[global_allocator]
 static ALLOC: AllocDisabler = AllocDisabler;
@@ -103,6 +105,46 @@ fn processing_never_allocates() {
         content: ClipContent::Steps(sky_model::StepClip::new(16, vec![line])),
     });
     project.tracks.push(acid);
+    // A piano with the pedal going down and up in a MIDI clip and a pattern.
+    let libraries: LibraryCache = [(
+        String::new(),
+        Arc::new(SampleLibrary::new(
+            "test",
+            vec![SampleData::from_audio(&AudioData::silent(2, 9_600, 48_000))],
+            vec![Zone::new(0, 60)],
+        )),
+    )]
+    .into();
+    let mut piano = Track::new_instrument("Piano", InstrumentType::Piano);
+    piano.clips.push(Clip {
+        id: ClipId::new(),
+        name: "m".into(),
+        start: 0,
+        length: bar,
+        muted: false,
+        content: ClipContent::Midi {
+            notes: (0..8)
+                .map(|i| Note::new(i * PPQ / 2, PPQ / 4, 60 + i as u8, 100))
+                .collect(),
+            pedal: vec![Pedal::new(0, PPQ), Pedal::new(PPQ * 2, PPQ / 2)],
+        },
+    });
+    let mut pattern = ClipContent::pattern("c4*8", 0, bar);
+    if let ClipContent::Pattern { controls, .. } = &mut pattern {
+        controls.insert("sustain".into(), "1 0 1 0".into());
+    }
+    piano.clips.push(Clip {
+        id: ClipId::new(),
+        name: "p".into(),
+        start: bar / 2,
+        length: bar,
+        muted: false,
+        content: pattern,
+    });
+    project.tracks.push(piano);
+    let compile = |project: &sky_model::Project, cache: &AudioCache, sr: u32, version: u64| {
+        compile_with(project, cache, &libraries, sr, version)
+    };
     let (mut handle, mut engine) = create_engine(compile(&project, &cache, 48_000, 1));
     let mut out = vec![0.0f32; 2 * 1_024];
     handle.send(EngineMsg::Play);

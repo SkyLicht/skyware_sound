@@ -726,6 +726,9 @@ pub enum ClipContent {
     Midi {
         #[serde(default)]
         notes: Vec<Note>,
+        /// Where the sustain pedal is down, sorted and apart.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pedal: Vec<Pedal>,
     },
     /// A short pattern in mini-notation that generates notes for any span.
     #[serde(rename_all = "camelCase")]
@@ -814,6 +817,15 @@ impl ClipContent {
             swing: Swing::default(),
         }
     }
+
+    /// MIDI content with these notes and the pedal up throughout.
+    pub fn midi(notes: Vec<Note>) -> Self {
+        ClipContent::Midi {
+            notes,
+            pedal: Vec::new(),
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             ClipContent::Audio { .. } => "audio",
@@ -860,6 +872,65 @@ impl Note {
             )));
         }
         Ok(())
+    }
+}
+
+/// A stretch of a MIDI clip with the sustain pedal down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pedal {
+    /// Start relative to the clip start.
+    pub start: Ticks,
+    pub length: Ticks,
+}
+
+impl Pedal {
+    pub fn new(start: Ticks, length: Ticks) -> Self {
+        Self { start, length }
+    }
+
+    pub fn end(&self) -> Ticks {
+        self.start + self.length
+    }
+
+    /// The stretch moved `by` ticks and cut where the clip starts, or none
+    /// when it ends before then.
+    pub fn shifted(&self, by: Ticks) -> Option<Pedal> {
+        let start = (self.start + by).max(0);
+        let end = self.end() + by;
+        (end > start).then(|| Pedal::new(start, end - start))
+    }
+
+    /// The stretch cut where a clip `length` long ends, or none when it
+    /// starts after then.
+    pub fn cut(&self, length: Ticks) -> Option<Pedal> {
+        (self.start < length).then(|| Pedal::new(self.start, self.length.min(length - self.start)))
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.start < 0 || self.length <= 0 {
+            return Err(ModelError::InvalidValue(format!(
+                "a pedal stretch needs start >= 0 and length > 0, got start {} length {}",
+                self.start, self.length
+            )));
+        }
+        Ok(())
+    }
+
+    /// Sorts stretches and joins the ones that touch or overlap, so the
+    /// pedal goes down and up once per stretch.
+    pub fn tidy(mut pedal: Vec<Pedal>) -> Vec<Pedal> {
+        pedal.sort_by_key(|p| p.start);
+        let mut out: Vec<Pedal> = Vec::with_capacity(pedal.len());
+        for p in pedal {
+            match out.last_mut() {
+                Some(last) if p.start <= last.end() => {
+                    last.length = last.length.max(p.end() - last.start);
+                }
+                _ => out.push(p),
+            }
+        }
+        out
     }
 }
 

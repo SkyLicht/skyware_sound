@@ -25,7 +25,7 @@ use sky_dsp::{EffectType, InstrumentType};
 use sky_io::WavFormat;
 use sky_library::{PACKS, PackSource, Samples};
 use sky_model::command::VELOCITY;
-use sky_model::notes::{format_note_list, parse_note_list};
+use sky_model::notes::{format_note_list, format_pedal_list, parse_note_list, parse_pedal_list};
 use sky_model::summary::{clip_json, game_asset_json, game_json, project_summary, track_json};
 use sky_model::templates::{acid_project, demo_project, empty_project, techno_project};
 use sky_model::{
@@ -104,7 +104,13 @@ licenses.\n\
 The piano (instrument piano) plays a recorded piano with velocity layers and \
 release sounds. It starts with a small built-in upright; instrument_libraries \
 lists the others and piano_library switches a track to one, downloading it \
-once. Libraries live outside the project, which names the one it needs.\n\
+once. Libraries live outside the project, which names the one it needs. Its \
+sustain pedal holds notes after they end: give a MIDI clip pedal stretches in \
+beats from the clip start (pedal \"0-3.75, 4-8\" in clip_create or \
+notes_write); stretches that touch join, so leave a gap where the harmony \
+changes, as above, for the pedal to come up. On a \
+pattern clip the sustain control moves the pedal instead, held from one step \
+to the next: controls {\"sustain\": \"<1 0>\"} holds every other cycle.\n\
 \n\
 Step clips (steps_write) work like a drum machine or an acid bass: lanes of \
 steps, one token per step. On drums give a lane per piece (note bd, sd, cp, hh, \
@@ -406,6 +412,7 @@ fn check_controls<'a>(
         }
         if let Some(slot) = slot
             && params::find(slot.kind.params(), name).is_none()
+            && !(name == "sustain" && slot.kind.takes_pedal())
         {
             return Err(format!(
                 "a control is velocity or a parameter of the track's {}, which has no {name:?}; \
@@ -825,6 +832,9 @@ pub struct ClipCreateArgs {
     pub name: Option<String>,
     /// For a MIDI clip: notes in the compact list form.
     pub notes: Option<String>,
+    /// For a MIDI clip on a piano: where the sustain pedal is down, as
+    /// stretches of beats from the clip start, such as "0-3.75, 4-8".
+    pub pedal: Option<String>,
     /// For a pattern clip: mini-notation text, or Strudel code.
     pub pattern: Option<String>,
     /// Pattern cycle length in bars. Default 1.
@@ -859,9 +869,13 @@ pub struct ClipMoveArgs {
 pub struct NotesWriteArgs {
     /// MIDI clip ID or name.
     pub clip: String,
-    /// Notes in the compact list form.
-    pub notes: String,
-    /// replace (default) or add.
+    /// Notes in the compact list form. Leave out to keep the notes.
+    pub notes: Option<String>,
+    /// Where the sustain pedal is down, as stretches of beats from the clip
+    /// start, such as "0-3.75, 4-8"; "" lifts it everywhere. Leave out to
+    /// keep the stretches.
+    pub pedal: Option<String>,
+    /// replace (default) or add, for notes and stretches alike.
     pub mode: Option<String>,
 }
 
@@ -1941,6 +1955,12 @@ impl SkywareMcp {
         {
             return Err("controls and swing are for pattern clips; give a pattern too".into());
         }
+        if a.pedal.is_some() && (a.pattern.is_some() || a.audio.is_some()) {
+            return Err(
+                "pedal stretches are for MIDI clips; on a pattern clip use the sustain control"
+                    .into(),
+            );
+        }
         let (content, default_name) = if let Some(audio) = &a.audio {
             let source = find_audio(&project, audio)?;
             let name = project
@@ -1981,7 +2001,9 @@ impl SkywareMcp {
         } else {
             let notes =
                 parse_note_list(a.notes.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
-            (ClipContent::Midi { notes }, "Clip".to_string())
+            let pedal =
+                parse_pedal_list(a.pedal.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
+            (ClipContent::Midi { notes, pedal }, "Clip".to_string())
         };
         let clip = Clip {
             id: ClipId::new(),
@@ -2073,7 +2095,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Writes notes into a MIDI clip from the compact note list, replacing its notes (default) or adding to them. Note positions are relative to the clip start."
+        description = "Writes notes into a MIDI clip from the compact note list, and where its sustain pedal is down, replacing what is there (default) or adding to it. Positions are relative to the clip start."
     )]
     async fn notes_write(
         &self,
@@ -2083,30 +2105,46 @@ impl SkywareMcp {
         let project = self.session.project();
         let id = find_clip(&project, &a.clip)?;
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
-        let ClipContent::Midi { notes: old } = &clip.content else {
+        let ClipContent::Midi {
+            notes: old,
+            pedal: old_pedal,
+        } = &clip.content
+        else {
             return Err(format!(
                 "{} is a {} clip, not a MIDI clip",
                 clip.name,
                 clip.kind_name()
             ));
         };
-        let notes = parse_note_list(&a.notes).map_err(|e| e.to_string())?;
-        let mut cmds = Vec::new();
-        match a.mode.as_deref().unwrap_or("replace") {
-            "replace" => {
-                if !old.is_empty() {
-                    cmds.push(Command::RemoveNotes {
-                        clip: id,
-                        ids: old.iter().map(|n| n.id).collect(),
-                    });
-                }
-            }
-            "add" => {}
-            other => return Err(format!("mode {other:?} is not replace or add")),
+        if a.notes.is_none() && a.pedal.is_none() {
+            return Err("give notes, pedal or both".into());
         }
-        let count = notes.len();
-        if !notes.is_empty() {
-            cmds.push(Command::AddNotes { clip: id, notes });
+        let replace = match a.mode.as_deref().unwrap_or("replace") {
+            "replace" => true,
+            "add" => false,
+            other => return Err(format!("mode {other:?} is not replace or add")),
+        };
+        let mut cmds = Vec::new();
+        let mut count = 0;
+        if let Some(text) = &a.notes {
+            let notes = parse_note_list(text).map_err(|e| e.to_string())?;
+            if replace && !old.is_empty() {
+                cmds.push(Command::RemoveNotes {
+                    clip: id,
+                    ids: old.iter().map(|n| n.id).collect(),
+                });
+            }
+            count = notes.len();
+            if !notes.is_empty() {
+                cmds.push(Command::AddNotes { clip: id, notes });
+            }
+        }
+        if let Some(text) = &a.pedal {
+            let mut pedal = parse_pedal_list(text).map_err(|e| e.to_string())?;
+            if !replace {
+                pedal.extend(old_pedal.iter().copied());
+            }
+            cmds.push(Command::SetPedal { clip: id, pedal });
         }
         if cmds.is_empty() {
             return Err("there are no notes to write".into());
@@ -2119,16 +2157,34 @@ impl SkywareMcp {
         )?;
         let project = self.session.project();
         let (_, clip) = project.find_clip(id).map_err(|e| e.to_string())?;
-        let ClipContent::Midi { notes } = &clip.content else {
+        let ClipContent::Midi { notes, pedal } = &clip.content else {
             return Err("the clip changed type".into());
         };
         let beyond = notes.iter().filter(|n| n.start >= clip.length).count();
         let mut v =
             json!({ "written": count, "noteCount": notes.len(), "notes": format_note_list(notes) });
+        if !pedal.is_empty() {
+            v["pedal"] = json!(format_pedal_list(pedal));
+        }
+        let mut warnings = Vec::new();
         if beyond > 0 {
-            v["warning"] = json!(format!(
+            warnings.push(format!(
                 "{beyond} note(s) start after the clip ends and will not play; lengthen the clip with clip_move"
             ));
+        }
+        let takes_pedal = project
+            .find_clip(id)
+            .ok()
+            .and_then(|(t, _)| t.instrument.as_ref())
+            .is_some_and(|s| s.kind.takes_pedal());
+        if !pedal.is_empty() && !takes_pedal {
+            warnings.push(
+                "the track's instrument has no sustain pedal: the stretches are kept but change nothing"
+                    .to_string(),
+            );
+        }
+        if !warnings.is_empty() {
+            v["warning"] = json!(warnings.join("; "));
         }
         Ok(v.to_string())
     }

@@ -38,7 +38,7 @@ fn every_command_undoes_exactly() {
     let step_clip = ClipId::new();
     let note_ids: Vec<NoteId>;
     {
-        let ClipContent::Midi { notes } = &project.tracks[1].clips[0].content else {
+        let ClipContent::Midi { notes, .. } = &project.tracks[1].clips[0].content else {
             panic!()
         };
         note_ids = notes.iter().take(3).map(|n| n.id).collect();
@@ -162,7 +162,7 @@ fn every_command_undoes_exactly() {
                 start: 0,
                 length: PPQ * 4,
                 muted: false,
-                content: ClipContent::Midi { notes: vec![] },
+                content: ClipContent::midi(vec![]),
             }),
         },
         Command::AddClip {
@@ -213,6 +213,14 @@ fn every_command_undoes_exactly() {
         Command::RemoveNotes {
             clip: bass_clip,
             ids: note_ids.clone(),
+        },
+        Command::SetPedal {
+            clip: bass_clip,
+            pedal: vec![Pedal::new(0, PPQ * 3), Pedal::new(PPQ * 4, PPQ * 4)],
+        },
+        Command::SetPedal {
+            clip: bass_clip,
+            pedal: Vec::new(),
         },
         Command::SetPattern {
             clip: pattern_clip,
@@ -912,6 +920,10 @@ fn arb_command(track_ids: Vec<TrackId>, clip_ids: Vec<ClipId>) -> impl Strategy<
             length: l * PPQ
         }),
         clips.clone().prop_map(|id| Command::RemoveClip { id }),
+        (clips.clone(), 0i64..8, 1i64..8).prop_map(|(clip, s, l)| Command::SetPedal {
+            clip,
+            pedal: vec![sky_model::Pedal::new(s * PPQ, l * PPQ)]
+        }),
         (clips.clone(), 0i64..32, 36u8..90).prop_map(|(clip, s, p)| Command::AddNotes {
             clip,
             notes: vec![sky_model::Note::new(s * 120, 240, p, 100)]
@@ -1191,6 +1203,66 @@ fn commands_name_what_they_change() {
             Target::Track(lead_id),
         ]
     );
+}
+
+#[test]
+fn pedal_stretches_are_checked_joined_and_saved() {
+    let mut project = demo_project();
+    let mut history = History::new();
+    let bass_clip = project.tracks[1].clips[0].id;
+    let pattern_clip = project.tracks[0].clips[0].id;
+    let pedal = |p: &Project| match &p.tracks[1].clips[0].content {
+        ClipContent::Midi { pedal, .. } => pedal.clone(),
+        _ => panic!(),
+    };
+    // Out of order and overlapping: stored once per press.
+    try_apply(
+        &mut history,
+        &mut project,
+        Command::SetPedal {
+            clip: bass_clip,
+            pedal: vec![
+                Pedal::new(PPQ * 4, PPQ),
+                Pedal::new(0, PPQ * 2),
+                Pedal::new(PPQ, PPQ * 2),
+            ],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pedal(&project),
+        [Pedal::new(0, PPQ * 3), Pedal::new(PPQ * 4, PPQ)]
+    );
+    let set = Command::SetPedal {
+        clip: bass_clip,
+        pedal: Vec::new(),
+    };
+    assert_eq!(set.describe(), "Edit pedal");
+    let e = try_apply(
+        &mut history,
+        &mut project,
+        Command::SetPedal {
+            clip: bass_clip,
+            pedal: vec![Pedal::new(PPQ, 0)],
+        },
+    )
+    .unwrap_err();
+    assert!(e.contains("pedal"), "{e}");
+    let e = try_apply(
+        &mut history,
+        &mut project,
+        Command::SetPedal {
+            clip: pattern_clip,
+            pedal: vec![Pedal::new(0, PPQ)],
+        },
+    )
+    .unwrap_err();
+    assert!(e.contains("midi"), "{e}");
+    // Saved with the clip; clips without a pedal save as before.
+    let json = serde_json::to_string(&project).unwrap();
+    assert_eq!(json.matches("\"pedal\"").count(), 1);
+    let back: Project = serde_json::from_str(&json).unwrap();
+    assert_eq!(pedal(&back), pedal(&project));
 }
 
 #[test]

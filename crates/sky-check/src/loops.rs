@@ -46,7 +46,7 @@ pub fn check_project(bars: u32) -> Project {
                 let mut copy = clip.clone();
                 copy.id = sky_core::ClipId::new();
                 copy.start = start;
-                if let ClipContent::Midi { notes } = &mut copy.content {
+                if let ClipContent::Midi { notes, .. } = &mut copy.content {
                     for n in notes.iter_mut() {
                         n.id = NoteId::new();
                     }

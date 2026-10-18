@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use sky_core::{ClipId, EffectId, NoteId, PPQ, TempoMap, Ticks, TrackId};
 use sky_dsp::{EffectType, InstrumentType};
 use sky_model::{
-    AbCompare, ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Picture,
-    Project, StepClip, StepLane, Swing, Track, Transaction,
+    AbCompare, ChannelRef, Clip, ClipContent, Command, EffectSlot, InstrumentSlot, Note, Pedal,
+    Picture, Project, StepClip, StepLane, Swing, Track, Transaction,
 };
 use sky_session::Session;
 
@@ -440,7 +440,7 @@ pub fn add_midi_clip(
         start: start.max(0),
         length: length.max(1),
         muted: false,
-        content: ClipContent::Midi { notes: Vec::new() },
+        content: ClipContent::midi(Vec::new()),
     };
     let id = clip.id;
     apply(
@@ -674,6 +674,20 @@ pub fn update_notes(
     )
 }
 
+/// Replaces where a MIDI clip's sustain pedal is down, as one undo step.
+pub fn set_pedal(
+    session: &Session,
+    clip: ClipId,
+    pedal: Vec<Pedal>,
+    label: &str,
+) -> ActionResult<u64> {
+    apply(
+        session,
+        Transaction::user(label, vec![Command::SetPedal { clip, pedal }]),
+        None,
+    )
+}
+
 pub fn remove_notes(session: &Session, clip: ClipId, ids: Vec<NoteId>) -> ActionResult<u64> {
     if ids.is_empty() {
         return Err("no notes selected".into());
@@ -823,7 +837,7 @@ pub fn stress_project(tracks: usize) -> Project {
                 start: 0,
                 length: bar * 8,
                 muted: false,
-                content: ClipContent::Midi { notes },
+                content: ClipContent::midi(notes),
             }
         };
         t.clips.push(clip);

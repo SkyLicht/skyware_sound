@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 use sky_dsp::InstrumentType;
 
-use crate::notes::format_note_list;
+use crate::notes::{format_note_list, format_pedal_list};
 use crate::picture::Picture;
 use crate::project::*;
 use crate::steps::{DEFAULT_GATE, StepClip, format_locks};
@@ -70,10 +70,13 @@ pub fn clip_json(project: &Project, clip: &Clip, detail: bool) -> Value {
                 v["offsetSamples"] = json!(offset);
             }
         }
-        ClipContent::Midi { notes } => {
+        ClipContent::Midi { notes, pedal } => {
             v["noteCount"] = json!(notes.len());
             if detail {
                 v["notes"] = json!(format_note_list(notes));
+                if !pedal.is_empty() {
+                    v["pedal"] = json!(format_pedal_list(pedal));
+                }
             }
         }
         ClipContent::Pattern {

@@ -28,7 +28,7 @@ fn drum_project(notes: Vec<Note>) -> Project {
         start: 0,
         length: PPQ * 16,
         muted: false,
-        content: ClipContent::Midi { notes },
+        content: ClipContent::midi(notes),
     });
     p.tracks.push(t);
     p
@@ -194,9 +194,7 @@ fn notes_held_into_the_body_do_not_cut_off_at_the_join() {
         start: 0,
         length: PPQ * 16,
         muted: false,
-        content: ClipContent::Midi {
-            notes: vec![Note::new(PPQ * 2, PPQ * 3, 57, 110)],
-        },
+        content: ClipContent::midi(vec![Note::new(PPQ * 2, PPQ * 3, 57, 110)]),
     });
     p.tracks.push(t);
     let bar = p.tempo.tick_to_sample(p.ticks_per_bar(), SR);
@@ -281,9 +279,7 @@ fn swaps_keep_held_notes_sounding() {
         start: 0,
         length: PPQ * 16,
         muted: false,
-        content: ClipContent::Midi {
-            notes: vec![Note::new(0, PPQ * 16, 60, 100)],
-        },
+        content: ClipContent::midi(vec![Note::new(0, PPQ * 16, 60, 100)]),
     });
     p.tracks.push(t);
     let (mut handle, mut engine) = create_engine(compile(&p, &AudioCache::new(), SR, 1));
@@ -319,9 +315,7 @@ fn pianos_play_the_library_they_are_given() {
         start: 0,
         length: PPQ * 16,
         muted: false,
-        content: ClipContent::Midi {
-            notes: vec![Note::new(0, PPQ * 16, 60, 100)],
-        },
+        content: ClipContent::midi(vec![Note::new(0, PPQ * 16, 60, 100)]),
     });
     p.tracks.push(t);
     let tone: Vec<f32> = (0..SR as usize * 4)
@@ -492,12 +486,7 @@ fn bank_patterns_play_named_sounds_and_variations() {
 #[test]
 fn bank_notes_play_drums_by_number_or_the_pitched_sound() {
     let notes = vec![Note::new(0, PPQ / 4, 38, 100)];
-    let (p, audio) = bank_project(
-        ClipContent::Midi {
-            notes: notes.clone(),
-        },
-        None,
-    );
+    let (p, audio) = bank_project(ClipContent::midi(notes.clone()), None);
     let drums = render(compile(&p, &audio, SR, 1), 0, SR as usize / 2, false);
     let (p2, audio2) = bank_project(ClipContent::pattern("bd", 0, PPQ * 4), None);
     let bd = render(compile(&p2, &audio2, SR, 1), 0, SR as usize / 2, false);
@@ -507,9 +496,7 @@ fn bank_notes_play_drums_by_number_or_the_pitched_sound() {
     // With `piano` pitched, note 62 plays the C4 sample two semitones up,
     // so the 4800 frames go by faster.
     let (p, audio) = bank_project(
-        ClipContent::Midi {
-            notes: vec![Note::new(0, PPQ, 62, 100)],
-        },
+        ClipContent::midi(vec![Note::new(0, PPQ, 62, 100)]),
         Some("piano"),
     );
     let out = render(compile(&p, &audio, SR, 1), 0, SR as usize / 2, false);

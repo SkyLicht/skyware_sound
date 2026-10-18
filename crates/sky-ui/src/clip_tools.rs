@@ -157,9 +157,10 @@ pub fn trimmed(project: &Project, clip: &Clip, start: Ticks) -> Clip {
             *fade_in = (*fade_in).min(out.length);
             *fade_out = (*fade_out).min(out.length - *fade_in);
         }
-        ClipContent::Midi { notes } => {
+        ClipContent::Midi { notes, pedal } => {
             let by = clip.start - start;
             *notes = notes.iter().filter_map(|n| shifted(n, by)).collect();
+            *pedal = pedal.iter().filter_map(|p| p.shifted(by)).collect();
         }
         ClipContent::Pattern { .. } | ClipContent::Steps(_) => {}
     }
@@ -188,11 +189,19 @@ pub fn slipped(project: &Project, clip: &Clip, by: Ticks) -> Clip {
             let moved = frames_between(project, clip.start, clip.start + by, rate);
             *offset = (*offset - moved).clamp(0, (frames - 1).max(0));
         }
-        ClipContent::Midi { notes } => {
-            let first = notes.iter().map(|n| n.start).min().unwrap_or(0);
+        ClipContent::Midi { notes, pedal } => {
+            let first = notes
+                .iter()
+                .map(|n| n.start)
+                .chain(pedal.iter().map(|p| p.start))
+                .min()
+                .unwrap_or(0);
             let by = by.max(-first);
             for n in notes.iter_mut() {
                 n.start += by;
+            }
+            for p in pedal.iter_mut() {
+                p.start += by;
             }
         }
         ClipContent::Pattern { .. } | ClipContent::Steps(_) => {}
@@ -216,14 +225,17 @@ pub fn split(project: &Project, clip: &Clip, at: Ticks) -> Option<(Clip, Clip)> 
             *fade_in = (*fade_in).min(left.length);
             *fade_out = 0;
         }
-        ClipContent::Midi { notes } => notes.retain(|n| n.start < left.length),
+        ClipContent::Midi { notes, pedal } => {
+            notes.retain(|n| n.start < left.length);
+            *pedal = pedal.iter().filter_map(|p| p.cut(left.length)).collect();
+        }
         ClipContent::Pattern { .. } | ClipContent::Steps(_) => {}
     }
     let mut right = trimmed(project, clip, at);
     right.id = ClipId::new();
     match &mut right.content {
         ClipContent::Audio { fade_in, .. } => *fade_in = 0,
-        ClipContent::Midi { notes } => {
+        ClipContent::Midi { notes, .. } => {
             for n in notes.iter_mut() {
                 n.id = NoteId::new();
             }
@@ -283,7 +295,22 @@ pub fn changes(old: &Clip, new: &Clip, track: TrackId) -> Vec<Command> {
                 });
             }
         }
-        (ClipContent::Midi { notes: a }, ClipContent::Midi { notes: b }) => {
+        (
+            ClipContent::Midi {
+                notes: a,
+                pedal: pa,
+            },
+            ClipContent::Midi {
+                notes: b,
+                pedal: pb,
+            },
+        ) => {
+            if pa != pb {
+                out.push(Command::SetPedal {
+                    clip: id,
+                    pedal: pb.clone(),
+                });
+            }
             let gone: Vec<NoteId> = a
                 .iter()
                 .filter(|n| !b.iter().any(|m| m.id == n.id))
@@ -1015,7 +1042,7 @@ pub fn handles_ui(
 mod tests {
     use super::*;
     use sky_core::{AudioId, PPQ};
-    use sky_model::PoolEntry;
+    use sky_model::{Pedal, PoolEntry};
 
     const SR: u32 = 48_000;
 
@@ -1059,7 +1086,7 @@ mod tests {
             start: PPQ * 4,
             length: PPQ * 8,
             muted: false,
-            content: ClipContent::Midi { notes },
+            content: ClipContent::midi(notes),
         }
     }
 
@@ -1072,7 +1099,7 @@ mod tests {
 
     fn notes(c: &Clip) -> Vec<(Ticks, Ticks)> {
         match &c.content {
-            ClipContent::Midi { notes } => notes.iter().map(|n| (n.start, n.length)).collect(),
+            ClipContent::Midi { notes, .. } => notes.iter().map(|n| (n.start, n.length)).collect(),
             _ => unreachable!(),
         }
     }
@@ -1154,10 +1181,36 @@ mod tests {
         // The note across the cut goes on in the right half.
         assert_eq!(notes(&r), [(0, PPQ)]);
         let ids = |c: &Clip| match &c.content {
-            ClipContent::Midi { notes } => notes.iter().map(|n| n.id).collect::<Vec<_>>(),
+            ClipContent::Midi { notes, .. } => notes.iter().map(|n| n.id).collect::<Vec<_>>(),
             _ => unreachable!(),
         };
         assert!(ids(&r).iter().all(|id| !ids(&l).contains(id)));
+    }
+
+    #[test]
+    fn the_pedal_goes_with_the_notes() {
+        let (p, _) = project();
+        let mut m = midi(vec![Note::new(0, PPQ, 60, 100)]);
+        let pedal = |c: &Clip| match &c.content {
+            ClipContent::Midi { pedal, .. } => pedal.iter().map(|p| (p.start, p.length)).collect(),
+            _ => Vec::new(),
+        };
+        if let ClipContent::Midi { pedal, .. } = &mut m.content {
+            *pedal = vec![Pedal::new(0, PPQ * 3), Pedal::new(PPQ * 4, PPQ * 3)];
+        }
+        // Split at beat 2: the first stretch is cut there and goes on in the right half.
+        let (l, r) = split(&p, &m, PPQ * 6).unwrap();
+        assert_eq!(pedal(&l), [(0, PPQ * 2)]);
+        assert_eq!(pedal(&r), [(0, PPQ), (PPQ * 2, PPQ * 3)]);
+        // Slipping stops where a stretch would go before the start.
+        assert_eq!(pedal(&slipped(&p, &m, -PPQ)), pedal(&m));
+        assert_eq!(pedal(&slipped(&p, &m, PPQ))[1], (PPQ * 5, PPQ * 3));
+        // The commands carry it.
+        let c = changes(&m, &l, TrackId::new());
+        assert!(
+            c.iter()
+                .any(|c| matches!(c, Command::SetPedal { pedal, .. } if pedal.len() == 1))
+        );
     }
 
     #[test]
