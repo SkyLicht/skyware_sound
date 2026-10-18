@@ -219,6 +219,29 @@ fn the_journal_recovers_unsaved_changes() {
 }
 
 #[test]
+fn save_as_leaves_the_old_folder_as_it_was_saved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = tmp.path().join("First.skyproj");
+    let second = tmp.path().join("Second.skyproj");
+    let session = headless(demo_project());
+    session.save(Some(&first)).unwrap();
+    let saved = session.project();
+    session
+        .apply(Transaction::single(Command::SetTempo { bpm: 133.0 }))
+        .unwrap();
+    session.save(Some(&second)).unwrap();
+
+    // The change went with Save As; the old folder has nothing to recover.
+    let old = headless(empty_project("x"));
+    assert_eq!(old.open(&first).unwrap(), 0);
+    assert_eq!(*old.project(), *saved);
+    assert!(!old.view().dirty);
+    let new = headless(empty_project("y"));
+    assert_eq!(new.open(&second).unwrap(), 0);
+    assert_eq!(*new.project(), *session.project());
+}
+
+#[test]
 fn save_copy_leaves_the_session_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let session = headless(demo_project());

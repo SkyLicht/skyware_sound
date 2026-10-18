@@ -38,6 +38,8 @@ pub enum ModelError {
     Pattern(String),
     #[error("invalid note list: {0}")]
     NoteList(String),
+    #[error("invalid pedal list: {0}")]
+    PedalList(String),
     #[error("invalid steps: {0}")]
     Steps(String),
     #[error(transparent)]

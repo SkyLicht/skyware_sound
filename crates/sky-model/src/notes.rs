@@ -15,12 +15,15 @@
 //! * `v<1-127>` sets the velocity (default 100);
 //! * `@<beats>` places the entry at that many quarter notes from the clip
 //!   start; later entries continue from there.
+//!
+//! The pedal list says where the sustain pedal is down, as stretches of
+//! beats from the clip start: `0-3.75, 4-8`.
 
 use sky_core::music::{note_name, parse_duration, parse_note_name};
 use sky_core::{PPQ, Ticks};
 
 use crate::error::ModelError;
-use crate::project::Note;
+use crate::project::{Note, Pedal};
 
 fn parse_pitch(text: &str) -> Result<u8, String> {
     if let Ok(n) = text.parse::<u8>() {
@@ -140,6 +143,44 @@ pub fn format_note_list(notes: &[Note]) -> String {
     entries.join(", ")
 }
 
+/// Parses a pedal list into stretches, sorted and joined where they touch.
+pub fn parse_pedal_list(text: &str) -> Result<Vec<Pedal>, ModelError> {
+    let mut pedal = Vec::new();
+    for (i, raw) in text.split([',', '\n', ';']).enumerate() {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let err = |m: &str| ModelError::PedalList(format!("entry {} ({entry:?}): {m}", i + 1));
+        let (from, to) = entry
+            .split_once('-')
+            .ok_or_else(|| err("write a stretch as <from>-<to> in beats, such as 0-3.75"))?;
+        let beats = |t: &str| {
+            t.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|b| b.is_finite() && *b >= 0.0)
+                .map(|b| (b * PPQ as f64).round() as Ticks)
+                .ok_or_else(|| err("beats must be numbers >= 0"))
+        };
+        let (from, to) = (beats(from)?, beats(to)?);
+        if to <= from {
+            return Err(err("the pedal must come up after it goes down"));
+        }
+        pedal.push(Pedal::new(from, to - from));
+    }
+    Ok(Pedal::tidy(pedal))
+}
+
+/// Formats stretches as a pedal list that parses back to the same stretches.
+pub fn format_pedal_list(pedal: &[Pedal]) -> String {
+    pedal
+        .iter()
+        .map(|p| format!("{}-{}", format_beats(p.start), format_beats(p.end())))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +238,21 @@ mod tests {
         a.sort();
         b.sort();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn pedal_lists_round_trip_and_join() {
+        let pedal = parse_pedal_list("4-8, 0-3.75").unwrap();
+        assert_eq!(format_pedal_list(&pedal), "0-3.75, 4-8");
+        assert_eq!(pedal[0], Pedal::new(0, PPQ * 15 / 4));
+        // Stretches that touch are one press.
+        assert_eq!(
+            format_pedal_list(&parse_pedal_list("0-2, 2-4, 3-5").unwrap()),
+            "0-5"
+        );
+        assert!(parse_pedal_list("").unwrap().is_empty());
+        assert!(parse_pedal_list("2-1").is_err());
+        assert!(parse_pedal_list("2").is_err());
+        assert!(parse_pedal_list("a-3").is_err());
     }
 }

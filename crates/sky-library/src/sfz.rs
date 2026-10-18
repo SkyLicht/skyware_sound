@@ -323,6 +323,8 @@ const KNOWN: &[&str] = &[
     "end",
     "seq_length",
     "seq_position",
+    "lorand",
+    "hirand",
     "ampeg_release",
     "fil_type",
     "filtype",
@@ -337,13 +339,34 @@ const KNOWN: &[&str] = &[
     "global_label",
 ];
 
-/// Whether a region waits for a controller: `on_loccN`/`on_hiccN` start it
-/// from a controller move, and `loccN`/`hiccN` need the controller inside a
-/// range that leaves out 0.
+/// What the sustain pedal does to start a region that `on_locc64` and
+/// `on_hicc64` start: pressing it when the range is the top half, letting
+/// go when it is the bottom half.
+fn pedal_trigger(ops: &Opcodes) -> Option<Trigger> {
+    let lo = number(ops, "on_locc64");
+    let hi = number(ops, "on_hicc64");
+    if lo.is_none() && hi.is_none() {
+        return None;
+    }
+    let (lo, hi) = (lo.unwrap_or(0.0), hi.unwrap_or(127.0));
+    if lo >= 64.0 {
+        Some(Trigger::PedalDown)
+    } else if hi <= 63.0 {
+        Some(Trigger::PedalUp)
+    } else {
+        None
+    }
+}
+
+/// Whether a region waits for a controller this player does not follow:
+/// `on_loccN`/`on_hiccN` start it from a controller move (the sustain
+/// pedal's are played, see [`pedal_trigger`]), and `loccN`/`hiccN` need the
+/// controller inside a range that leaves out 0.
 fn needs_controller(ops: &Opcodes) -> bool {
+    let pedal = pedal_trigger(ops).is_some();
     ops.iter().any(|(k, v)| {
         if k.starts_with("on_locc") || k.starts_with("on_hicc") {
-            return true;
+            return !(pedal && (k == "on_locc64" || k == "on_hicc64"));
         }
         let bound = v.trim().parse::<f32>().unwrap_or(0.0);
         (k.starts_with("locc") && bound > 0.0) || (k.starts_with("hicc") && bound < 0.0)
@@ -372,10 +395,12 @@ fn region_zone(ops: &Opcodes, sample: u32) -> Zone {
         });
     z.pan = number(ops, "pan").unwrap_or(0.0).clamp(-100.0, 100.0) / 100.0;
     z.width = number(ops, "width").unwrap_or(100.0).clamp(-100.0, 100.0) / 100.0;
-    z.trigger = match ops.get("trigger").map(|t| t.trim().to_ascii_lowercase()) {
-        Some(t) if t.starts_with("release") => Trigger::Release,
-        _ => Trigger::Attack,
-    };
+    z.trigger = pedal_trigger(ops).unwrap_or_else(|| {
+        match ops.get("trigger").map(|t| t.trim().to_ascii_lowercase()) {
+            Some(t) if t.starts_with("release") => Trigger::Release,
+            _ => Trigger::Attack,
+        }
+    });
     z.rt_decay = number(ops, "rt_decay").unwrap_or(0.0).max(0.0);
     let mode = ops
         .get("loop_mode")
@@ -393,6 +418,8 @@ fn region_zone(ops: &Opcodes, sample: u32) -> Zone {
     z.end = frames(ops, &["end"]);
     z.seq_length = number(ops, "seq_length").map_or(1, |v| v.clamp(1.0, 100.0) as u8);
     z.seq_position = number(ops, "seq_position").map_or(1, |v| v.clamp(1.0, 100.0) as u8);
+    z.lorand = number(ops, "lorand").unwrap_or(0.0);
+    z.hirand = number(ops, "hirand").unwrap_or(1.0);
     z.release = number(ops, "ampeg_release").unwrap_or(0.001).max(0.001);
     let fil = ops
         .get("fil_type")
@@ -553,15 +580,46 @@ mod tests {
         let sfz = parse(
             "#define $DIR sub\n<control> default_path=../Samples/\n\
              <group> trigger=release rt_decay=3 set_hdcc64=0\n#include \"keys.sfz\"\n\
-             <group> on_locc64=64 on_hicc64=127\n<region> sample=pedal.wav\n\
+             <group> on_locc64=64 on_hicc64=127\n<region> sample=pedal.wav pitch_keycenter=21\n\
+             <group> on_locc64=0 on_hicc64=63\n<region> sample=up1.wav hirand=0.5\n\
+             <region> sample=up2.wav lorand=0.5\n\
+             <group> on_locc1=64 on_hicc1=127\n<region> sample=wheel.wav\n\
+             <group> on_locc64=30 on_hicc64=90\n<region> sample=half.wav\n\
              <group> locc64=64\n<region> sample=down.wav\n\
              <group>\n<region> sample=*sine\n",
             "inst/Programs",
             &mut |f| files.get(f).map(|s| s.to_string()).ok_or(f.to_string()),
         )
         .expect("parses");
-        assert_eq!(sfz.samples, ["inst/Samples/sub/c4.wav"]);
-        assert_eq!(sfz.zones.len(), 1);
+        // The pedal's sounds play on pedal moves; other controllers' do not.
+        assert_eq!(
+            sfz.samples,
+            [
+                "inst/Samples/sub/c4.wav",
+                "inst/Samples/pedal.wav",
+                "inst/Samples/up1.wav",
+                "inst/Samples/up2.wav",
+            ]
+        );
+        let triggers: Vec<_> = sfz.zones.iter().map(|z| z.trigger).collect();
+        assert_eq!(
+            triggers,
+            [
+                Trigger::Release,
+                Trigger::PedalDown,
+                Trigger::PedalUp,
+                Trigger::PedalUp
+            ]
+        );
+        assert_eq!(sfz.zones[1].root, 21);
+        assert_eq!(
+            (
+                sfz.zones[2].lorand,
+                sfz.zones[2].hirand,
+                sfz.zones[3].lorand
+            ),
+            (0.0, 0.5, 0.5)
+        );
         assert_eq!(
             (sfz.zones[0].trigger, sfz.zones[0].root),
             (Trigger::Release, 60)

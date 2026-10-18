@@ -7,6 +7,12 @@
 //! zones, so the audio thread never searches. [`SampleVoices`] plays it
 //! with 4-point cubic interpolation. When every voice is busy, the oldest
 //! fades out over a few milliseconds instead of jumping to a new sample.
+//!
+//! The sustain pedal holds keys after they come up, as a piano's dampers
+//! stay off the strings: their release waits for the pedal to come up. A
+//! key struck again while it still sounds fades the old note out quickly,
+//! and keys from [`SampleVoices::set_undamped_from`] up ring on without
+//! dampers at all.
 
 use std::sync::Arc;
 
@@ -21,6 +27,12 @@ pub const MAX_VOICES: usize = 96;
 const SLOTS: usize = MAX_VOICES + 32;
 /// How long a stolen voice takes to fade out.
 const STEAL_MS: f32 = 5.0;
+/// How long the note a key still sounds takes to fade when the key is
+/// struck again.
+const RESTRIKE_MS: f32 = 50.0;
+/// How long an undamped key rings after it comes up, at the zone's own
+/// release scale.
+const UNDAMPED_RING_S: f32 = 3.0;
 /// Zero frames kept before and after each sample, so interpolation can
 /// read past both ends without checks.
 const PAD_FRONT: usize = 1;
@@ -101,8 +113,13 @@ impl SampleData {
 pub enum Trigger {
     /// On note-on.
     Attack,
-    /// On note-off, with the velocity the note started with.
+    /// On note-off, with the velocity the note started with. While the
+    /// sustain pedal is down, on pedal up instead.
     Release,
+    /// When the sustain pedal goes down, at the zone's root key.
+    PedalDown,
+    /// When the sustain pedal comes up, at the zone's root key.
+    PedalUp,
 }
 
 /// How a zone's sample repeats.
@@ -164,6 +181,10 @@ pub struct Zone {
     /// `seq_length`th note of its key, the `seq_position`th (from 1).
     pub seq_length: u8,
     pub seq_position: u8,
+    /// Random choice: the zone plays when a number drawn for the note, from
+    /// 0 up to 1, falls in `lorand..hirand`.
+    pub lorand: f32,
+    pub hirand: f32,
     /// Release time in seconds after the key comes up.
     pub release: f32,
     pub filter: Option<ZoneFilter>,
@@ -194,6 +215,8 @@ impl Zone {
             end: None,
             seq_length: 1,
             seq_position: 1,
+            lorand: 0.0,
+            hirand: 1.0,
             release: 0.001,
             filter: None,
         }
@@ -201,6 +224,17 @@ impl Zone {
 
     fn covers(&self, key: u8, vel: u8) -> bool {
         (self.lokey..=self.hikey).contains(&key) && (self.lovel..=self.hivel).contains(&vel)
+    }
+
+    /// Whether the zone plays on note `n` of its key, drawn `rand`.
+    fn picked(&self, n: u32, rand: f32) -> bool {
+        let len = u32::from(self.seq_length);
+        (len <= 1 || n % len + 1 == u32::from(self.seq_position)) && self.drawn(rand)
+    }
+
+    /// Whether the zone plays on draw `rand`.
+    fn drawn(&self, rand: f32) -> bool {
+        (self.lorand..self.hirand).contains(&rand)
     }
 }
 
@@ -253,6 +287,8 @@ pub struct SampleLibrary {
     zones: Vec<Zone>,
     attack: ZoneTable,
     release: ZoneTable,
+    pedal_down: Vec<u32>,
+    pedal_up: Vec<u32>,
 }
 
 impl SampleLibrary {
@@ -281,15 +317,24 @@ impl SampleLibrary {
                     }
                 }
                 z.lovel = z.lovel.max(1);
+                z.lorand = z.lorand.clamp(0.0, 1.0);
+                z.hirand = z.hirand.clamp(0.0, 1.0);
                 z.seq_length = z.seq_length.max(1);
                 z.seq_position = z.seq_position.clamp(1, z.seq_length);
                 Some(z)
             })
             .collect();
+        let with = |trigger| {
+            (0..zones.len() as u32)
+                .filter(|&i| zones[i as usize].trigger == trigger)
+                .collect()
+        };
         Self {
             name: name.into(),
             attack: ZoneTable::build(&zones, Trigger::Attack),
             release: ZoneTable::build(&zones, Trigger::Release),
+            pedal_down: with(Trigger::PedalDown),
+            pedal_up: with(Trigger::PedalUp),
             samples,
             zones,
         }
@@ -304,11 +349,13 @@ impl SampleLibrary {
     }
 
     /// The zones `key` at velocity `vel` plays, as indices into
-    /// [`zones`](Self::zones).
+    /// [`zones`](Self::zones). Pedal zones play whatever the key.
     pub fn zones_at(&self, trigger: Trigger, key: u8, vel: u8) -> &[u32] {
         match trigger {
             Trigger::Attack => self.attack.get(key, vel),
             Trigger::Release => self.release.get(key, vel),
+            Trigger::PedalDown => &self.pedal_down,
+            Trigger::PedalUp => &self.pedal_up,
         }
     }
 
@@ -346,6 +393,11 @@ impl SampleLibrary {
     /// True when any zone plays on note-off.
     pub fn has_release_zones(&self) -> bool {
         self.zones.iter().any(|z| z.trigger == Trigger::Release)
+    }
+
+    /// True when the library has recordings of the sustain pedal.
+    pub fn has_pedal_noise(&self) -> bool {
+        !self.pedal_down.is_empty() || !self.pedal_up.is_empty()
     }
 }
 
@@ -444,6 +496,8 @@ struct Voice {
     env: Adsr,
     /// 1 while playing; above 0 and falling when stolen.
     fade: f32,
+    /// How much `fade` falls each frame once stolen.
+    fade_step: f32,
     stolen: bool,
     age: u64,
     filter: VoiceFilter,
@@ -463,6 +517,7 @@ impl Default for Voice {
             mix: [1.0, 0.0, 0.0, 1.0],
             env: Adsr::default(),
             fade: 1.0,
+            fade_step: 1.0,
             stolen: false,
             age: 0,
             filter: VoiceFilter::None,
@@ -495,6 +550,14 @@ pub struct SampleVoices {
     down: [bool; KEYS],
     held_at: [u64; KEYS],
     held_vel: [u8; KEYS],
+    /// The sustain pedal is down.
+    pedal: bool,
+    /// Keys that came up while the pedal was down and still sound.
+    sustained: [bool; KEYS],
+    /// The lowest key without a damper.
+    undamped_from: u8,
+    /// The state of the random draws for `lorand` and `hirand`.
+    rand: u32,
 }
 
 impl SampleVoices {
@@ -509,7 +572,28 @@ impl SampleVoices {
             down: [false; KEYS],
             held_at: [0; KEYS],
             held_vel: [0; KEYS],
+            pedal: false,
+            sustained: [false; KEYS],
+            undamped_from: 128,
+            rand: 0x9e37_79b9,
         }
+    }
+
+    /// Keys from `key` up have no dampers: they ring on after they come
+    /// up, as on a piano. 128 (the default) damps every key.
+    pub fn set_undamped_from(&mut self, key: u8) {
+        self.undamped_from = key.min(128);
+    }
+
+    /// A number from 0 up to (not including) 1.
+    fn draw(&mut self) -> f32 {
+        // xorshift32
+        let mut x = self.rand;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rand = x;
+        (x >> 8) as f32 / (1u32 << 24) as f32
     }
 
     pub fn library(&self) -> &Arc<SampleLibrary> {
@@ -601,10 +685,11 @@ impl SampleVoices {
             rate,
             end,
             looping,
-            released: zone.trigger == Trigger::Release || zone.loop_mode == LoopMode::OneShot,
+            released: zone.trigger != Trigger::Attack || zone.loop_mode == LoopMode::OneShot,
             mix,
             env: Adsr::default(),
             fade: 1.0,
+            fade_step: 1.0 / (STEAL_MS * 0.001 * self.sample_rate).max(1.0),
             stolen: false,
             age: self.clock,
             filter: VoiceFilter::new(zone.filter, self.sample_rate),
@@ -615,56 +700,139 @@ impl SampleVoices {
 
     /// Starts the zones of `key` at velocity `vel` (1-127). `shape.gain`
     /// is the note's gain, from the velocity as the instrument sees it.
+    /// The note the key still sounds, held by the pedal or ringing without
+    /// a damper, fades out.
     pub fn note_on(&mut self, key: u8, vel: u8, shape: &NoteShape) {
         let key = key.min(127);
         let vel = vel.clamp(1, 127);
         let k = usize::from(key);
+        let restrike = 1.0 / (RESTRIKE_MS * 0.001 * self.sample_rate).max(1.0);
+        for v in self
+            .voices
+            .iter_mut()
+            .filter(|v| v.active && !v.stolen && v.key == key)
+        {
+            if self.library.zones[v.zone as usize].trigger == Trigger::Attack {
+                v.stolen = true;
+                v.fade_step = restrike;
+            }
+        }
         let n = self.seq[k];
         self.seq[k] = n.wrapping_add(1);
         self.down[k] = true;
+        self.sustained[k] = false;
         self.held_at[k] = self.frames;
         self.held_vel[k] = vel;
+        let rand = self.draw();
         let library = Arc::clone(&self.library);
         for &z in library.zones_at(Trigger::Attack, key, vel) {
-            let zone = &library.zones[z as usize];
-            let len = u32::from(zone.seq_length);
-            if len > 1 && n % len + 1 != u32::from(zone.seq_position) {
-                continue;
+            if library.zones[z as usize].picked(n, rand) {
+                self.start(z, key, shape.gain, shape);
             }
-            self.start(z, key, shape.gain, shape);
         }
     }
 
     /// Releases the voices of `key` and starts its release zones, quieter
-    /// the longer the key was held.
+    /// the longer the key was held. While the pedal is down the key goes
+    /// on sounding until the pedal comes up; a key without a damper rings
+    /// on whatever the pedal does.
     pub fn note_off(&mut self, key: u8, shape: &NoteShape) {
         let key = key.min(127);
         let k = usize::from(key);
-        for v in self.voices.iter_mut().filter(|v| v.active && v.key == key) {
-            if !v.released {
-                v.released = true;
-                let mode = self.library.zones[v.zone as usize].loop_mode;
-                if mode == LoopMode::Sustain {
-                    v.looping = false;
-                } else {
-                    v.env.release();
-                }
-            }
-        }
         if !std::mem::take(&mut self.down[k]) {
             return;
         }
+        if self.pedal {
+            self.sustained[k] = true;
+            return;
+        }
+        self.damp(key, shape);
+    }
+
+    /// The key is up and the pedal too: its dampers fall on the strings.
+    fn damp(&mut self, key: u8, shape: &NoteShape) {
+        let k = usize::from(key);
+        let undamped = key >= self.undamped_from;
+        let ring_ms = UNDAMPED_RING_S * 1000.0 * shape.release;
+        for v in self
+            .voices
+            .iter_mut()
+            .filter(|v| v.active && !v.released && v.key == key)
+        {
+            v.released = true;
+            let zone = &self.library.zones[v.zone as usize];
+            if zone.loop_mode == LoopMode::Sustain {
+                v.looping = false;
+            } else if undamped {
+                // The string rings out; a looped sample needs an end.
+                if v.looping {
+                    v.env.set(0.0, 1.0, 1.0, ring_ms, self.sample_rate);
+                    v.env.release();
+                }
+            } else {
+                v.env.release();
+            }
+        }
         let seconds = (self.frames - self.held_at[k]) as f32 / self.sample_rate;
+        let rand = self.draw();
         let library = Arc::clone(&self.library);
         for &z in library.zones_at(Trigger::Release, key, self.held_vel[k]) {
-            let decay = db_to_gain(-library.zones[z as usize].rt_decay * seconds);
-            self.start(z, key, shape.gain * decay, shape);
+            let zone = &library.zones[z as usize];
+            if zone.drawn(rand) {
+                let decay = db_to_gain(-zone.rt_decay * seconds);
+                self.start(z, key, shape.gain * decay, shape);
+            }
         }
     }
 
-    /// Releases every held key, without release zones.
+    /// Moves the sustain pedal. Up, the keys it held stop the way they
+    /// would have when they came up. `noise` shapes the pedal's own
+    /// recordings, when the library has them; `key_shape` gives the shape
+    /// of each key it stops.
+    pub fn set_pedal(
+        &mut self,
+        down: bool,
+        noise: &NoteShape,
+        key_shape: impl Fn(u8) -> NoteShape,
+    ) {
+        if down == self.pedal {
+            return;
+        }
+        self.pedal = down;
+        if !down {
+            for key in 0..KEYS as u8 {
+                if std::mem::take(&mut self.sustained[usize::from(key)]) {
+                    self.damp(key, &key_shape(key));
+                }
+            }
+        }
+        let trigger = if down {
+            Trigger::PedalDown
+        } else {
+            Trigger::PedalUp
+        };
+        let rand = self.draw();
+        let library = Arc::clone(&self.library);
+        for &z in library.zones_at(trigger, 0, 1) {
+            let zone = &library.zones[z as usize];
+            if zone.drawn(rand) {
+                let root = zone.root;
+                self.start(z, root, noise.gain, noise);
+            }
+        }
+    }
+
+    /// Whether the sustain pedal is down.
+    pub fn pedal(&self) -> bool {
+        self.pedal
+    }
+
+    /// Releases every held key, without release zones, and lifts the
+    /// pedal without a sound.
     pub fn release_all(&mut self) {
         self.down = [false; KEYS];
+        self.sustained = [false; KEYS];
+        self.pedal = false;
         for v in self.voices.iter_mut().filter(|v| v.active) {
             v.released = true;
             v.looping = false;
@@ -675,6 +843,8 @@ impl SampleVoices {
     /// Silences everything at once.
     pub fn reset(&mut self) {
         self.down = [false; KEYS];
+        self.sustained = [false; KEYS];
+        self.pedal = false;
         for v in &mut self.voices {
             v.active = false;
             v.env.reset();
@@ -684,7 +854,6 @@ impl SampleVoices {
     /// Adds the voices into `left` and `right`.
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         let n = left.len().min(right.len());
-        let fade_step = 1.0 / (STEAL_MS * 0.001 * self.sample_rate).max(1.0);
         let library = &*self.library;
         for v in self.voices.iter_mut().filter(|v| v.active) {
             let zone = &library.zones[v.zone as usize];
@@ -723,7 +892,7 @@ impl SampleVoices {
                 let (sl, sr) = v.filter.tick(sl, sr);
                 let mut g = v.env.tick();
                 if v.stolen {
-                    v.fade -= fade_step;
+                    v.fade -= v.fade_step;
                     if v.fade <= 0.0 {
                         v.active = false;
                         break;
@@ -764,6 +933,9 @@ impl SampleVoices {
         self.down = previous.down;
         self.held_at = previous.held_at;
         self.held_vel = previous.held_vel;
+        self.pedal = previous.pedal;
+        self.sustained = previous.sustained;
+        self.rand = previous.rand;
         true
     }
 }
@@ -947,15 +1119,20 @@ pub(crate) mod tests {
 
     #[test]
     fn stolen_voices_fade_instead_of_clicking() {
-        let lib = library();
+        // One zone across the keyboard, so every voice is a key of its own.
+        let lib = Arc::new(SampleLibrary::new(
+            "all",
+            vec![sine(48_000, 440.0, 1)],
+            vec![Zone::new(0, 60)],
+        ));
         let mut v = SampleVoices::new(48_000.0, lib);
         for i in 0..MAX_VOICES {
-            v.note_on(48 + (i % 24) as u8, 100, &NoteShape::default());
+            v.note_on(16 + i as u8, 100, &NoteShape::default());
         }
         let _ = render(&mut v, 256);
         assert_eq!(v.active_voices(), MAX_VOICES);
         let (before, _) = render(&mut v, 64);
-        v.note_on(60, 100, &NoteShape::default());
+        v.note_on(15, 100, &NoteShape::default());
         assert_eq!(v.active_voices(), MAX_VOICES);
         let (after, _) = render(&mut v, 1_024);
         // The output moves on smoothly from where it was.
@@ -1015,5 +1192,178 @@ pub(crate) mod tests {
         assert!((l - 0.25).abs() < 1e-3 && (r - 0.25).abs() < 1e-3);
         let (l, r) = play(-1.0);
         assert!(l.abs() < 1e-3 && (r - 0.5).abs() < 1e-3);
+    }
+
+    /// Attack voices of `key` held by the key or the pedal, not counting
+    /// fading or released ones.
+    fn sounding(v: &SampleVoices, key: u8) -> usize {
+        v.voices
+            .iter()
+            .filter(|x| x.active && !x.stolen && !x.released && x.key == key)
+            .filter(|x| v.library.zones[x.zone as usize].trigger == Trigger::Attack)
+            .count()
+    }
+
+    #[test]
+    fn the_pedal_holds_keys_until_it_comes_up() {
+        let lib = library();
+        let quick = NoteShape {
+            release: 0.001,
+            ..NoteShape::default()
+        };
+        let mut v = SampleVoices::new(48_000.0, lib);
+        v.set_pedal(true, &NoteShape::default(), |_| quick);
+        v.note_on(60, 100, &NoteShape::default());
+        v.note_on(64, 100, &NoteShape::default());
+        let _ = render(&mut v, 480);
+        v.note_off(60, &quick);
+        v.note_off(64, &quick);
+        // The keys are up but still sound, and their release waits.
+        let held = peak(&render(&mut v, 4_800).0);
+        assert!(held > 0.1, "{held}");
+        assert_eq!((sounding(&v, 60), sounding(&v, 64)), (1, 1));
+        assert_eq!(v.active_voices(), 2, "no release zone yet");
+        // Pedal up: they stop and the release zones play.
+        v.set_pedal(false, &NoteShape::default(), |_| quick);
+        assert_eq!((sounding(&v, 60), sounding(&v, 64)), (0, 0));
+        let _ = render(&mut v, 480);
+        assert_eq!(v.active_voices(), 2, "the two release zones");
+        // A key still held when the pedal comes up goes on.
+        v.set_pedal(true, &NoteShape::default(), |_| quick);
+        v.note_on(62, 100, &NoteShape::default());
+        v.set_pedal(false, &NoteShape::default(), |_| quick);
+        let _ = render(&mut v, 480);
+        assert_eq!(sounding(&v, 62), 1);
+        v.note_off(62, &quick);
+        let _ = render(&mut v, 480);
+        assert_eq!(sounding(&v, 62), 0);
+        // Stopping lifts the pedal.
+        v.set_pedal(true, &NoteShape::default(), |_| quick);
+        v.release_all();
+        assert!(!v.pedal());
+    }
+
+    #[test]
+    fn a_key_struck_again_fades_its_old_note() {
+        let lib = library();
+        let mut v = SampleVoices::new(48_000.0, lib);
+        v.set_pedal(true, &NoteShape::default(), |_| NoteShape::default());
+        for _ in 0..3 {
+            v.note_on(60, 100, &NoteShape::default());
+            let _ = render(&mut v, 240);
+            v.note_off(60, &NoteShape::default());
+        }
+        // The old notes fade over about 50 ms instead of piling up.
+        assert_eq!(sounding(&v, 60), 1);
+        let fading = v.voices.iter().filter(|x| x.active && x.stolen).count();
+        assert_eq!(fading, 2);
+        let _ = render(&mut v, 2_400 + 64);
+        assert!(v.voices.iter().all(|x| !(x.active && x.stolen)));
+        // No click: the output moves on smoothly as the old note fades.
+        let mut w = SampleVoices::new(48_000.0, library());
+        w.note_on(60, 100, &NoteShape::default());
+        let (before, _) = render(&mut w, 2_400);
+        w.note_on(60, 100, &NoteShape::default());
+        let (after, _) = render(&mut w, 256);
+        let jump = (after[0] - before[2_399]).abs();
+        assert!(jump < 0.1, "jump {jump}");
+    }
+
+    #[test]
+    fn keys_without_dampers_ring_on() {
+        let quick = NoteShape {
+            release: 0.001,
+            ..NoteShape::default()
+        };
+        let tail = |key: u8| {
+            let mut v = SampleVoices::new(48_000.0, library());
+            v.set_undamped_from(70);
+            v.note_on(key, 100, &NoteShape::default());
+            let _ = render(&mut v, 480);
+            v.note_off(key, &quick);
+            let _ = render(&mut v, 4_800);
+            sounding_any(&v, key)
+        };
+        assert!(!tail(69), "a damped key stops");
+        assert!(tail(70), "an undamped key rings");
+    }
+
+    /// Whether any attack voice of `key` still sounds.
+    fn sounding_any(v: &SampleVoices, key: u8) -> bool {
+        v.voices.iter().any(|x| {
+            x.active && x.key == key && v.library.zones[x.zone as usize].trigger == Trigger::Attack
+        })
+    }
+
+    #[test]
+    fn pedal_recordings_play_and_take_turns_by_chance() {
+        let down_a = Zone {
+            trigger: Trigger::PedalDown,
+            hirand: 0.5,
+            ..Zone::new(0, 60)
+        };
+        let down_b = Zone {
+            sample: 1,
+            lorand: 0.5,
+            hirand: 1.0,
+            ..down_a.clone()
+        };
+        let up = Zone {
+            trigger: Trigger::PedalUp,
+            sample: 2,
+            ..Zone::new(2, 60)
+        };
+        let lib = Arc::new(SampleLibrary::new(
+            "pedal",
+            vec![
+                sine(4_800, 100.0, 1),
+                sine(4_800, 200.0, 1),
+                sine(4_800, 300.0, 1),
+            ],
+            vec![down_a, down_b, up],
+        ));
+        assert!(lib.has_pedal_noise());
+        assert!(lib.zones_at(Trigger::Attack, 60, 100).is_empty());
+        let mut v = SampleVoices::new(48_000.0, lib);
+        let mut downs = [0; 2];
+        for _ in 0..40 {
+            v.set_pedal(true, &NoteShape::default(), |_| NoteShape::default());
+            let zone = v.newest_zone().unwrap();
+            downs[zone as usize] += 1;
+            v.set_pedal(false, &NoteShape::default(), |_| NoteShape::default());
+            assert_eq!(v.newest_zone(), Some(2));
+            // Moving it the way it already is does nothing.
+            let before = v.clock;
+            v.set_pedal(false, &NoteShape::default(), |_| NoteShape::default());
+            assert_eq!(v.clock, before);
+        }
+        assert!(downs[0] > 5 && downs[1] > 5, "{downs:?}");
+        // The noise plays at the gain given and ignores the keys.
+        let _ = render(&mut v, 4_800);
+        let mut v2 = SampleVoices::new(48_000.0, v.library().clone());
+        let quiet = NoteShape {
+            gain: 0.1,
+            ..NoteShape::default()
+        };
+        v2.set_pedal(true, &quiet, |_| NoteShape::default());
+        v2.note_off(60, &NoteShape::default());
+        let level = peak(&render(&mut v2, 2_400).0);
+        // The sine peaks at 0.5.
+        assert!((level - 0.05).abs() < 0.005, "{level}");
+    }
+
+    #[test]
+    fn the_pedal_carries_over_with_the_voices() {
+        let lib = library();
+        let mut a = SampleVoices::new(48_000.0, lib.clone());
+        a.set_pedal(true, &NoteShape::default(), |_| NoteShape::default());
+        a.note_on(60, 100, &NoteShape::default());
+        a.note_off(60, &NoteShape::default());
+        let mut b = SampleVoices::new(48_000.0, lib);
+        assert!(b.adopt(&mut a));
+        assert!(b.pedal());
+        assert_eq!(sounding(&b, 60), 1);
+        b.set_pedal(false, &NoteShape::default(), |_| NoteShape::default());
+        assert_eq!(sounding(&b, 60), 0);
     }
 }

@@ -230,6 +230,11 @@ pub enum Command {
         clip: ClipId,
         notes: Vec<Note>,
     },
+    /// Replaces where a MIDI clip's sustain pedal is down.
+    SetPedal {
+        clip: ClipId,
+        pedal: Vec<Pedal>,
+    },
     SetPattern {
         clip: ClipId,
         source: String,
@@ -361,7 +366,7 @@ fn validate_clip(project: &Project, track: &Track, clip: &Clip) -> Result<(), Mo
             }
             project.pool_entry(*source)?;
         }
-        ClipContent::Midi { notes } => {
+        ClipContent::Midi { notes, pedal } => {
             if track.kind != TrackKind::Instrument {
                 return Err(ModelError::InvalidValue(
                     "MIDI clips go on instrument tracks".into(),
@@ -369,6 +374,9 @@ fn validate_clip(project: &Project, track: &Track, clip: &Clip) -> Result<(), Mo
             }
             for n in notes {
                 n.validate()?;
+            }
+            for p in pedal {
+                p.validate()?;
             }
         }
         ClipContent::Pattern {
@@ -604,7 +612,20 @@ fn midi_notes_mut(project: &mut Project, clip: ClipId) -> Result<&mut Vec<Note>,
     let c = project.clip_mut(clip)?;
     let actual = c.kind_name();
     match &mut c.content {
-        ClipContent::Midi { notes } => Ok(notes),
+        ClipContent::Midi { notes, .. } => Ok(notes),
+        _ => Err(ModelError::WrongClipType {
+            id: clip,
+            expected: "midi",
+            actual,
+        }),
+    }
+}
+
+fn midi_pedal_mut(project: &mut Project, clip: ClipId) -> Result<&mut Vec<Pedal>, ModelError> {
+    let c = project.clip_mut(clip)?;
+    let actual = c.kind_name();
+    match &mut c.content {
+        ClipContent::Midi { pedal, .. } => Ok(pedal),
         _ => Err(ModelError::WrongClipType {
             id: clip,
             expected: "midi",
@@ -797,6 +818,7 @@ impl Command {
             | C::AddNotes { clip: id, .. }
             | C::RemoveNotes { clip: id, .. }
             | C::UpdateNotes { clip: id, .. }
+            | C::SetPedal { clip: id, .. }
             | C::SetPattern { clip: id, .. }
             | C::SetSteps { clip: id, .. } => add(Target::Clip(*id)),
             C::AddPoolAudio { entry, .. } => add(Target::Audio(entry.id)),
@@ -845,6 +867,7 @@ impl Command {
             Command::AddNotes { .. } => "Add notes",
             Command::RemoveNotes { .. } => "Delete notes",
             Command::UpdateNotes { .. } => "Edit notes",
+            Command::SetPedal { .. } => "Edit pedal",
             Command::SetPattern { .. } => "Edit pattern",
             Command::SetSteps { .. } => "Edit steps",
             Command::AddPoolAudio { .. } => "Import audio",
@@ -1397,6 +1420,14 @@ impl Command {
                 }
                 sort_notes(existing);
                 Command::UpdateNotes { clip, notes: old }
+            }
+            Command::SetPedal { clip, pedal } => {
+                for p in &pedal {
+                    p.validate()?;
+                }
+                let existing = midi_pedal_mut(project, clip)?;
+                let old = std::mem::replace(existing, Pedal::tidy(pedal));
+                Command::SetPedal { clip, pedal: old }
             }
             Command::SetPattern {
                 clip,

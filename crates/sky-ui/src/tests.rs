@@ -452,9 +452,7 @@ fn empty_and_odd_projects_do_not_panic() {
         start: 0,
         length: 0,
         muted: false,
-        content: ClipContent::Midi {
-            notes: vec![Note::new(0, 0, 60, 100)],
-        },
+        content: ClipContent::midi(vec![Note::new(0, 0, 60, 100)]),
     });
     synth.clips.push(Clip {
         id: ClipId::new(),
@@ -2383,6 +2381,7 @@ fn every_symbol_in_the_ui_has_a_glyph() {
         include_str!("palette.rs"),
         include_str!("params.rs"),
         include_str!("pattern_editor.rs"),
+        include_str!("pedal_lane.rs"),
         include_str!("piano_roll.rs"),
         include_str!("ruler_lanes.rs"),
         include_str!("sounds.rs"),
@@ -2581,7 +2580,7 @@ fn piano_keys_and_placed_notes_are_heard() {
     // A note added on the grid sounds once, and only the note is a change.
     let grid = h.rect_of(Id::new(("piano_bg", clip)));
     let notes = |h: &Harness| match &h.clip(clip).content {
-        ClipContent::Midi { notes } => notes.len(),
+        ClipContent::Midi { notes, .. } => notes.len(),
         _ => 0,
     };
     let before = notes(&h);
@@ -3673,7 +3672,7 @@ fn clips_are_duplicated_copied_cut_and_pasted_at_the_playhead() {
     let dup = bass.clips.iter().find(|c| c.id != clip).expect("a copy");
     assert_eq!(dup.start, bar * 4);
     assert_eq!(h.app.sel.clips, [dup.id]);
-    let (ClipContent::Midi { notes: a }, ClipContent::Midi { notes: b }) =
+    let (ClipContent::Midi { notes: a, .. }, ClipContent::Midi { notes: b, .. }) =
         (&h.clip(clip).content, &dup.content)
     else {
         panic!("MIDI clips");
@@ -3796,7 +3795,7 @@ fn notes_are_selected_nudged_transposed_and_copied_in_the_piano_roll() {
     h.app.piano.top_pitch = 72.0;
     h.frames(2);
     let notes = |h: &Harness| match &h.clip(clip).content {
-        ClipContent::Midi { notes } => notes.clone(),
+        ClipContent::Midi { notes, .. } => notes.clone(),
         _ => panic!("a MIDI clip"),
     };
     let first: Vec<Note> = notes(&h).into_iter().filter(|n| n.start == 0).collect();
@@ -3899,10 +3898,10 @@ fn notes_are_selected_nudged_transposed_and_copied_in_the_piano_roll() {
     h.frames(2);
     let before = bass.clips[0].clone();
     h.key(Key::V, COMMAND);
-    let ClipContent::Midi { notes: after } = h.clip(before.id).content else {
+    let ClipContent::Midi { notes: after, .. } = h.clip(before.id).content else {
         panic!("MIDI");
     };
-    let ClipContent::Midi { notes: was } = &before.content else {
+    let ClipContent::Midi { notes: was, .. } = &before.content else {
         panic!("MIDI");
     };
     assert_eq!(after.len(), was.len() + 3);
@@ -4318,7 +4317,7 @@ fn audio_of(clip: &Clip) -> (i64, f32, i64, i64) {
 
 fn notes_of(clip: &Clip) -> Vec<Note> {
     match &clip.content {
-        ClipContent::Midi { notes } => notes.clone(),
+        ClipContent::Midi { notes, .. } => notes.clone(),
         _ => panic!("a MIDI clip"),
     }
 }
@@ -5014,6 +5013,71 @@ fn velocities_are_drawn_in_the_lane_under_the_piano_roll() {
             .read_response(Id::new(("velocity_lane", clip)))
             .is_none()
     );
+}
+
+fn pedal_of(clip: &Clip) -> Vec<(i64, i64)> {
+    match &clip.content {
+        ClipContent::Midi { pedal, .. } => pedal.iter().map(|p| (p.start, p.end())).collect(),
+        _ => panic!("a MIDI clip"),
+    }
+}
+
+#[test]
+fn the_pedal_is_drawn_in_its_lane_for_pianos_only() {
+    let mut project = demo_project();
+    let pad = project
+        .tracks
+        .iter_mut()
+        .find(|t| t.name == "Pad")
+        .expect("the demo's pad");
+    pad.instrument = Some(sky_model::InstrumentSlot::new(InstrumentType::Piano));
+    let mut h = Harness::with_project(project);
+    let pad = h.track_named("Pad");
+    let clip = pad.clips[0].id;
+    h.app.sel.select_clip(pad.id, clip);
+    h.app.workspace.show(Tab::Editor);
+    h.frames(3);
+    let lane = h.rect_of(Id::new(("pedal_lane", clip)));
+    let velocity = h.rect_of(Id::new(("velocity_lane", clip)));
+    assert!(
+        lane.top() >= velocity.bottom() - 1.0,
+        "under the velocity lane"
+    );
+    let bar = h.project().ticks_per_bar();
+    let x = |h: &Harness, tick: i64| {
+        lane.left()
+            + ((tick as f64 - h.app.piano.scroll) * f64::from(h.app.piano.px_per_tick)) as f32
+    };
+    let y = lane.center().y;
+    let history = h.history_len();
+
+    // Dragging across the lane holds the pedal down there, on the grid.
+    h.drag(pos2(x(&h, 0) + 2.0, y), pos2(x(&h, bar) - 2.0, y));
+    assert_eq!(pedal_of(&h.clip(clip)), [(0, bar)]);
+    assert_eq!(h.history_len(), history + 1);
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Edit pedal"));
+    // Its end drags later.
+    h.frames(40);
+    h.drag(pos2(x(&h, bar), y), pos2(x(&h, bar * 2), y));
+    assert_eq!(pedal_of(&h.clip(clip)), [(0, bar * 2)]);
+    // A right-click takes it away; undo brings it back.
+    h.frames(40);
+    h.right_click(pos2(x(&h, bar / 2), y));
+    assert!(pedal_of(&h.clip(clip)).is_empty());
+    assert_eq!(h.app.view.undo_label.as_deref(), Some("Delete pedal"));
+    h.key(Key::Z, COMMAND);
+    assert_eq!(pedal_of(&h.clip(clip)), [(0, bar * 2)]);
+
+    // The toolbar hides the lane.
+    h.accessible();
+    h.click_in(Tab::Editor, "Pedal lane");
+    h.frames(2);
+    assert!(!h.app.workspace.piano.pedal_lane);
+    assert!(h.ctx.read_response(Id::new(("pedal_lane", clip))).is_none());
+
+    // A synth has no pedal, so no lane.
+    let (h, clip) = pad_in_piano_roll();
+    assert!(h.ctx.read_response(Id::new(("pedal_lane", clip))).is_none());
 }
 
 #[test]

@@ -103,7 +103,7 @@ pub fn clip_editor(app: &mut App, ui: &mut Ui) {
     };
     clip_header(app, ui, project, track, clip);
     match &clip.content {
-        ClipContent::Midi { notes } => {
+        ClipContent::Midi { notes, .. } => {
             crate::piano_roll::show(app, ui, project, track, clip, notes)
         }
         ClipContent::Pattern {
@@ -1071,11 +1071,30 @@ pub fn format_number(value: f64) -> String {
 }
 
 /// What a control sets, for its row: a label and a tooltip.
+/// The control that moves the sustain pedal, on instruments with one.
+const PEDAL: &str = "sustain";
+
+fn takes_pedal(track: &Track) -> bool {
+    track
+        .instrument
+        .as_ref()
+        .is_some_and(|i| i.kind.takes_pedal())
+}
+
 fn control_label(track: &Track, name: &str) -> (String, String, bool) {
     if name == VELOCITY {
         return (
             "Velocity".into(),
             "How hard each note plays, 1 to 127; 0 skips the note".into(),
+            true,
+        );
+    }
+    if name == PEDAL && takes_pedal(track) {
+        return (
+            "Sustain pedal".into(),
+            "1 puts the sustain pedal down and 0 lifts it, until the next step that says \
+             otherwise: <1 0> holds every other cycle"
+                .into(),
             true,
         );
     }
@@ -1195,6 +1214,9 @@ fn groove_ui(
     if !controls.contains_key(VELOCITY) {
         options.push((VELOCITY.into(), "Velocity".into()));
     }
+    if takes_pedal(track) && !controls.contains_key(PEDAL) {
+        options.push((PEDAL.into(), "Sustain pedal".into()));
+    }
     if let Some(slot) = &track.instrument {
         for spec in slot.kind.params() {
             if !controls.contains_key(spec.name) {
@@ -1220,6 +1242,7 @@ fn groove_ui(
                 // Start from the track's own value, so nothing changes yet.
                 let start = match track.instrument.as_ref().and_then(|i| i.param(&name)) {
                     Some(v) => format_number(v as f64),
+                    None if name == PEDAL => "0".into(),
                     None => "100".into(),
                 };
                 commits.push((name, Some(start)));

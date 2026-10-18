@@ -26,7 +26,8 @@ fn processors_do_not_allocate() {
             })
             .collect(),
     });
-    // A looped layer, a one-shot layer and a release zone on every key.
+    // A looped layer, a one-shot layer and a release zone on every key,
+    // and the pedal's own sounds.
     let piano = Arc::new(SampleLibrary::new(
         "test",
         vec![
@@ -47,6 +48,15 @@ fn processors_do_not_allocate() {
             },
             Zone {
                 trigger: Trigger::Release,
+                ..Zone::new(1, 60)
+            },
+            Zone {
+                trigger: Trigger::PedalDown,
+                hirand: 0.5,
+                ..Zone::new(1, 60)
+            },
+            Zone {
+                trigger: Trigger::PedalUp,
                 ..Zone::new(1, 60)
             },
         ],
@@ -74,6 +84,7 @@ fn processors_do_not_allocate() {
                     for spec in params.iter() {
                         inst.set_param(spec.name, spec.max);
                     }
+                    inst.controller(sky_dsp::SUSTAIN_PEDAL, 127);
                     for note in [36, 38, 42, 60, 64, 67] {
                         inst.note_on(note, 100);
                     }
@@ -85,6 +96,10 @@ fn processors_do_not_allocate() {
                     for note in [36, 60] {
                         inst.note_off(note);
                     }
+                    // The pedal lets go of the keys that came up.
+                    inst.controller(sky_dsp::SUSTAIN_PEDAL, 0);
+                    inst.note_on(60, 90);
+                    inst.note_on(60, 70);
                 }
                 if block % 10 == 5 {
                     inst.all_notes_off();

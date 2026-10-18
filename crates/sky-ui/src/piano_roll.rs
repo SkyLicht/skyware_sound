@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The piano roll for MIDI clips, with its velocity lane, the song's scale
-//! marked on the rows, and the notes of other clips shown faintly behind.
+//! The piano roll for MIDI clips, with its velocity lane, a sustain pedal
+//! lane for instruments that have a pedal, the song's scale marked on the
+//! rows, and the notes of other clips shown faintly behind.
 
 use egui::{
     Align2, Color32, ComboBox, Context, CornerRadius, CursorIcon, DragValue, Id, Key, Label,
@@ -10,11 +11,13 @@ use serde::{Deserialize, Serialize};
 use sky_core::music::{note_name, pitch_class_name};
 use sky_core::{NoteId, PPQ, Ticks};
 use sky_model::{
-    Clip, ClipContent, Command, Note, Project, Scale, ScaleMode, Track, TrackKind, Transaction,
+    Clip, ClipContent, Command, Note, Pedal, Project, Scale, ScaleMode, Track, TrackKind,
+    Transaction,
 };
 
 use crate::app::{Action, App, Focus};
 use crate::arrange::{snap_floor, snap_round};
+use crate::pedal_lane::{self, PEDAL_H, PedalDrag};
 use crate::theme;
 use crate::velocity_lane::{self, VEL_H, VelDrag};
 use crate::widgets::Marquee;
@@ -103,6 +106,8 @@ pub struct PianoPrefs {
     /// The height of a pitch row.
     pub row_h: f32,
     pub velocity_lane: bool,
+    /// The sustain pedal lane, on tracks whose instrument has a pedal.
+    pub pedal_lane: bool,
     pub ghosts: Ghosts,
 }
 
@@ -111,6 +116,7 @@ impl Default for PianoPrefs {
         Self {
             row_h: 13.0,
             velocity_lane: true,
+            pedal_lane: true,
             ghosts: Ghosts::default(),
         }
     }
@@ -151,6 +157,8 @@ pub struct PianoState {
     pub marquee: Option<Marquee<NoteId>>,
     /// Velocities being drawn in the velocity lane.
     pub vel_drag: Option<VelDrag>,
+    /// Pedal stretches being drawn or changed in the pedal lane.
+    pub pedal_drag: Option<PedalDrag>,
 }
 
 impl PianoState {
@@ -161,7 +169,10 @@ impl PianoState {
 
     /// Whether a drag is under way in the piano roll.
     pub fn gesture(&self) -> bool {
-        self.drag.is_some() || self.marquee.is_some() || self.vel_drag.is_some()
+        self.drag.is_some()
+            || self.marquee.is_some()
+            || self.vel_drag.is_some()
+            || self.pedal_drag.is_some()
     }
 }
 
@@ -186,6 +197,7 @@ impl Default for PianoState {
             drag: None,
             marquee: None,
             vel_drag: None,
+            pedal_drag: None,
         }
     }
 }
@@ -205,8 +217,12 @@ impl View {
     pub fn x_of(&self, tick: f64) -> f32 {
         self.left + ((tick - self.scroll) * self.ppt as f64) as f32
     }
-    fn tick_at(&self, x: f32) -> f64 {
+    /// The tick from the clip's start at an x.
+    pub fn tick_at(&self, x: f32) -> f64 {
         self.scroll + ((x - self.left) / self.ppt) as f64
+    }
+    pub fn px_per_tick(&self) -> f32 {
+        self.ppt
     }
     fn y_of(&self, pitch: u8) -> f32 {
         self.grid.top() + (self.top_pitch - pitch as f32 - 1.0) * self.row_h
@@ -249,6 +265,17 @@ pub fn show(
     clip: &Clip,
     notes: &[Note],
 ) {
+    let pedal: &[Pedal] = match &clip.content {
+        ClipContent::Midi { pedal, .. } => pedal,
+        _ => &[],
+    };
+    // The lane shows on instruments with a pedal, and wherever there are
+    // stretches to see.
+    let pedal_possible = track
+        .instrument
+        .as_ref()
+        .is_some_and(|s| s.kind.takes_pedal())
+        || !pedal.is_empty();
     // Toolbar.
     let mut refit = app.piano.clip != Some(clip.id);
     let mut taller = 0.0;
@@ -325,6 +352,10 @@ pub fn show(
                 "A stem for each note under the grid: drag across them to set velocities, \
                  Shift-drag to draw a ramp",
             );
+        if pedal_possible {
+            ui.checkbox(&mut app.workspace.piano.pedal_lane, "Pedal lane")
+                .on_hover_text("Where the sustain pedal is down, under the velocity lane");
+        }
         ui.separator();
         ui.label(RichText::new("Rows").color(theme::TEXT_WEAK));
         if ui
@@ -375,15 +406,23 @@ pub fn show(
     if full.width() < KEYS_W + 40.0 || full.height() < RULER_H + 30.0 {
         return;
     }
-    // The velocity lane gives way when there is no room for it.
+    // The lanes give way when there is no room for them.
     let lane_h = if app.workspace.piano.velocity_lane && full.height() >= RULER_H + 60.0 + VEL_H {
         VEL_H
     } else {
         0.0
     };
+    let pedal_h = if pedal_possible
+        && app.workspace.piano.pedal_lane
+        && full.height() >= RULER_H + 60.0 + lane_h + PEDAL_H
+    {
+        PEDAL_H
+    } else {
+        0.0
+    };
     let grid_rect = Rect::from_min_max(
         pos2(full.left() + KEYS_W, full.top() + RULER_H),
-        pos2(full.right(), full.bottom() - lane_h),
+        pos2(full.right(), full.bottom() - lane_h - pedal_h),
     );
     if taller != 0.0 {
         let row_h = app.workspace.piano.row_h + taller;
@@ -403,6 +442,7 @@ pub fn show(
         app.piano.drag = None;
         app.piano.marquee = None;
         app.piano.vel_drag = None;
+        app.piano.pedal_drag = None;
     }
     input(app, ui, full, grid_rect);
 
@@ -615,14 +655,27 @@ pub fn show(
         theme::HEADER,
     );
     if lane_h > 0.0 {
-        let lane = Rect::from_min_max(pos2(grid_rect.left(), grid_rect.bottom()), full.max);
+        let lane = Rect::from_min_max(
+            pos2(grid_rect.left(), grid_rect.bottom()),
+            pos2(full.right(), grid_rect.bottom() + lane_h),
+        );
         let corner = Rect::from_min_max(
-            pos2(full.left(), grid_rect.bottom()),
-            pos2(grid_rect.left(), full.bottom()),
+            pos2(full.left(), lane.top()),
+            pos2(grid_rect.left(), lane.bottom()),
         );
         velocity_lane::show(app, ui, &painter, &view, lane, corner, clip, &shown, color);
     } else {
         app.piano.vel_drag = None;
+    }
+    if pedal_h > 0.0 {
+        let lane = Rect::from_min_max(pos2(grid_rect.left(), full.bottom() - pedal_h), full.max);
+        let corner = Rect::from_min_max(
+            pos2(full.left(), lane.top()),
+            pos2(grid_rect.left(), lane.bottom()),
+        );
+        pedal_lane::show(app, ui, &painter, &view, lane, corner, clip, pedal, color);
+    } else {
+        app.piano.pedal_drag = None;
     }
     ui.advance_cursor_after_rect(full);
 }
@@ -691,7 +744,7 @@ fn ghost_notes(
         }
         let color = theme::track_color(t.color);
         for c in t.clips.iter().filter(|c| c.id != clip.id && !c.muted) {
-            let ClipContent::Midi { notes } = &c.content else {
+            let ClipContent::Midi { notes, .. } = &c.content else {
                 continue;
             };
             let offset = c.start - clip.start;
@@ -1137,9 +1190,10 @@ mod tests {
         later.id = ClipId::new();
         later.start = bar * 2;
         later.length = bar;
-        later.content = ClipContent::Midi {
-            notes: vec![Note::new(0, PPQ, 72, 90), Note::new(bar * 2, PPQ, 74, 90)],
-        };
+        later.content = ClipContent::midi(vec![
+            Note::new(0, PPQ, 72, 90),
+            Note::new(bar * 2, PPQ, 74, 90),
+        ]);
         project.tracks[pad].clips.push(later);
         let track = project.tracks[pad].clone();
         let clip = track.clips[0].clone();
@@ -1158,7 +1212,7 @@ mod tests {
         assert_eq!((own[0].start, own[0].pitch), (bar * 2, 72));
         // Every instrument track's MIDI clips, but not drum patterns.
         let bass_notes = match &project.tracks[bass].clips[0].content {
-            ClipContent::Midi { notes } => notes.len(),
+            ClipContent::Midi { notes, .. } => notes.len(),
             _ => panic!("a MIDI clip"),
         };
         assert_eq!(ghosts(&project, Ghosts::All, end).len(), bass_notes + 1);

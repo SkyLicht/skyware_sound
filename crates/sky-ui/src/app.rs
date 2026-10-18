@@ -200,7 +200,7 @@ impl Selection {
             match project.find_clip(c) {
                 Ok((track, clip)) => {
                     self.track = Some(track.id);
-                    if let ClipContent::Midi { notes } = &clip.content {
+                    if let ClipContent::Midi { notes, .. } = &clip.content {
                         self.notes.retain(|id| notes.iter().any(|n| n.id == *id));
                     } else {
                         self.notes.clear();

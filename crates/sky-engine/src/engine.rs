@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use sky_core::TrackId;
 use sky_dsp::loudness::BlockMeter;
-use sky_dsp::{Instrument, MAX_BLOCK};
+use sky_dsp::{Instrument, MAX_BLOCK, SUSTAIN_PEDAL};
 
 use crate::compile::{
     AudioClipNode, ChannelNode, EngineSnapshot, NoteEvent, SourceNode, TrackNode, Triggers,
@@ -184,6 +184,7 @@ fn seek_cursor(notes: &[NoteEvent], position: i64) -> usize {
     notes.partition_point(|n| n.time < position)
 }
 
+/// Lets go of every note, and of the pedal without a sound.
 fn release_all(track: &mut TrackNode) {
     if let SourceNode::Instrument {
         instrument: Some(inst),
@@ -193,6 +194,17 @@ fn release_all(track: &mut TrackNode) {
         inst.all_notes_off();
     }
     track.state.active = [-1; 128];
+    track.state.pedal = false;
+}
+
+/// Whether the pedal is down at sample `t`, and when it next moves.
+fn pedal_at(pedal: &[(i64, i64)], t: i64) -> (bool, Option<i64>) {
+    let i = pedal.partition_point(|s| s.1 <= t);
+    match pedal.get(i) {
+        Some(&(start, end)) if start <= t => (true, Some(end)),
+        Some(&(start, _)) => (false, Some(start)),
+        None => (false, None),
+    }
 }
 
 fn reseek(track: &mut TrackNode, position: i64) {
@@ -224,8 +236,9 @@ fn adopt_snapshot(new: &mut EngineSnapshot, old: &mut EngineSnapshot, position: 
                     ..
                 },
             ) = (&mut nt.source, &mut ot.source)
+                && ni.adopt(oi.as_mut())
             {
-                ni.adopt(oi.as_mut());
+                nt.state.pedal = ot.state.pedal;
             }
             adopt_effects(&mut nt.channel, &mut ot.channel);
             std::mem::swap(&mut nt.state.active, &mut ot.state.active);
@@ -304,6 +317,7 @@ fn render_source(
             instrument,
             notes,
             locks,
+            pedal,
         } => {
             let Some(inst) = instrument else {
                 return;
@@ -326,11 +340,19 @@ fn render_source(
                     .copied()
                     .filter(|&e| e >= 0 && e < end)
                     .min();
-                let next = match (next_on, next_off) {
-                    (Some(a), Some(b)) => a.min(b),
-                    (a, b) => a.or(b).unwrap_or(end),
-                }
-                .max(t);
+                // Now, when the pedal is not where it should be.
+                let (down, moves) = pedal_at(pedal, t);
+                let next_pedal = if down == state.pedal {
+                    moves.filter(|&m| m < end)
+                } else {
+                    Some(t)
+                };
+                let next = [next_on, next_off, next_pedal]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or(end)
+                    .max(t);
                 if next > t {
                     let a = (t - pos) as usize;
                     let b = (next - pos) as usize;
@@ -347,6 +369,13 @@ fn render_source(
                         inst.note_off(pitch as u8);
                         *e = -1;
                     }
+                }
+                // Between the notes that end and the ones that start, so a
+                // chord struck as the pedal moves is caught by it.
+                let (down, _) = pedal_at(pedal, t);
+                if down != state.pedal {
+                    inst.controller(SUSTAIN_PEDAL, if down { 127 } else { 0 });
+                    state.pedal = down;
                 }
                 while let Some(n) = notes.get(state.cursor) {
                     if n.time > t {
@@ -502,6 +531,7 @@ impl Engine {
                             inst.reset();
                         }
                         t.state.active = [-1; 128];
+                        t.state.pedal = false;
                         for fx in t.channel.effects.iter_mut() {
                             fx.effect.reset();
                         }

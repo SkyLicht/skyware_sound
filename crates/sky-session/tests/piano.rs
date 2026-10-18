@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The piano end to end: its built-in library loads with the project, every
 //! key sounds in a render, velocity sets the level, notes ring on through
-//! changes to the project, and switching libraries is one undo step.
+//! changes to the project, switching libraries is one undo step, and the
+//! sustain pedal holds notes live and offline.
 
 use sky_core::{ClipId, PPQ, TrackId};
 use sky_dsp::{AudioData, InstrumentType};
 use sky_model::templates::empty_project;
-use sky_model::{Clip, ClipContent, Command, Note, Origin, Project, Track, Transaction};
+use sky_model::{Clip, ClipContent, Command, Note, Origin, Pedal, Project, Track, Transaction};
 use sky_session::Session;
 
 /// A project with one piano track whose clip plays `notes`.
@@ -25,7 +26,7 @@ fn piano_project(notes: Vec<Note>) -> (Project, TrackId) {
         start: 0,
         length,
         muted: false,
-        content: ClipContent::Midi { notes },
+        content: ClipContent::midi(notes),
     });
     project.tracks.push(track);
     (project, id)
@@ -189,4 +190,98 @@ fn chords_stay_below_full_scale() {
     println!("line peak {line}, sixteen-key chord peak {chord}");
     assert!(line > 0.05, "{line}");
     assert!(chord < 1.0, "{chord}");
+}
+
+/// A one-beat C major chord in an eight-beat clip, with the pedal down for
+/// the first four beats when `pedal` is set.
+fn pedalled_chord(pedal: bool) -> Project {
+    let notes = [60u8, 64, 67]
+        .iter()
+        .map(|&k| Note::new(0, PPQ, k, 100))
+        .collect();
+    let (mut project, _) = piano_project(notes);
+    let clip = &mut project.tracks[0].clips[0];
+    clip.length = 8 * PPQ;
+    if pedal {
+        clip.content = match std::mem::replace(&mut clip.content, ClipContent::midi(Vec::new())) {
+            ClipContent::Midi { notes, .. } => ClipContent::Midi {
+                notes,
+                pedal: vec![Pedal::new(0, 4 * PPQ)],
+            },
+            other => other,
+        };
+    }
+    project
+}
+
+/// The chord's level a second after its note-offs, with the pedal still
+/// down, and 0.8 s after the pedal comes up at two seconds.
+fn held_and_after(audio: &AudioData) -> (f32, f32) {
+    (peak(audio, 1.5, 2.0), peak(audio, 2.8, 3.0))
+}
+
+/// The gate for the pedal: a pedalled chord keeps ringing after its
+/// note-offs and stops on pedal up, in an offline render and live.
+#[test]
+fn a_pedalled_chord_rings_until_the_pedal_comes_up() {
+    let render = |pedal: bool| {
+        Session::new(pedalled_chord(pedal), None)
+            .0
+            .render_range(0, 8 * PPQ, 0.0)
+            .unwrap()
+    };
+    let (dry, _) = held_and_after(&render(false));
+    let (held, after) = held_and_after(&render(true));
+    println!("offline: dry {dry}, held {held}, after pedal up {after}");
+    assert!(held > 0.02 && held > dry * 10.0, "{dry} -> {held}");
+    assert!(after < held * 0.01, "{held} -> {after}");
+
+    // Live, in blocks as small as the low-latency output's.
+    let (session, engine) = Session::new(pedalled_chord(true), Some(48_000));
+    let mut engine = engine.unwrap();
+    let started = std::time::Instant::now();
+    while !session.libraries_ready() {
+        assert!(started.elapsed().as_secs() < 30, "the piano never loaded");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Let the loaded piano reach the engine before playing.
+    engine_peak(&mut engine, 480);
+    session.play().unwrap();
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let (mut l, mut r) = (vec![0.0f32; 144], vec![0.0f32; 144]);
+    while left.len() < 48_000 * 3 {
+        engine.process_planar(&mut l, &mut r);
+        left.extend_from_slice(&l);
+        right.extend_from_slice(&r);
+    }
+    let live = AudioData {
+        sample_rate: 48_000,
+        channels: vec![left, right],
+    };
+    let (live_held, live_after) = held_and_after(&live);
+    println!("live: held {live_held}, after pedal up {live_after}");
+    assert!(
+        (live_held - held).abs() < held * 0.2,
+        "{held} offline, {live_held} live"
+    );
+    assert!(live_after < live_held * 0.01, "{live_held} -> {live_after}");
+}
+
+#[test]
+fn the_top_keys_ring_without_dampers() {
+    // A quarter-second note; how much of it is left half a second later.
+    let ring = |key: u8| {
+        let (project, _) = piano_project(vec![Note::new(0, PPQ / 2, key, 100)]);
+        let mut project = project;
+        project.tracks[0].clips[0].length = 4 * PPQ;
+        let audio = Session::new(project, None)
+            .0
+            .render_range(0, 4 * PPQ, 0.0)
+            .unwrap();
+        peak(&audio, 0.75, 0.85) / peak(&audio, 0.0, 0.2)
+    };
+    let (damped, undamped) = (ring(84), ring(96));
+    println!("left after the key comes up: C6 {damped}, C7 {undamped}");
+    assert!(undamped > damped * 10.0, "{damped} {undamped}");
 }

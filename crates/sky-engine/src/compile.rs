@@ -69,6 +69,9 @@ pub enum SourceNode {
         instrument: Option<Box<dyn Instrument>>,
         notes: Vec<NoteEvent>,
         locks: Vec<ParamLock>,
+        /// Where the sustain pedal is down, as start and end samples:
+        /// sorted and apart.
+        pedal: Vec<(i64, i64)>,
     },
 }
 
@@ -134,6 +137,8 @@ pub(crate) struct TrackState {
     pub active: [i64; 128],
     /// Index of the next note to start.
     pub cursor: usize,
+    /// The sustain pedal is down on the instrument.
+    pub pedal: bool,
 }
 
 impl Default for TrackState {
@@ -141,6 +146,7 @@ impl Default for TrackState {
         Self {
             active: [-1; 128],
             cursor: 0,
+            pedal: false,
         }
     }
 }
@@ -391,6 +397,41 @@ enum Target {
     Velocity,
     /// An index into [`Locks::params`].
     Param(usize),
+    /// The sustain pedal, down from 0.5.
+    Pedal,
+}
+
+/// The pattern control that moves the sustain pedal on instruments that
+/// have one, as Strudel's `sustain`.
+const SUSTAIN: &str = "sustain";
+
+/// Where the pedal is down within `[from, to)`, from the times it moves:
+/// each change holds until the next. Changes at the same time apply in
+/// order, the last one winning.
+fn pedal_spans(
+    changes: &mut [(Ticks, bool)],
+    from: Ticks,
+    to: Ticks,
+    out: &mut Vec<(Ticks, Ticks)>,
+) {
+    changes.sort_by_key(|c| c.0);
+    let mut down_at = None;
+    for &(t, down) in changes.iter() {
+        let t = t.clamp(from, to);
+        match (down, down_at) {
+            (true, None) => down_at = Some(t),
+            (false, Some(start)) => {
+                if t > start {
+                    out.push((start, t));
+                }
+                down_at = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = down_at.filter(|&s| s < to) {
+        out.push((start, to));
+    }
 }
 
 /// A control pattern's events over a clip, ready to be read at any time.
@@ -440,6 +481,8 @@ fn control_seed(seed: u64, name: &str) -> u64 {
     })
 }
 
+/// The notes a pattern clip plays, and with `pedal`, where its `sustain`
+/// control holds the sustain pedal down, in ticks.
 #[allow(clippy::too_many_arguments)]
 fn pattern_notes(
     tempo: &TempoMap,
@@ -449,6 +492,7 @@ fn pattern_notes(
     resolve: &Resolve,
     locks: &mut Locks,
     out: &mut Vec<NoteEvent>,
+    pedal: Option<&mut Vec<(Ticks, Ticks)>>,
 ) {
     let ClipContent::Pattern {
         seed,
@@ -470,6 +514,8 @@ fn pattern_notes(
         .filter_map(|(name, src)| {
             let target = if name == VELOCITY {
                 Target::Velocity
+            } else if name == SUSTAIN && pedal.is_some() {
+                Target::Pedal
             } else {
                 Target::Param(locks.params.iter().position(|s| s.name == name)?)
             };
@@ -477,7 +523,33 @@ fn pattern_notes(
         })
         .collect();
     let clip_end = clip_start + clip_len;
-    for ev in pattern.query(Rational64::from_integer(0), to, seed) {
+    // The pedal moves where the lane's steps start, then where the code
+    // gives a note `sustain`.
+    let mut changes: Vec<(Ticks, bool)> = controls
+        .iter()
+        .filter(|c| matches!(c.target, Target::Pedal))
+        .flat_map(|c| c.events.iter())
+        .map(|&(begin, _, v)| {
+            (
+                swing.apply(clip_start + rational_ticks(begin, cycle)),
+                v >= 0.5,
+            )
+        })
+        .collect();
+    let events = pattern.query(Rational64::from_integer(0), to, seed);
+    if pedal.is_some() {
+        changes.extend(events.iter().filter_map(|ev| {
+            let v = ev.controls.get(Code::Sustain)?;
+            Some((
+                swing.apply(clip_start + rational_ticks(ev.begin, cycle)),
+                v >= 0.5,
+            ))
+        }));
+    }
+    if let Some(pedal) = pedal {
+        pedal_spans(&mut changes, clip_start, clip_end, pedal);
+    }
+    for ev in events {
         let Some(play) = resolve(&ev) else {
             continue;
         };
@@ -651,6 +723,30 @@ impl<'a> CompiledBank<'a> {
     }
 }
 
+/// Pedal stretches in ticks as samples, sorted, with the ones that touch
+/// or overlap joined.
+fn pedal_samples(tempo: &TempoMap, sr: u32, ticks: Vec<(Ticks, Ticks)>) -> Vec<(i64, i64)> {
+    let mut spans: Vec<(i64, i64)> = ticks
+        .into_iter()
+        .map(|(a, b)| {
+            (
+                ticks_to_samples(tempo, a, sr),
+                ticks_to_samples(tempo, b, sr),
+            )
+        })
+        .filter(|(a, b)| b > a)
+        .collect();
+    spans.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+    for (a, b) in spans {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
 fn rational_ticks(cycles: Rational64, cycle: Ticks) -> Ticks {
     let r = cycles * Rational64::from_integer(cycle);
     // Round to the nearest tick.
@@ -755,12 +851,25 @@ fn track_node(
                 .collect();
             let mut notes = Vec::new();
             let mut locks = Locks::new(track, &patterns);
+            let takes_pedal = slot.is_some_and(|s| s.kind.takes_pedal());
+            let mut pedal: Vec<(Ticks, Ticks)> = Vec::new();
             for (clip, pattern) in track.clips.iter().zip(&patterns) {
                 if clip.muted {
                     continue;
                 }
                 match &clip.content {
-                    ClipContent::Midi { notes: clip_notes } => {
+                    ClipContent::Midi {
+                        notes: clip_notes,
+                        pedal: clip_pedal,
+                    } => {
+                        if takes_pedal {
+                            pedal.extend(
+                                clip_pedal
+                                    .iter()
+                                    .filter_map(|p| p.cut(clip.length))
+                                    .map(|p| (clip.start + p.start, clip.start + p.end())),
+                            );
+                        }
                         for n in clip_notes.iter().filter(|n| n.start < clip.length) {
                             let begin = clip.start + n.start;
                             let end = clip.start + (n.start + n.length).min(clip.length);
@@ -779,7 +888,14 @@ fn track_node(
                     ClipContent::Pattern { .. } => {
                         if let Some(pattern) = pattern {
                             pattern_notes(
-                                tempo, sr, clip, pattern, &resolve, &mut locks, &mut notes,
+                                tempo,
+                                sr,
+                                clip,
+                                pattern,
+                                &resolve,
+                                &mut locks,
+                                &mut notes,
+                                takes_pedal.then_some(&mut pedal),
                             );
                         }
                     }
@@ -814,6 +930,7 @@ fn track_node(
                 instrument,
                 notes,
                 locks: locks.out,
+                pedal: pedal_samples(tempo, sr, pedal),
             }
         }
     };

@@ -106,7 +106,7 @@ fn label(verb: &str, n: usize, noun: &str) -> String {
 fn midi_notes(project: &Project, clip: ClipId) -> Option<(&Track, &Clip, &[Note])> {
     let (track, c) = project.find_clip(clip).ok()?;
     match &c.content {
-        ClipContent::Midi { notes } => Some((track, c, notes)),
+        ClipContent::Midi { notes, .. } => Some((track, c, notes)),
         _ => None,
     }
 }
@@ -180,7 +180,7 @@ fn fresh(clip: &Clip, start: Ticks) -> Clip {
     let mut copy = clip.clone();
     copy.id = ClipId::new();
     copy.start = start;
-    if let ClipContent::Midi { notes } = &mut copy.content {
+    if let ClipContent::Midi { notes, .. } = &mut copy.content {
         for n in notes.iter_mut() {
             n.id = NoteId::new();
         }

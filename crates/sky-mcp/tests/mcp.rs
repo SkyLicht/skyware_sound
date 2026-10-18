@@ -313,6 +313,81 @@ async fn notes_and_patterns_round_trip() {
     client.cancel().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sustain_pedal_is_written_and_read_back() {
+    let (session, _) = Session::new(empty_project("Pedal"), None);
+    let client = connect(SkywareMcp::new(
+        session.clone(),
+        Policy::new(Permission::Edit, vec![]),
+    ))
+    .await;
+    ok(
+        &client,
+        "track_create",
+        json!({ "name": "Keys", "instrument": "piano" }),
+    )
+    .await;
+    let clip = ok(
+        &client,
+        "clip_create",
+        json!({ "track": "Keys", "start_bar": 1, "length_bars": 2, "name": "Chords",
+                "notes": "C4+E4+G4 1/4, F4+A4+C5 1/4 @4", "pedal": "4-7.5, 0-3.75" }),
+    )
+    .await;
+    assert_eq!(clip["pedal"], "0-3.75, 4-7.5");
+    // The pedal alone, added to what is there and then replaced.
+    let written = ok(
+        &client,
+        "notes_write",
+        json!({ "clip": "Chords", "pedal": "7-8", "mode": "add" }),
+    )
+    .await;
+    assert_eq!(written["pedal"], "0-3.75, 4-8");
+    assert_eq!(written["noteCount"], 6, "the notes stay");
+    let written = ok(
+        &client,
+        "notes_write",
+        json!({ "clip": "Chords", "pedal": "" }),
+    )
+    .await;
+    assert_eq!(written["pedal"], "", "the lift is confirmed");
+    let (e, is_error) = call(
+        &client,
+        "notes_write",
+        json!({ "clip": "Chords", "pedal": "3-1" }),
+    )
+    .await;
+    assert!(is_error && e.contains("pedal"), "{e}");
+    let (e, is_error) = call(&client, "notes_write", json!({ "clip": "Chords" })).await;
+    assert!(is_error && e.contains("notes, pedal"), "{e}");
+    // On a pattern clip the sustain control moves the pedal.
+    ok(
+        &client,
+        "clip_create",
+        json!({ "track": "Keys", "start_bar": 3, "length_bars": 2,
+                "pattern": "c4 e4", "controls": { "sustain": "<1 0>" } }),
+    )
+    .await;
+    let (e, is_error) = call(
+        &client,
+        "clip_create",
+        json!({ "track": "Keys", "start_bar": 5, "length_bars": 1,
+                "pattern": "c4", "pedal": "0-1" }),
+    )
+    .await;
+    assert!(is_error && e.contains("sustain control"), "{e}");
+    // Undo takes back one write at a time.
+    let pedal = || match &session.project().tracks[0].clips[0].content {
+        sky_model::ClipContent::Midi { pedal, .. } => pedal.len(),
+        _ => 0,
+    };
+    assert_eq!(pedal(), 0);
+    session.undo().unwrap();
+    session.undo().unwrap();
+    assert_eq!(pedal(), 2);
+    client.cancel().await.unwrap();
+}
+
 /// The phase 1 gate: an assistant builds a techno loop with ducked bass
 /// and accented, swung hats from the built-in instruments, and it loops
 /// cleanly.

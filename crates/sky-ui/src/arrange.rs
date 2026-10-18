@@ -1519,7 +1519,7 @@ fn draw_clip(
     );
     if body.height() > 2.0 {
         match &clip.content {
-            ClipContent::Midi { notes } => draw_notes(
+            ClipContent::Midi { notes, .. } => draw_notes(
                 &p,
                 r,
                 body,

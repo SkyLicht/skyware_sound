@@ -35,6 +35,7 @@ mod mixer;
 mod palette;
 mod params;
 mod pattern_editor;
+mod pedal_lane;
 mod piano;
 mod piano_roll;
 mod picture_editor;

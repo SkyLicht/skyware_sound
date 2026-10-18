@@ -27,6 +27,9 @@ pub use sampled::{SampleData, SampleLibrary, Zone};
 pub use sampler::Sampler;
 pub use synth::Synth;
 
+/// The MIDI controller number of the sustain pedal.
+pub const SUSTAIN_PEDAL: u8 = 64;
+
 /// A note-driven sound source. `render` adds into the buffers.
 pub trait Instrument: Send + 'static {
     /// Sets a parameter by its spec name. Returns false for unknown names.
@@ -36,6 +39,9 @@ pub trait Instrument: Send + 'static {
     /// Starts sound number `sound` of a sample bank as a one-shot; it
     /// rings out and takes no note-off. Other instruments ignore it.
     fn sound_on(&mut self, _sound: u32, _velocity: u8) {}
+    /// A MIDI controller moved to `value` (0-127), such as the
+    /// [`SUSTAIN_PEDAL`], down from 64. Instruments without one ignore it.
+    fn controller(&mut self, _controller: u8, _value: u8) {}
     /// Releases every held note, letting release tails ring out.
     fn all_notes_off(&mut self);
     /// Silences everything immediately.
@@ -155,9 +161,17 @@ impl InstrumentType {
             InstrumentType::Piano => {
                 "Sampled piano from an instrument library (Upright Piano KW by default): velocity \
                  picks the layer and the level through the velocity curve and dynamics, release \
-                 samples play on key up, and a mono library spreads across the stereo field by key"
+                 samples play on key up, and a mono library spreads across the stereo field by key. \
+                 The sustain pedal holds notes, and the top keys ring on without dampers"
             }
         }
+    }
+
+    /// Whether the instrument has a sustain pedal: notes it plays take
+    /// [`SUSTAIN_PEDAL`] moves, and a pattern's `sustain` control moves the
+    /// pedal instead of setting a parameter.
+    pub fn takes_pedal(self) -> bool {
+        self == InstrumentType::Piano
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
