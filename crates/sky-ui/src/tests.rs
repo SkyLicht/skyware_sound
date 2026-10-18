@@ -2857,9 +2857,9 @@ fn big_pianos_offer_fewer_velocity_layers() {
     h.click_label("8 layers");
     h.frames(3);
     for choice in [
-        "16 layers · about 845 MB",
-        "4 layers · about 211 MB",
-        "2 layers · about 106 MB",
+        "16 layers · about 1307 MB",
+        "4 layers · about 327 MB",
+        "2 layers · about 163 MB",
     ] {
         assert!(h.find(choice).is_some(), "{choice}");
     }

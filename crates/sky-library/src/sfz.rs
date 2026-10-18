@@ -9,7 +9,8 @@
 //! `pitch_keytrack`), set their level and place (`volume`, `amplitude`,
 //! `pan`, `width`), loop them (`loop_mode`, `loop_start`, `loop_end`,
 //! `offset`, `end`), take turns (`seq_length`, `seq_position`), play on
-//! note-off (`trigger=release`, `rt_decay`), release (`ampeg_release`) and
+//! note-off (`trigger=release`, `rt_decay`), fade in and out
+//! (`ampeg_attack`, `ampeg_release`) and
 //! filter them (`fil_type` low-pass, `cutoff`, `resonance`). Regions that
 //! need a pedal or controller to be pressed are left out, as the instrument
 //! starts with every controller at 0. Anything else is skipped and listed,
@@ -325,6 +326,7 @@ const KNOWN: &[&str] = &[
     "seq_position",
     "lorand",
     "hirand",
+    "ampeg_attack",
     "ampeg_release",
     "fil_type",
     "filtype",
@@ -420,6 +422,7 @@ fn region_zone(ops: &Opcodes, sample: u32) -> Zone {
     z.seq_position = number(ops, "seq_position").map_or(1, |v| v.clamp(1.0, 100.0) as u8);
     z.lorand = number(ops, "lorand").unwrap_or(0.0);
     z.hirand = number(ops, "hirand").unwrap_or(1.0);
+    z.attack = number(ops, "ampeg_attack").unwrap_or(0.0).clamp(0.0, 10.0);
     z.release = number(ops, "ampeg_release").unwrap_or(0.001).max(0.001);
     let fil = ops
         .get("fil_type")

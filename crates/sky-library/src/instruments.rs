@@ -189,7 +189,7 @@ pub const INSTRUMENTS: &[InstrumentInfo] = &[
         homepage: "https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html",
         size: 746_912_846,
         layers: 16,
-        memory: 845_000_000,
+        memory: 1_307_000_000,
         source: InstrumentSource::Download {
             url: "https://freepats.zenvoid.org/Piano/SalamanderGrandPiano/\
                   SalamanderGrandPiano-SFZ+FLAC-V3+20200602.tar.gz",
@@ -1116,7 +1116,16 @@ mod tests {
         let mut paths: Vec<String> = files.iter().map(|f| f.0.to_string()).collect();
         paths.sort();
         assert_eq!(named, paths);
-        assert_eq!(parsed.skipped, ["ampeg_attack"]);
+        assert!(parsed.skipped.is_empty(), "{:?}", parsed.skipped);
+        // Notes fade in over 4 ms and the release samples over 100 ms.
+        for z in &parsed.zones {
+            let fade = if z.trigger == Trigger::Attack {
+                0.004
+            } else {
+                0.1
+            };
+            assert_eq!(z.attack, fade);
+        }
         let attack = parsed
             .zones
             .iter()

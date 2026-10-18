@@ -185,6 +185,8 @@ pub struct Zone {
     /// 0 up to 1, falls in `lorand..hirand`.
     pub lorand: f32,
     pub hirand: f32,
+    /// Fade-in time in seconds when the zone starts.
+    pub attack: f32,
     /// Release time in seconds after the key comes up.
     pub release: f32,
     pub filter: Option<ZoneFilter>,
@@ -217,6 +219,7 @@ impl Zone {
             seq_position: 1,
             lorand: 0.0,
             hirand: 1.0,
+            attack: 0.0,
             release: 0.001,
             filter: None,
         }
@@ -369,10 +372,13 @@ impl SampleLibrary {
         self.samples.iter().any(|s| s.channels == 2)
     }
 
-    /// The lowest and highest keys any zone plays.
+    /// The lowest and highest keys that play a note. Release and pedal
+    /// zones are left out: a library may spread them wider, or put pedal
+    /// noises on no key at all.
     pub fn key_range(&self) -> Option<(u8, u8)> {
-        let lo = self.zones.iter().map(|z| z.lokey).min()?;
-        let hi = self.zones.iter().map(|z| z.hikey).max()?;
+        let attack = || self.zones.iter().filter(|z| z.trigger == Trigger::Attack);
+        let lo = attack().map(|z| z.lokey).min()?;
+        let hi = attack().map(|z| z.hikey).max()?;
         Some((lo, hi))
     }
 
@@ -704,7 +710,8 @@ impl SampleVoices {
             age: self.clock,
             filter: VoiceFilter::new(zone.filter, self.sample_rate),
         };
-        v.env.set(0.0, 1.0, 1.0, release_ms, self.sample_rate);
+        v.env
+            .set(zone.attack * 1000.0, 1.0, 1.0, release_ms, self.sample_rate);
         v.env.trigger();
     }
 
@@ -1019,7 +1026,8 @@ pub(crate) mod tests {
         assert!(lib.zones_at(Trigger::Attack, 40, 100).is_empty());
         assert_eq!(lib.zones_at(Trigger::Release, 30, 1), &[2]);
         assert_eq!(lib.layers(60), 2);
-        assert_eq!(lib.key_range(), Some((0, 127)));
+        // The release zone covers every key, but only 48-72 play notes.
+        assert_eq!(lib.key_range(), Some((48, 72)));
         assert!(lib.is_stereo() && lib.has_release_zones());
     }
 
@@ -1125,6 +1133,25 @@ pub(crate) mod tests {
             played.push(newest.map(|x| x.zone));
         }
         assert_eq!(played, [Some(0), Some(1), Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn zones_fade_in_over_their_attack() {
+        // How loud the first millisecond is against the note later on.
+        let start = |attack: f32| {
+            let zone = Zone {
+                attack,
+                ..Zone::new(0, 60)
+            };
+            let lib = SampleLibrary::new("one", vec![sine(48_000, 440.0, 1)], vec![zone]);
+            let mut v = SampleVoices::new(48_000.0, Arc::new(lib));
+            v.note_on(60, 100, &NoteShape::default());
+            let (l, _) = render(&mut v, 960);
+            peak(&l[..48]) / peak(&l[480..])
+        };
+        // A millisecond into a 10 ms fade-in, a tenth of the level at most.
+        assert!(start(0.01) < 0.15, "{}", start(0.01));
+        assert!(start(0.0) > 0.9, "{}", start(0.0));
     }
 
     #[test]
