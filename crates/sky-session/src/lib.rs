@@ -47,7 +47,7 @@ mod libraries;
 mod pattern_sounds;
 mod place;
 
-pub use libraries::LibrarySet;
+pub use libraries::{LibrarySet, LoadProgress};
 pub use pattern_sounds::{SoundsLoaded, SoundsRequest, pattern_sound_names};
 pub use place::{AudioInput, AudioTarget, ImportedFiles, Placed, audio_clip, sound_name};
 
@@ -401,7 +401,7 @@ struct State {
     libraries: LibraryCache,
     /// Libraries being loaded in the background, and those that failed
     /// (with why), so they are not tried again until asked.
-    loading: std::collections::HashSet<String>,
+    loading: HashMap<String, Arc<libraries::LoadProgress>>,
     failed: HashMap<String, String>,
     engine_rate: Option<u32>,
     status: Option<String>,

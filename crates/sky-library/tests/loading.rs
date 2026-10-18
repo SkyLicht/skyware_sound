@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 
 use sky_dsp::AudioData;
 use sky_dsp::InstrumentType;
+use sky_dsp::instruments::sampled::Trigger;
 use sky_io::{WavFormat, write_wav};
-use sky_library::{InstrumentInfo, InstrumentSource, Instruments, Library, PackSource};
+use sky_library::{InstrumentInfo, InstrumentSource, Instruments, Library, PackSource, Stage};
 use sky_model::License;
 
 /// Serves `files` by path on 127.0.0.1 until `stop` is set. Counts requests.
@@ -310,6 +311,8 @@ fn tiny_info(url: String, bytes: u64, sha256: String) -> InstrumentInfo {
         credit: None,
         homepage: "",
         size: 0,
+        layers: 1,
+        memory: 0,
         source: InstrumentSource::Download {
             url: Box::leak(url.into_boxed_str()),
             bytes,
@@ -331,7 +334,7 @@ fn instrument_libraries_install_once_and_only_when_they_match() {
 
     // An archive that is not the one listed is refused and leaves nothing.
     let wrong = tiny_info(url.clone(), archive.len() as u64, "00".repeat(32));
-    let e = instruments.install(&wrong, &mut |_, _| {}).unwrap_err();
+    let e = instruments.install(&wrong, &mut |_, _, _| {}).unwrap_err();
     assert!(e.to_string().contains("not the one expected"), "{e}");
     assert!(!instruments.is_installed(&wrong));
     assert!(instruments.load(&wrong).is_err());
@@ -340,18 +343,29 @@ fn instrument_libraries_install_once_and_only_when_they_match() {
         archive.len() as u64,
         sha256_hex(&archive),
     );
-    assert!(instruments.install(&missing, &mut |_, _| {}).is_err());
+    assert!(instruments.install(&missing, &mut |_, _, _| {}).is_err());
 
     let info = tiny_info(url, archive.len() as u64, sha256_hex(&archive));
     assert!(!instruments.is_installed(&info));
     let mut seen = Vec::new();
     instruments
-        .install(&info, &mut |done, total| seen.push((done, total)))
+        .install(&info, &mut |stage, done, total| {
+            seen.push((stage, done, total))
+        })
         .unwrap();
+    let downloaded = seen.iter().rfind(|s| s.0 == Stage::Download);
     assert_eq!(
-        seen.last(),
-        Some(&(archive.len() as u64, archive.len() as u64))
+        downloaded,
+        Some(&(Stage::Download, archive.len() as u64, archive.len() as u64))
     );
+    // Unpacking follows, and its count only grows.
+    let unpacked: Vec<u64> = seen
+        .iter()
+        .filter(|s| s.0 == Stage::Unpack)
+        .map(|s| s.1)
+        .collect();
+    assert!(!unpacked.is_empty() && unpacked.is_sorted(), "{seen:?}");
+    assert_eq!(seen.last().map(|s| s.0), Some(Stage::Unpack));
     assert!(instruments.is_installed(&info));
     let folder = instruments.folder(&info);
     assert!(
@@ -372,7 +386,7 @@ fn instrument_libraries_install_once_and_only_when_they_match() {
 
     // Installed: nothing is downloaded again.
     let requests = server.requests.load(Ordering::SeqCst);
-    instruments.install(&info, &mut |_, _| {}).unwrap();
+    instruments.install(&info, &mut |_, _, _| {}).unwrap();
     assert_eq!(server.requests.load(Ordering::SeqCst), requests);
     server.stop.store(true, Ordering::SeqCst);
 }
@@ -391,9 +405,244 @@ fn deflate_archives_unpack() {
         archive.len() as u64,
         sha256_hex(&archive),
     );
-    instruments.install(&info, &mut |_, _| {}).unwrap();
+    instruments.install(&info, &mut |_, _, _| {}).unwrap();
     assert_eq!(instruments.load(&info).unwrap().zones().len(), 1);
     server.stop.store(true, Ordering::SeqCst);
+}
+
+/// A `.tar.gz` of a two-layer piano, the way FreePats packs Salamander,
+/// with a link that must not be followed and, given `escape`, an entry that
+/// would land outside the library.
+fn layered_tar_gz(dir: &Path, escape: bool) -> Vec<u8> {
+    let sfz = "<group> ampeg_release=0.5\n\
+               <region> sample=samples/C4v1.flac lokey=0 hikey=127 lovel=1 hivel=64\n\
+               <region> sample=samples/C4v2.flac lokey=0 hikey=127 lovel=65\n\
+               <group> trigger=release\n<region> sample=samples/rel1.flac\n";
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::fast(),
+    ));
+    let mut add = |name: &str, bytes: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, bytes).unwrap();
+    };
+    add("Tiny-1/Tiny.sfz", sfz.as_bytes());
+    for (name, level) in [("C4v1", 0.2), ("C4v2", 0.6), ("rel1", 0.1)] {
+        let file = format!("Tiny-1/samples/{name}.flac");
+        // Any audio file reads by its contents; WAV is the easy one to make.
+        add(&file, &wav(dir, &format!("{name}.wav"), level, 2_205));
+    }
+    let mut link = tar::Header::new_gnu();
+    link.set_entry_type(tar::EntryType::Symlink);
+    link.set_size(0);
+    builder
+        .append_link(&mut link, "Tiny-1/samples/elsewhere", "/etc/passwd")
+        .unwrap();
+    if escape {
+        // `append_data` refuses `..`, so the name goes in by hand.
+        let mut header = tar::Header::new_old();
+        header.as_old_mut().name[..9].copy_from_slice(b"../evil.t");
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+#[test]
+fn tar_gz_libraries_install_and_load_fewer_layers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = layered_tar_gz(tmp.path(), false);
+    let evil = layered_tar_gz(tmp.path(), true);
+    let mut files = HashMap::new();
+    files.insert("/tiny.tar.gz".to_string(), archive.clone());
+    files.insert("/evil.tar.gz".to_string(), evil.clone());
+    let server = Server::start(files);
+    let instruments = Instruments::new(tmp.path().join("instruments"));
+
+    let bad = tiny_info(
+        format!("{}/evil.tar.gz", server.base),
+        evil.len() as u64,
+        sha256_hex(&evil),
+    );
+    let e = instruments.install(&bad, &mut |_, _, _| {}).unwrap_err();
+    assert!(e.to_string().contains("outside"), "{e}");
+    assert!(!instruments.is_installed(&bad));
+    assert!(!tmp.path().join("instruments").join("evil.t").exists());
+
+    let mut info = tiny_info(
+        format!("{}/tiny.tar.gz", server.base),
+        archive.len() as u64,
+        sha256_hex(&archive),
+    );
+    info.layers = 2;
+    instruments.install(&info, &mut |_, _, _| {}).unwrap();
+    let samples = instruments.folder(&info).join("Tiny-1").join("samples");
+    assert!(samples.join("C4v2.flac").is_file());
+    assert!(!samples.join("elsewhere").exists(), "links are left out");
+
+    let all = instruments.load(&info).unwrap();
+    assert_eq!((all.samples().len(), all.layers(60)), (3, 2));
+    let mut seen = Vec::new();
+    let one = instruments
+        .load_with(&info, Some(1), &mut |stage, done, total| {
+            seen.push((stage, done, total))
+        })
+        .unwrap();
+    // The loud layer now covers every velocity, and the soft one is never
+    // decoded.
+    assert_eq!((one.samples().len(), one.layers(60)), (2, 1));
+    assert_eq!(one.zones_at(Trigger::Attack, 60, 10).len(), 1);
+    assert_eq!(seen.first(), Some(&(Stage::Load, 0, 2)));
+    assert_eq!(seen.last(), Some(&(Stage::Load, 2, 2)));
+    server.stop.store(true, Ordering::SeqCst);
+}
+
+/// A library of separate files at `base`, played by the built-in Steinway
+/// SFZ file.
+fn files_info(base: &str, files: &[(&str, &[u8])]) -> InstrumentInfo {
+    let files: Vec<(&'static str, u64, &'static str)> = files
+        .iter()
+        .map(|(path, bytes)| {
+            let path: &'static str = Box::leak(path.to_string().into_boxed_str());
+            let sha: &'static str = Box::leak(sha256_hex(bytes).into_boxed_str());
+            (path, bytes.len() as u64, sha)
+        })
+        .collect();
+    InstrumentInfo {
+        source: InstrumentSource::Files {
+            base: Box::leak(base.to_string().into_boxed_str()),
+            files: Box::leak(files.into_boxed_slice()),
+            sha256: "list-hash",
+            sfz: "vcsl-steinway-b/SteinwayB.sfz",
+        },
+        ..tiny_info(String::new(), 0, String::new())
+    }
+}
+
+#[test]
+fn file_libraries_download_each_file_and_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = wav(tmp.path(), "a.wav", 0.1, 500);
+    let b = wav(tmp.path(), "b.wav", 0.2, 700);
+    let list: [(&str, &[u8]); 2] = [("NoSus/A#0 soft.wav", &a), ("Rel/b.wav", &b)];
+    let total = (a.len() + b.len()) as u64;
+    // The first server lacks the second file, so the first try fails.
+    let mut some = HashMap::new();
+    some.insert("/lib/NoSus/A%230%20soft.wav".to_string(), a.clone());
+    let first = Server::start(some.clone());
+    let instruments = Instruments::new(tmp.path().join("instruments"));
+    let info = files_info(&format!("{}/lib/", first.base), &list);
+    let e = instruments
+        .install(&info, &mut |_, _, _| {})
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("Rel/b.wav"), "{e}");
+    assert!(!instruments.is_installed(&info));
+    // The second try only gets the file still missing.
+    some.insert("/lib/Rel/b.wav".to_string(), b.clone());
+    let second = Server::start(some);
+    let info = files_info(&format!("{}/lib/", second.base), &list);
+    let mut seen = Vec::new();
+    instruments
+        .install(&info, &mut |stage, done, of| seen.push((stage, done, of)))
+        .unwrap();
+    assert_eq!(second.requests.load(Ordering::SeqCst), 1);
+    assert!(
+        seen.iter()
+            .all(|(stage, _, of)| *stage == Stage::Download && *of == total)
+    );
+    assert!(seen.windows(2).all(|w| w[0].1 <= w[1].1), "{seen:?}");
+    assert_eq!(seen.last(), Some(&(Stage::Download, total, total)));
+    assert!(instruments.is_installed(&info));
+    // The downloads, and the built-in SFZ file and readme beside them.
+    let folder = instruments.folder(&info);
+    assert_eq!(
+        std::fs::read(folder.join("NoSus").join("A#0 soft.wav")).unwrap(),
+        a
+    );
+    assert_eq!(std::fs::read(folder.join("Rel").join("b.wav")).unwrap(), b);
+    assert!(folder.join("SteinwayB.sfz").is_file());
+    assert!(folder.join("readme.txt").is_file());
+    assert!(
+        !tmp.path()
+            .join("instruments")
+            .join("tiny-piano-1.part")
+            .exists()
+    );
+    // A file that is not the one listed is refused.
+    let mut wrong = HashMap::new();
+    wrong.insert(
+        "/lib/NoSus/A%230%20soft.wav".to_string(),
+        wav(tmp.path(), "c.wav", 0.3, 500),
+    );
+    let third = Server::start(wrong);
+    let other = Instruments::new(tmp.path().join("other"));
+    let info = files_info(&format!("{}/lib/", third.base), &list);
+    let e = other
+        .install(&info, &mut |_, _, _| {})
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not the one expected"), "{e}");
+    for s in [first, second, third] {
+        s.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Installs and loads a library from the folder `SKY_INSTRUMENTS` names,
+/// printing how long it took and the memory it uses.
+fn install_and_load(id: &str, layers: Option<u8>) -> sky_dsp::instruments::SampleLibrary {
+    let dir = std::env::var_os("SKY_INSTRUMENTS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("skyware-sound-instruments-test"));
+    let instruments = Instruments::new(dir);
+    let info = sky_library::find_instrument(id).unwrap();
+    let started = std::time::Instant::now();
+    instruments.install(info, &mut |_, _, _| {}).unwrap();
+    let installed = started.elapsed();
+    let started = std::time::Instant::now();
+    let lib = instruments
+        .load_with(info, layers, &mut |_, _, _| {})
+        .unwrap();
+    println!(
+        "{id} with {layers:?} layers: installed in {installed:?}, loaded in {:?}: {} samples, \
+         {} zones, {:.0} MB, stereo {}",
+        started.elapsed(),
+        lib.samples().len(),
+        lib.zones().len(),
+        lib.bytes() as f64 / 1e6,
+        lib.is_stereo()
+    );
+    lib
+}
+
+#[test]
+#[ignore = "downloads 543 MB from raw.githubusercontent.com"]
+fn the_steinway_b_installs_and_loads() {
+    let lib = install_and_load("vcsl-steinway-b", None);
+    assert_eq!(lib.samples().len(), 225);
+    assert_eq!(lib.key_range(), Some((21, 108)));
+    for key in 21..=108 {
+        assert_eq!(lib.layers(key), 3, "key {key}");
+    }
+}
+
+#[test]
+#[ignore = "downloads 707 MB from freepats.zenvoid.org"]
+fn the_salamander_grand_installs_and_loads() {
+    let all = install_and_load("salamander-grand-piano", None);
+    assert_eq!(all.samples().len(), 641);
+    assert_eq!(all.key_range(), Some((21, 108)));
+    for key in 21..=108 {
+        assert_eq!(all.layers(key), 16, "key {key}");
+    }
+    assert_eq!(all.zones_at(Trigger::PedalDown, 0, 1).len(), 2);
+    let half = install_and_load("salamander-grand-piano", Some(8));
+    assert_eq!(half.layers(60), 8);
+    assert!(half.bytes() < all.bytes() * 6 / 10);
 }
 
 #[test]
@@ -405,7 +654,7 @@ fn the_full_upright_piano_installs_and_loads() {
     let instruments = Instruments::new(dir);
     let info = sky_library::find_instrument("upright-piano-kw").unwrap();
     let started = std::time::Instant::now();
-    instruments.install(info, &mut |_, _| {}).unwrap();
+    instruments.install(info, &mut |_, _, _| {}).unwrap();
     let installed = started.elapsed();
     let started = std::time::Instant::now();
     let lib = instruments.load(info).unwrap();

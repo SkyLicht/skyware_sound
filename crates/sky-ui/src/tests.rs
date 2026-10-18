@@ -2796,17 +2796,31 @@ fn the_piano_shows_its_license_and_how_its_download_goes() {
     h.frames(2);
     assert!(h.find("CC0").is_some(), "the license badge");
     let total = 33_294_287;
+    let progress = Arc::new(std::sync::Mutex::new((
+        sky_library::Stage::Download,
+        10_000_000,
+        total,
+    )));
     h.app.devices.download = Some(crate::piano::Download {
         track: piano,
         name: "Upright Piano KW",
-        done: Arc::new(std::sync::atomic::AtomicU64::new(10_000_000)),
-        total: Arc::new(std::sync::atomic::AtomicU64::new(total)),
+        progress: progress.clone(),
     });
     h.frames(2);
     assert!(
         h.find("Downloading Upright Piano KW: 10.0 of 33.3 MB")
             .is_some(),
         "the progress bar"
+    );
+    // Then it unpacks and loads.
+    *progress.lock().unwrap() = (sky_library::Stage::Unpack, 25, 100);
+    h.frames(2);
+    assert!(h.find("Unpacking Upright Piano KW: 25%").is_some());
+    *progress.lock().unwrap() = (sky_library::Stage::Load, 12, 66);
+    h.frames(2);
+    assert!(
+        h.find("Loading Upright Piano KW: 12 of 66 recordings")
+            .is_some()
     );
     // The list names each piano with its license and where it comes from.
     h.click_label("Upright Piano KW (small)");
@@ -2823,6 +2837,36 @@ fn the_piano_shows_its_license_and_how_its_download_goes() {
     // Done or failed, the bar goes.
     h.app.piano_library_set(Err("no network".into()));
     assert!(h.app.devices.download.is_none());
+}
+
+#[test]
+fn big_pianos_offer_fewer_velocity_layers() {
+    let (mut h, piano) = piano_open(false);
+    // Nothing is downloaded here, so the grand cannot load.
+    let empty = tempfile::tempdir().unwrap();
+    h.app
+        .session
+        .set_instruments(sky_library::Instruments::new(empty.path().to_path_buf()));
+    let salamander = sky_library::find_instrument("salamander-grand-piano").unwrap();
+    let mut slot = h.track_named("Piano").instrument.unwrap();
+    slot.library = Some(salamander.reference_with(Some(8)));
+    crate::actions::set_instrument(&h.app.session, piano, slot, "Play the grand").unwrap();
+    h.accessible();
+    h.frames(3);
+    assert!(h.find("CC BY 3.0 · credit").is_some(), "the license badge");
+    h.click_label("8 layers");
+    h.frames(3);
+    for choice in [
+        "16 layers · about 845 MB",
+        "4 layers · about 211 MB",
+        "2 layers · about 106 MB",
+    ] {
+        assert!(h.find(choice).is_some(), "{choice}");
+    }
+    h.key(Key::Escape, Modifiers::NONE);
+    // A library with too few layers to halve has no choice to make.
+    let steinway = sky_library::find_instrument("vcsl-steinway-b").unwrap();
+    assert_eq!(steinway.layer_choices(), [3]);
 }
 
 #[test]

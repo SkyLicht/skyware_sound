@@ -4,17 +4,19 @@
 //!
 //! After every change the session looks for pianos whose library is not
 //! loaded and loads it on a background thread, so the UI never waits; the
-//! piano is silent until then. Renders and exports load what is missing
-//! first, so they never miss a piano.
+//! piano is silent until then, and lets go of libraries no piano plays any
+//! more. Renders and exports load what is missing first, so they never
+//! miss a piano.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use serde::Serialize;
 use sky_core::TrackId;
 use sky_dsp::InstrumentType;
 use sky_dsp::instruments::SampleLibrary;
-use sky_library::{InstrumentInfo, InstrumentStatus, Instruments, find_instrument};
+use sky_library::{InstrumentInfo, InstrumentStatus, Instruments, Stage, find_instrument};
 use sky_model::{
     Command, InstrumentSlot, LibraryRef, License, ModelError, Origin, Project, TrackKind,
     Transaction,
@@ -31,6 +33,29 @@ fn needed(project: &Project) -> HashMap<String, Option<LibraryRef>> {
         .filter(|slot| slot.kind == InstrumentType::Piano)
         .map(|slot| (slot.library_key(), slot.library.clone()))
         .collect()
+}
+
+/// How far a library loading in the background has got: recordings
+/// decoded and the total.
+#[derive(Debug, Default)]
+pub struct LoadProgress {
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+impl LoadProgress {
+    /// Recordings decoded and the total; the total is 0 until it is known.
+    pub fn get(&self) -> (u64, u64) {
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+
+    fn set(&self, done: u64, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+        self.done.store(done, Ordering::Relaxed);
+    }
 }
 
 /// What [`Session::set_piano_library`] did.
@@ -73,23 +98,29 @@ impl Session {
     }
 
     /// Starts loading, on a background thread, each library the project's
-    /// pianos need that is neither loaded nor loading nor failed. The
-    /// thread recompiles the project once its library is in.
+    /// pianos need that is neither loaded nor loading nor failed, and lets
+    /// go of the ones no piano needs. The thread recompiles the project
+    /// once its library is in.
     pub(crate) fn load_libraries_later(&self, st: &mut State) {
-        let wanted: Vec<(String, Option<LibraryRef>)> = needed(&st.project)
+        let needed = needed(&st.project);
+        // Libraries no track plays any more give their memory back: a grand
+        // piano can hold most of a gigabyte.
+        st.libraries.retain(|key, _| needed.contains_key(key));
+        let wanted: Vec<(String, Option<LibraryRef>)> = needed
             .into_iter()
             .filter(|(key, _)| {
                 !st.libraries.contains_key(key)
-                    && !st.loading.contains(key)
+                    && !st.loading.contains_key(key)
                     && !st.failed.contains_key(key)
             })
             .collect();
         for (key, reference) in wanted {
-            st.loading.insert(key.clone());
+            let progress = Arc::new(LoadProgress::default());
+            st.loading.insert(key.clone(), progress.clone());
             let inner = Arc::downgrade(&self.inner);
             let spawned = std::thread::Builder::new()
                 .name("sky-instrument-load".into())
-                .spawn(move || load_in_background(inner, key, reference));
+                .spawn(move || load_in_background(inner, key, reference, &progress));
             if let Err(e) = spawned {
                 tracing::error!("cannot start loading an instrument library: {e}");
             }
@@ -153,6 +184,14 @@ impl Session {
             .flatten()
     }
 
+    /// How far a track's piano library has got loading in the background,
+    /// while it loads.
+    pub fn track_library_loading(&self, track: TrackId) -> Option<(u64, u64)> {
+        let st = lock(&self.inner.state);
+        let slot = st.project.track(track).ok()?.instrument.as_ref()?;
+        st.loading.get(&slot.library_key()).map(|p| p.get())
+    }
+
     /// Why a track's piano library could not be loaded, if it could not.
     pub fn track_library_error(&self, track: TrackId) -> Option<String> {
         let st = lock(&self.inner.state);
@@ -160,12 +199,12 @@ impl Session {
         st.failed.get(&slot.library_key()).cloned()
     }
 
-    /// Downloads and unpacks a library, reporting bytes received and the
-    /// total. Does nothing for one that is installed.
+    /// Downloads and unpacks a library, reporting each stage's progress.
+    /// Does nothing for one that is installed.
     pub fn install_library(
         &self,
         name: &str,
-        progress: &mut dyn FnMut(u64, u64),
+        progress: &mut dyn FnMut(Stage, u64, u64),
     ) -> Result<&'static InstrumentInfo, SessionError> {
         let info = known(name)?;
         self.instruments().install(info, progress)?;
@@ -184,18 +223,20 @@ impl Session {
         download: bool,
         origin: Origin,
     ) -> Result<LibrarySet, SessionError> {
-        self.set_piano_library_reporting(track, name, download, origin, &mut |_, _| {})
+        self.set_piano_library_reporting(track, name, None, download, origin, &mut |_, _, _| {})
     }
 
-    /// [`set_piano_library`](Self::set_piano_library), reporting the bytes
-    /// downloaded and the total while a download runs.
+    /// [`set_piano_library`](Self::set_piano_library) with at most `layers`
+    /// velocity layers loaded (all for `None`), reporting the download,
+    /// unpacking and loading as they go.
     pub fn set_piano_library_reporting(
         &self,
         track: TrackId,
         name: &str,
+        layers: Option<u8>,
         download: bool,
         origin: Origin,
-        progress: &mut dyn FnMut(u64, u64),
+        progress: &mut dyn FnMut(Stage, u64, u64),
     ) -> Result<LibrarySet, SessionError> {
         let info = known(name)?;
         if info.kind != InstrumentType::Piano {
@@ -219,13 +260,19 @@ impl Session {
             }
             instruments.install(info, progress)?;
         }
+        if layers == Some(0) {
+            return Err(SessionError::Invalid(
+                "a piano needs at least one velocity layer".into(),
+            ));
+        }
         // The built-in piano is what a slot without a library plays.
-        let reference = (!info.is_bundled()).then(|| info.reference());
+        let reference = (!info.is_bundled()).then(|| info.reference_with(layers));
+        let layers = reference.as_ref().and_then(|r| r.layers);
         let key = reference.as_ref().map(LibraryRef::key).unwrap_or_default();
         let cached = lock(&self.inner.state).libraries.get(&key).cloned();
         let lib = match cached {
             Some(lib) => lib,
-            None => Arc::new(instruments.load(info)?),
+            None => Arc::new(instruments.load_with(info, layers, progress)?),
         };
 
         let mut st = lock(&self.inner.state);
@@ -285,13 +332,20 @@ fn known(name: &str) -> Result<&'static InstrumentInfo, SessionError> {
     })
 }
 
-fn load_in_background(inner: Weak<Inner>, key: String, reference: Option<LibraryRef>) {
+fn load_in_background(
+    inner: Weak<Inner>,
+    key: String,
+    reference: Option<LibraryRef>,
+    progress: &LoadProgress,
+) {
     let Some(strong) = inner.upgrade() else {
         return;
     };
     let instruments = lock(&strong.instruments).clone();
     drop(strong);
-    let result = instruments.load_ref(reference.as_ref());
+    let result = instruments.load_ref_with(reference.as_ref(), &mut |_, done, total| {
+        progress.set(done, total);
+    });
     let Some(inner) = inner.upgrade() else {
         return;
     };
@@ -312,5 +366,37 @@ fn load_in_background(inner: Weak<Inner>, key: String, reference: Option<Library
             st.failed.insert(key, e.to_string());
             session.publish(&mut st, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sky_model::Track;
+    use sky_model::templates::empty_project;
+
+    use super::*;
+
+    #[test]
+    fn libraries_no_piano_plays_are_let_go() {
+        let mut project = empty_project("Free");
+        let piano = Track::new_instrument("Piano", InstrumentType::Piano);
+        let id = piano.id;
+        project.tracks.push(piano);
+        let session = Session::new(project, None).0;
+        session.load_libraries().unwrap();
+        let cached = || lock(&session.inner.state).libraries.len();
+        assert_eq!(cached(), 1);
+        session
+            .apply(Transaction::user(
+                "Delete",
+                vec![Command::RemoveTrack { id }],
+            ))
+            .unwrap();
+        assert_eq!(cached(), 0);
+        // Undoing brings the piano back, and its library with it.
+        session.undo().unwrap();
+        session.load_libraries().unwrap();
+        assert_eq!(cached(), 1);
+        assert!(session.track_library(id).is_some());
     }
 }

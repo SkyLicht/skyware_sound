@@ -4,8 +4,7 @@
 //! map of the keys and velocity layers its recordings cover that plays
 //! like a keyboard and lights the keys that sound, and the pedal light.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use egui::text::LayoutJob;
@@ -19,7 +18,7 @@ use sky_dsp::curves;
 use sky_dsp::instruments::sampled::Trigger;
 use sky_dsp::instruments::{PIANO_UNDAMPED_FROM, SampleLibrary};
 use sky_dsp::{InstrumentType, SUSTAIN_PEDAL};
-use sky_library::{DEFAULT_PIANO, InstrumentInfo, InstrumentSource, find_instrument};
+use sky_library::{DEFAULT_PIANO, InstrumentInfo, InstrumentSource, Stage, find_instrument};
 use sky_model::{InstrumentSlot, License, Origin, Track};
 use sky_session::{LibrarySet, SessionError};
 
@@ -40,30 +39,30 @@ const STRIP_H: f32 = 36.0;
 /// How far down a key its black part reaches.
 const BLACK_DEPTH: f32 = 0.6;
 
-/// A library being downloaded, for its progress bar.
+/// A library being downloaded and loaded for a track, for its progress
+/// bar.
 pub struct Download {
     pub track: TrackId,
     pub name: &'static str,
-    pub done: Arc<AtomicU64>,
-    pub total: Arc<AtomicU64>,
+    /// What it is busy with, how far it got and the total.
+    pub progress: Arc<Mutex<(Stage, u64, u64)>>,
 }
 
 impl Download {
-    fn new(track: TrackId, info: &'static InstrumentInfo) -> Self {
+    fn new(track: TrackId, info: &'static InstrumentInfo, installed: bool) -> Self {
+        let start = match download_bytes(info) {
+            Some(bytes) if !installed => (Stage::Download, 0, bytes),
+            _ => (Stage::Load, 0, 0),
+        };
         Self {
             track,
             name: info.name,
-            done: Arc::new(AtomicU64::new(0)),
-            total: Arc::new(AtomicU64::new(download_bytes(info).unwrap_or(0))),
+            progress: Arc::new(Mutex::new(start)),
         }
     }
 
-    /// The bytes received and the total.
-    pub fn progress(&self) -> (u64, u64) {
-        (
-            self.done.load(Ordering::Relaxed),
-            self.total.load(Ordering::Relaxed),
-        )
+    pub fn progress(&self) -> (Stage, u64, u64) {
+        self.progress.lock().map_or((Stage::Load, 0, 0), |p| *p)
     }
 }
 
@@ -71,8 +70,41 @@ impl Download {
 fn download_bytes(info: &InstrumentInfo) -> Option<u64> {
     match info.source {
         InstrumentSource::Download { bytes, .. } => Some(bytes),
+        InstrumentSource::Files { files, .. } => Some(files.iter().map(|f| f.1).sum()),
         InstrumentSource::Bundled { .. } => None,
     }
+}
+
+/// What a library's progress bar says, and how full it is.
+fn progress_text(name: &str, (stage, done, total): (Stage, u64, u64)) -> (String, f32) {
+    let frac = if total > 0 {
+        (done as f64 / total as f64).min(1.0) as f32
+    } else {
+        0.0
+    };
+    let text = match stage {
+        Stage::Download => format!(
+            "Downloading {name}: {:.1} of {:.1} MB",
+            done as f64 / 1e6,
+            total as f64 / 1e6
+        ),
+        Stage::Unpack => format!("Unpacking {name}: {:.0}%", frac * 100.0),
+        Stage::Load if total == 0 => format!("Loading {name}…"),
+        Stage::Load => format!("Loading {name}: {done} of {total} recordings"),
+    };
+    (text, frac)
+}
+
+/// A library's progress bar.
+fn progress_bar(ui: &mut Ui, name: &str, progress: (Stage, u64, u64)) {
+    let (text, frac) = progress_text(name, progress);
+    ui.add(
+        ProgressBar::new(frac)
+            .desired_width(360.0)
+            .desired_height(16.0)
+            .text(text),
+    );
+    ui.ctx().request_repaint_after(Duration::from_millis(100));
 }
 
 /// The status bar label while a track's piano is being changed.
@@ -195,7 +227,8 @@ pub fn library_row(app: &mut App, ui: &mut Ui, track: TrackId, slot: &Instrument
         .busy_labels()
         .any(|l| l.starts_with("Getting the ") && l.ends_with(" piano"));
     let loaded = app.session.track_library(track);
-    let mut chosen = None;
+    // A library, and how many velocity layers of it to load.
+    let mut chosen: Option<(&'static InstrumentInfo, Option<u8>)> = None;
     ui.horizontal(|ui| {
         ui.label("Piano");
         ui.add_enabled_ui(!busy, |ui| {
@@ -225,11 +258,39 @@ pub fn library_row(app: &mut App, ui: &mut Ui, track: TrackId, slot: &Instrument
                             // computer does not have it yet.
                             && (info.id != current || loaded.is_none())
                         {
-                            chosen = Some(info);
+                            chosen = Some((info, None));
                         }
                     }
                 });
         });
+        if let Some(info) = info.filter(|i| i.layer_choices().len() > 1) {
+            let now = slot
+                .library
+                .as_ref()
+                .and_then(|l| l.layers)
+                .unwrap_or(info.layers);
+            ui.add_enabled_ui(!busy, |ui| {
+                ComboBox::from_id_salt(("piano_layers", track))
+                    .selected_text(format!("{now} layers"))
+                    .show_ui(ui, |ui| {
+                        for n in info.layer_choices() {
+                            let text = format!(
+                                "{n} layers · about {:.0} MB",
+                                info.memory_with(Some(n)) as f64 / 1e6
+                            );
+                            if ui.selectable_label(n == now, text).clicked() && n != now {
+                                chosen = Some((info, Some(n)));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "How many velocity layers to load. Fewer take less memory and load \
+                         faster; the loudest is always kept, and the others play the \
+                         velocities in between.",
+                    );
+            });
+        }
         license_badge(ui, license, credit.as_deref());
         if let Some(info) = info {
             ui.hyperlink_to(RichText::new("Homepage").small(), info.homepage)
@@ -237,25 +298,12 @@ pub fn library_row(app: &mut App, ui: &mut Ui, track: TrackId, slot: &Instrument
         }
     });
     let download = app.devices.download.as_ref().filter(|d| d.track == track);
+    let loading = app.session.track_library_loading(track);
     if let Some(d) = download {
-        let (done, total) = d.progress();
-        let frac = if total > 0 {
-            done as f32 / total as f32
-        } else {
-            0.0
-        };
-        ui.add(
-            ProgressBar::new(frac)
-                .desired_width(360.0)
-                .desired_height(16.0)
-                .text(format!(
-                    "Downloading {}: {:.1} of {:.1} MB",
-                    d.name,
-                    done as f64 / 1e6,
-                    total as f64 / 1e6
-                )),
-        );
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        progress_bar(ui, d.name, d.progress());
+    } else if let (None, Some((done, total))) = (&loaded, loading) {
+        // Opening a project loads its pianos in the background.
+        progress_bar(ui, &current_name, (Stage::Load, done, total));
     } else {
         let line = match &loaded {
             _ if busy => "Getting the new piano…".to_string(),
@@ -273,21 +321,30 @@ pub fn library_row(app: &mut App, ui: &mut Ui, track: TrackId, slot: &Instrument
         };
         ui.label(RichText::new(line).small().color(theme::TEXT_DIM));
     }
-    if let Some(info) = chosen {
-        let download = Download::new(track, info);
-        let (done, total) = (download.done.clone(), download.total.clone());
-        app.devices.download = (!app.session.instruments().is_installed(info)).then_some(download);
+    if let Some((info, layers)) = chosen {
+        let installed = app.session.instruments().is_installed(info);
+        let download = Download::new(track, info, installed);
+        let shared = download.progress.clone();
+        app.devices.download = Some(download);
         let session = app.session.clone();
         let id = info.id;
         app.jobs
             .spawn(ui.ctx(), Some(job_label(info.name)), move || {
-                let mut progress = |d: u64, t: u64| {
-                    done.store(d, Ordering::Relaxed);
-                    total.store(t, Ordering::Relaxed);
+                let mut progress = |stage: Stage, done: u64, total: u64| {
+                    if let Ok(mut p) = shared.lock() {
+                        *p = (stage, done, total);
+                    }
                 };
                 JobOutput::PianoLibrary(
                     session
-                        .set_piano_library_reporting(track, id, true, Origin::User, &mut progress)
+                        .set_piano_library_reporting(
+                            track,
+                            id,
+                            layers,
+                            true,
+                            Origin::User,
+                            &mut progress,
+                        )
                         .map_err(|e| e.to_string()),
                 )
             });
@@ -454,8 +511,13 @@ pub fn key_map(app: &mut App, ui: &mut Ui, track: &Track, slot: &InstrumentSlot)
         }
         None => {
             let text = match app.session.track_library_error(track.id) {
-                Some(_) => "The recordings are not loaded",
-                None => "Loading the recordings…",
+                Some(_) => "The recordings are not loaded".to_string(),
+                None => match app.session.track_library_loading(track.id) {
+                    Some((done, total)) if total > 0 => {
+                        format!("Loading the recordings: {done} of {total}…")
+                    }
+                    _ => "Loading the recordings…".to_string(),
+                },
             };
             painter.text(
                 map.center(),
