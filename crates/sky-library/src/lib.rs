@@ -27,10 +27,11 @@ pub mod packs;
 pub mod samples;
 pub mod sfz;
 mod steinway_b;
+mod strudel_piano;
 
 pub use instruments::{
     DEFAULT_PIANO, INSTRUMENTS, InstrumentInfo, InstrumentSource, InstrumentStatus, Instruments,
-    Stage, find_instrument,
+    STRUDEL_PIANO, Stage, find_instrument,
 };
 pub use map::{MapFile, SampleMap, expand_github};
 pub use packs::{PACKS, PackInfo};

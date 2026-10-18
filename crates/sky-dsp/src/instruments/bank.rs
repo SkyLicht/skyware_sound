@@ -6,12 +6,14 @@
 //! track. Pattern sounds start a sample directly with
 //! [`Instrument::sound_on`]; MIDI notes go through the map's keys, which
 //! hold either the drum sounds on their General MIDI notes or one pitched
-//! sound spread across the keyboard.
+//! sound spread across the keyboard. Voices play as the multi-sample
+//! engine's do (see [`voice`](super::voice)).
 
 use std::sync::Arc;
 
 use crate::AudioData;
-use crate::instruments::{Adsr, Instrument};
+use crate::instruments::Instrument;
+use crate::instruments::voice::{self, Voice};
 use crate::params::ParamSpec;
 use crate::util::db_to_gain;
 
@@ -23,7 +25,9 @@ pub(crate) const BANK_PARAMS: &[ParamSpec] = &[
     ParamSpec::linear("gain", "Gain", -60.0, 12.0, 0.0, "dB"),
 ];
 
+/// Voices that may sound at once.
 const VOICES: usize = 32;
+const SLOTS: usize = voice::slots(VOICES);
 /// The key of a voice started by a pattern sound rather than a note.
 const NO_KEY: u8 = u8::MAX;
 
@@ -57,31 +61,6 @@ impl BankMap {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Voice {
-    sample: u32,
-    key: u8,
-    pos: f64,
-    rate: f64,
-    velocity: f32,
-    age: u64,
-    env: Adsr,
-}
-
-impl Default for Voice {
-    fn default() -> Self {
-        Self {
-            sample: 0,
-            key: NO_KEY,
-            pos: 0.0,
-            rate: 1.0,
-            velocity: 0.0,
-            age: 0,
-            env: Adsr::default(),
-        }
-    }
-}
-
 pub struct Bank {
     sample_rate: f32,
     map: Arc<BankMap>,
@@ -90,7 +69,7 @@ pub struct Bank {
     release: f32,
     one_shot: bool,
     gain: f32,
-    voices: [Voice; VOICES],
+    voices: [Voice; SLOTS],
     clock: u64,
 }
 
@@ -104,7 +83,7 @@ impl Bank {
             release: 100.0,
             one_shot: true,
             gain: 1.0,
-            voices: [Voice::default(); VOICES],
+            voices: [Voice::default(); SLOTS],
             clock: 0,
         }
     }
@@ -113,30 +92,15 @@ impl Bank {
         let Some(data) = self.map.samples.get(sample as usize) else {
             return;
         };
-        let i = self
-            .voices
-            .iter()
-            .position(|v| !v.env.is_active())
-            .unwrap_or_else(|| {
-                self.voices
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, v)| v.age)
-                    .map_or(0, |(i, _)| i)
-            });
+        let i = voice::free_slot(&mut self.voices, VOICES, self.sample_rate);
         self.clock += 1;
         let shift = f64::from(semitones + self.tune) / 12.0;
         let rate = 2f64.powf(shift) * f64::from(data.sample_rate) / f64::from(self.sample_rate);
+        let velocity = f32::from(velocity) / 127.0;
         let v = &mut self.voices[i];
-        v.sample = sample;
-        v.key = key;
-        v.pos = 0.0;
-        v.rate = rate;
-        v.velocity = f32::from(velocity) / 127.0;
-        v.age = self.clock;
+        *v = Voice::new(sample, key, 0.0, rate, velocity, self.clock);
         v.env
             .set(self.attack, 1.0, 1.0, self.release, self.sample_rate);
-        v.env.trigger();
     }
 }
 
@@ -189,25 +153,9 @@ impl Instrument for Bank {
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         let map = &self.map;
         for v in self.voices.iter_mut().filter(|v| v.env.is_active()) {
-            let Some(data) = map.samples.get(v.sample as usize) else {
-                v.env.reset();
-                continue;
-            };
-            let (src_l, src_r) = (data.left(), data.right());
-            let len = src_l.len().min(src_r.len());
-            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-                let i = v.pos as usize;
-                if i + 1 >= len {
-                    v.env.reset();
-                    break;
-                }
-                let frac = (v.pos - i as f64) as f32;
-                let sl = src_l[i] + (src_l[i + 1] - src_l[i]) * frac;
-                let sr = src_r[i] + (src_r[i + 1] - src_r[i]) * frac;
-                let g = v.env.tick() * v.velocity * self.gain;
-                *l += sl * g;
-                *r += sr * g;
-                v.pos += v.rate;
+            match map.samples.get(v.sample as usize) {
+                Some(data) => v.render(data, data.frames(), self.gain, left, right),
+                None => v.env.reset(),
             }
         }
     }
@@ -320,5 +268,45 @@ mod tests {
         assert_sounding(&render(&mut b, 64), 64);
         let mut c = Bank::new(48_000.0, Arc::new(BankMap::default()));
         assert!(!c.adopt(&mut b));
+    }
+
+    #[test]
+    fn a_stolen_voice_fades_instead_of_clicking() {
+        // A sample that rises from silence to a steady level over its
+        // first millisecond, on every key.
+        let steady = Arc::new(AudioData {
+            sample_rate: 48_000,
+            channels: vec![
+                (0..48_000)
+                    .map(|i| (i as f32 / 48.0).min(1.0) * 0.5)
+                    .collect(),
+            ],
+        });
+        let zone = Some(KeyZone {
+            sample: 0,
+            semitones: 0.0,
+        });
+        let map = Arc::new(BankMap {
+            samples: vec![steady],
+            keys: vec![zone; 128],
+        });
+        let mut bank = Bank::new(48_000.0, map);
+        for key in 0..VOICES as u8 {
+            bank.note_on(key, 100);
+        }
+        let before = render(&mut bank, 256);
+        bank.note_on(100, 100);
+        let after = render(&mut bank, 1_024);
+        // Started again from the top, the oldest note would drop from its
+        // level to silence in one step.
+        let level = 0.5 * 100.0 / 127.0;
+        let biggest = std::iter::once(after[0] - before[255])
+            .chain(after.windows(2).map(|w| w[1] - w[0]))
+            .fold(0.0f32, |m, d| m.max(d.abs()));
+        assert!(biggest < level / 10.0, "a step of {biggest}");
+        // It is gone once faded, and the new note sounds in its place.
+        let sounding = bank.voices.iter().filter(|v| v.env.is_active()).count();
+        assert_eq!(sounding, VOICES);
+        assert!((after[1_000] - before[255]).abs() < 1e-3);
     }
 }

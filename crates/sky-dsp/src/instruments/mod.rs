@@ -17,6 +17,7 @@ mod piano;
 pub mod sampled;
 mod sampler;
 mod synth;
+mod voice;
 
 pub use acid::{ACCENT_THRESHOLD, Acid, ENV_OCTAVES as ACID_ENV_OCTAVES};
 pub use bank::{Bank, BankMap, KeyZone};

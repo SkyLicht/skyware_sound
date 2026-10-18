@@ -322,32 +322,7 @@ pub fn library_row(app: &mut App, ui: &mut Ui, track: TrackId, slot: &Instrument
         ui.label(RichText::new(line).small().color(theme::TEXT_DIM));
     }
     if let Some((info, layers)) = chosen {
-        let installed = app.session.instruments().is_installed(info);
-        let download = Download::new(track, info, installed);
-        let shared = download.progress.clone();
-        app.devices.download = Some(download);
-        let session = app.session.clone();
-        let id = info.id;
-        app.jobs
-            .spawn(ui.ctx(), Some(job_label(info.name)), move || {
-                let mut progress = |stage: Stage, done: u64, total: u64| {
-                    if let Ok(mut p) = shared.lock() {
-                        *p = (stage, done, total);
-                    }
-                };
-                JobOutput::PianoLibrary(
-                    session
-                        .set_piano_library_reporting(
-                            track,
-                            id,
-                            layers,
-                            true,
-                            Origin::User,
-                            &mut progress,
-                        )
-                        .map_err(|e| e.to_string()),
-                )
-            });
+        app.get_piano_library(ui.ctx(), track, info, layers);
     }
 }
 
@@ -732,6 +707,44 @@ fn pedal_light(app: &mut App, ui: &mut Ui, rect: Rect, track: TrackId, down: boo
 }
 
 impl App {
+    /// Has `track` play the piano `info` with at most `layers` velocity
+    /// layers (all for `None`), in the background: downloaded first when
+    /// this computer does not have it, with progress on the track's library
+    /// row.
+    pub fn get_piano_library(
+        &mut self,
+        ctx: &egui::Context,
+        track: TrackId,
+        info: &'static InstrumentInfo,
+        layers: Option<u8>,
+    ) {
+        let installed = self.session.instruments().is_installed(info);
+        let download = Download::new(track, info, installed);
+        let shared = download.progress.clone();
+        self.devices.download = Some(download);
+        let session = self.session.clone();
+        let id = info.id;
+        self.jobs.spawn(ctx, Some(job_label(info.name)), move || {
+            let mut progress = |stage: Stage, done: u64, total: u64| {
+                if let Ok(mut p) = shared.lock() {
+                    *p = (stage, done, total);
+                }
+            };
+            JobOutput::PianoLibrary(
+                session
+                    .set_piano_library_reporting(
+                        track,
+                        id,
+                        layers,
+                        true,
+                        Origin::User,
+                        &mut progress,
+                    )
+                    .map_err(|e| e.to_string()),
+            )
+        });
+    }
+
     /// A track's piano changed, or could not.
     pub fn piano_library_set(&mut self, result: Result<LibrarySet, String>) {
         self.devices.download = None;

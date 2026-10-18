@@ -1,0 +1,36 @@
+// Strudel's piano pack: the `piano` sound of felixroos/dough-samples'
+// piano.json: the Salamander Grand Piano's eighth of 16 velocity layers
+// as MP3s, one recording every three semitones (none for D#5).
+// As one velocity layer, each key plays the recording nearest its note,
+// the lower one where two are as near, as Strudel and the sample bank do.
+
+<group> ampeg_release=0.6
+<region> sample=A0v8.mp3 pitch_keycenter=21 lokey=21 hikey=22
+<region> sample=C1v8.mp3 pitch_keycenter=24 lokey=23 hikey=25
+<region> sample=Ds1v8.mp3 pitch_keycenter=27 lokey=26 hikey=28
+<region> sample=Fs1v8.mp3 pitch_keycenter=30 lokey=29 hikey=31
+<region> sample=A1v8.mp3 pitch_keycenter=33 lokey=32 hikey=34
+<region> sample=C2v8.mp3 pitch_keycenter=36 lokey=35 hikey=37
+<region> sample=Ds2v8.mp3 pitch_keycenter=39 lokey=38 hikey=40
+<region> sample=Fs2v8.mp3 pitch_keycenter=42 lokey=41 hikey=43
+<region> sample=A2v8.mp3 pitch_keycenter=45 lokey=44 hikey=46
+<region> sample=C3v8.mp3 pitch_keycenter=48 lokey=47 hikey=49
+<region> sample=Ds3v8.mp3 pitch_keycenter=51 lokey=50 hikey=52
+<region> sample=Fs3v8.mp3 pitch_keycenter=54 lokey=53 hikey=55
+<region> sample=A3v8.mp3 pitch_keycenter=57 lokey=56 hikey=58
+<region> sample=C4v8.mp3 pitch_keycenter=60 lokey=59 hikey=61
+<region> sample=Ds4v8.mp3 pitch_keycenter=63 lokey=62 hikey=64
+<region> sample=Fs4v8.mp3 pitch_keycenter=66 lokey=65 hikey=67
+<region> sample=A4v8.mp3 pitch_keycenter=69 lokey=68 hikey=70
+<region> sample=C5v8.mp3 pitch_keycenter=72 lokey=71 hikey=75
+<region> sample=Fs5v8.mp3 pitch_keycenter=78 lokey=76 hikey=79
+<region> sample=A5v8.mp3 pitch_keycenter=81 lokey=80 hikey=82
+<region> sample=C6v8.mp3 pitch_keycenter=84 lokey=83 hikey=85
+<region> sample=Ds6v8.mp3 pitch_keycenter=87 lokey=86 hikey=88
+<region> sample=Fs6v8.mp3 pitch_keycenter=90 lokey=89 hikey=91
+<region> sample=A6v8.mp3 pitch_keycenter=93 lokey=92 hikey=94
+<region> sample=C7v8.mp3 pitch_keycenter=96 lokey=95 hikey=97
+<region> sample=Ds7v8.mp3 pitch_keycenter=99 lokey=98 hikey=100
+<region> sample=Fs7v8.mp3 pitch_keycenter=102 lokey=101 hikey=103
+<region> sample=A7v8.mp3 pitch_keycenter=105 lokey=104 hikey=106
+<region> sample=C8v8.mp3 pitch_keycenter=108 lokey=107 hikey=108

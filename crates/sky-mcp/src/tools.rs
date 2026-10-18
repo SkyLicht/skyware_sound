@@ -104,7 +104,9 @@ licenses.\n\
 The piano (instrument piano) plays a recorded piano with velocity layers and \
 release sounds. It starts with a small built-in upright; instrument_libraries \
 lists the others and piano_library switches a track to one, downloading it \
-once. Libraries live outside the project, which names the one it needs. Its \
+once; strudel-piano is Strudel's piano pack, for note(...).s(\"piano\") lines \
+played with a pedal and release. Libraries live outside the project, which \
+names the one it needs. Its \
 sustain pedal holds notes after they end: give a MIDI clip pedal stretches in \
 beats from the clip start (pedal \"0-3.75, 4-8\" in clip_create or \
 notes_write); stretches that touch join, so leave a gap where the harmony \
