@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use num_rational::Rational64;
 use sky_core::{AudioId, EffectId, TempoMap, Ticks, TrackId};
-use sky_dsp::instruments::{BankMap, KeyZone};
+use sky_dsp::instruments::{BankMap, KeyZone, SampleLibrary};
 use sky_dsp::util::db_to_gain;
 use sky_dsp::{
     AudioData, Effect, Instrument, InstrumentAudio, InstrumentType, MAX_BLOCK, ParamSpec,
@@ -20,6 +20,10 @@ use sky_pattern::{Control as Code, Controls, Event, Pattern, Time, Value};
 
 /// Decoded audio-pool files, shared between snapshots.
 pub type AudioCache = HashMap<AudioId, Arc<AudioData>>;
+
+/// Loaded instrument libraries, shared between snapshots and tracks, by
+/// [`InstrumentSlot::library_key`].
+pub type LibraryCache = HashMap<String, Arc<SampleLibrary>>;
 
 /// A note with its end, both in samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -659,11 +663,13 @@ fn rational_ticks(cycles: Rational64, cycle: Ticks) -> Ticks {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn track_node(
     project: &Project,
     track: &Track,
     index: usize,
     audio: &AudioCache,
+    libraries: &LibraryCache,
     sr: u32,
     any_solo: bool,
     cx: &EffectContext,
@@ -788,6 +794,11 @@ fn track_node(
             let instrument = slot.map(|slot| {
                 let input = match (slot.kind, bank) {
                     (InstrumentType::Bank, Some(bank)) => InstrumentAudio::Bank(Arc::new(bank.map)),
+                    // A piano whose library is still loading stays silent.
+                    (InstrumentType::Piano, _) => libraries
+                        .get(&slot.library_key())
+                        .cloned()
+                        .map_or(InstrumentAudio::None, InstrumentAudio::Library),
                     _ => slot
                         .sample
                         .and_then(|id| audio.get(&id).cloned())
@@ -817,10 +828,23 @@ fn track_node(
     }
 }
 
-/// Builds a snapshot of `project` for an engine running at `sample_rate`.
+/// Builds a snapshot of `project` for an engine running at `sample_rate`,
+/// with no instrument libraries: pianos stay silent.
 pub fn compile(
     project: &Project,
     audio: &AudioCache,
+    sample_rate: u32,
+    version: u64,
+) -> EngineSnapshot {
+    compile_with(project, audio, &LibraryCache::new(), sample_rate, version)
+}
+
+/// Builds a snapshot of `project` for an engine running at `sample_rate`,
+/// playing pianos from `libraries`.
+pub fn compile_with(
+    project: &Project,
+    audio: &AudioCache,
+    libraries: &LibraryCache,
     sample_rate: u32,
     version: u64,
 ) -> EngineSnapshot {
@@ -840,7 +864,7 @@ pub fn compile(
         .tracks
         .iter()
         .enumerate()
-        .map(|(i, t)| track_node(project, t, i, audio, sample_rate, any_solo, &cx))
+        .map(|(i, t)| track_node(project, t, i, audio, libraries, sample_rate, any_solo, &cx))
         .collect();
     let triggers = tracks.iter().map(|_| Triggers::default()).collect();
     let loop_range = project.loop_enabled.then(|| {

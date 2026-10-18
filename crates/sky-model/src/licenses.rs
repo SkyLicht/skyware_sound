@@ -30,17 +30,22 @@ fn push_once(list: &mut Vec<String>, line: String) {
     }
 }
 
-/// The pool audio an export of `project` can contain: what the audible
-/// tracks with clips play. Muted tracks, and tracks a solo silences, are
-/// left out, as they are from the render.
-pub fn audio_in_use(project: &Project) -> Vec<AudioId> {
+/// The tracks an export of `project` can hear: audible ones with clips.
+/// Muted tracks, and tracks a solo silences, are left out, as they are
+/// from the render.
+fn tracks_in_use(project: &Project) -> impl Iterator<Item = &Track> {
     let any_solo = project.any_solo();
-    let mut ids = Vec::new();
-    for t in &project.tracks {
+    project.tracks.iter().filter(move |t| {
         let audible = !t.channel.mute && (!any_solo || t.channel.solo);
-        if !audible || t.clips.is_empty() {
-            continue;
-        }
+        audible && !t.clips.is_empty()
+    })
+}
+
+/// The pool audio an export of `project` can contain: what the audible
+/// tracks with clips play.
+pub fn audio_in_use(project: &Project) -> Vec<AudioId> {
+    let mut ids = Vec::new();
+    for t in tracks_in_use(project) {
         for c in &t.clips {
             if let ClipContent::Audio { source, .. } = c.content {
                 ids.push(source);
@@ -58,44 +63,69 @@ pub fn audio_in_use(project: &Project) -> Vec<AudioId> {
     ids
 }
 
-/// Credits and warnings for the pack audio an export of `project` uses.
-/// Audio imported from disk has no source and needs nothing.
+/// The instrument libraries an export of `project` plays. The built-in
+/// piano, which is CC0, is left out.
+pub fn libraries_in_use(project: &Project) -> Vec<&LibraryRef> {
+    let mut libraries: Vec<&LibraryRef> = Vec::new();
+    for t in tracks_in_use(project) {
+        if let Some(l) = t.instrument.as_ref().and_then(|s| s.library.as_ref())
+            && !libraries.contains(&l)
+        {
+            libraries.push(l);
+        }
+    }
+    libraries
+}
+
+/// Credits and warnings for the pack audio and instrument libraries an
+/// export of `project` uses. Audio imported from disk has no source and
+/// needs nothing.
 pub fn license_report(project: &Project) -> LicenseReport {
     let mut report = LicenseReport::default();
     for id in audio_in_use(project) {
         let Some(source) = project.pool_entry(id).ok().and_then(|e| e.source.as_ref()) else {
             continue;
         };
-        let pack = &source.pack;
-        let license = source.license;
-        if license == License::Unknown {
-            push_once(
-                &mut report.warnings,
-                format!(
-                    "{pack} does not state a license. Find out what its authors allow before \
-                     this audio ships in a game."
-                ),
-            );
-        }
-        if license.share_alike() {
-            push_once(
-                &mut report.warnings,
-                format!(
-                    "{pack} is {}: audio made with it must also be shared under {}.",
-                    license.label(),
-                    license.label()
-                ),
-            );
-        }
-        if license.needs_credit() {
-            let line = source
-                .credit
-                .clone()
-                .unwrap_or_else(|| format!("{pack} ({})", license.label()));
-            push_once(&mut report.credits, line);
-        }
+        note(
+            &mut report,
+            &source.pack,
+            source.license,
+            source.credit.as_ref(),
+        );
+    }
+    for l in libraries_in_use(project) {
+        note(&mut report, &l.name, l.license, l.credit.as_ref());
     }
     report
+}
+
+/// Adds what `license` asks of audio from `pack` to the report.
+fn note(report: &mut LicenseReport, pack: &str, license: License, credit: Option<&String>) {
+    if license == License::Unknown {
+        push_once(
+            &mut report.warnings,
+            format!(
+                "{pack} does not state a license. Find out what its authors allow before \
+                     this audio ships in a game."
+            ),
+        );
+    }
+    if license.share_alike() {
+        push_once(
+            &mut report.warnings,
+            format!(
+                "{pack} is {}: audio made with it must also be shared under {}.",
+                license.label(),
+                license.label()
+            ),
+        );
+    }
+    if license.needs_credit() {
+        let line = credit
+            .cloned()
+            .unwrap_or_else(|| format!("{pack} ({})", license.label()));
+        push_once(&mut report.credits, line);
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +220,40 @@ mod tests {
         p.tracks[1].channel.solo = true;
         // The solo silences the only track that uses the pack audio.
         p.tracks[1].instrument.as_mut().unwrap().bank = None;
+        assert!(license_report(&p).is_empty());
+    }
+
+    #[test]
+    fn piano_libraries_are_credited() {
+        let mut p = Project::new("Demo");
+        let mut piano = bank_track("Piano", &[]);
+        let slot = piano.instrument.as_mut().unwrap();
+        *slot = InstrumentSlot::new(InstrumentType::Piano);
+        p.tracks.push(piano.clone());
+        // The built-in piano is CC0 and owes nothing.
+        assert!(license_report(&p).is_empty());
+        let grand = LibraryRef {
+            id: "salamander".into(),
+            name: "Salamander Grand Piano".into(),
+            version: "3".into(),
+            sha256: None,
+            license: License::CcBy3,
+            credit: Some("Salamander Grand Piano by Alexander Holm (CC BY 3.0)".into()),
+        };
+        p.tracks[0].instrument.as_mut().unwrap().library = Some(grand.clone());
+        // A second track on the same library is credited once.
+        piano.instrument.as_mut().unwrap().library = Some(grand.clone());
+        p.tracks.push(piano);
+        assert_eq!(libraries_in_use(&p), [&grand]);
+        let r = license_report(&p);
+        assert_eq!(
+            r.credits,
+            ["Salamander Grand Piano by Alexander Holm (CC BY 3.0)"]
+        );
+        assert!(r.warnings.is_empty());
+        for t in &mut p.tracks {
+            t.channel.mute = true;
+        }
         assert!(license_report(&p).is_empty());
     }
 

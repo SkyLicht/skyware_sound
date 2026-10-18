@@ -74,7 +74,8 @@ pub fn instrument_view(
                 envelope_graph(ui, track, &mut e, &AR, "Envelope");
             }
             InstrumentType::Bank => envelope_graph(ui, track, &mut e, &AR, "Envelope"),
-            InstrumentType::Drums => {}
+            // The piano's editor comes with its own pictures later.
+            InstrumentType::Drums | InstrumentType::Piano => {}
         }
     });
     e.changes

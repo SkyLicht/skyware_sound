@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
-use sky_dsp::instruments::{BankMap, KeyZone};
+use sky_dsp::instruments::sampled::{LoopMode, Trigger};
+use sky_dsp::instruments::{BankMap, KeyZone, SampleData, SampleLibrary, Zone};
 use sky_dsp::{AudioData, EffectType, InstrumentAudio, InstrumentType};
 
 #[global_allocator]
@@ -25,11 +26,37 @@ fn processors_do_not_allocate() {
             })
             .collect(),
     });
+    // A looped layer, a one-shot layer and a release zone on every key.
+    let piano = Arc::new(SampleLibrary::new(
+        "test",
+        vec![
+            SampleData::from_audio(&sample),
+            SampleData::from_audio(&AudioData::silent(1, 4_800, 48_000)),
+        ],
+        vec![
+            Zone {
+                hivel: 80,
+                loop_mode: LoopMode::Continuous,
+                loop_start: 100,
+                loop_end: 9_000,
+                ..Zone::new(0, 60)
+            },
+            Zone {
+                lovel: 81,
+                ..Zone::new(1, 60)
+            },
+            Zone {
+                trigger: Trigger::Release,
+                ..Zone::new(1, 60)
+            },
+        ],
+    ));
     let mut instruments: Vec<_> = InstrumentType::ALL
         .iter()
         .map(|t| {
             let audio = match t {
                 InstrumentType::Bank => InstrumentAudio::Bank(bank.clone()),
+                InstrumentType::Piano => InstrumentAudio::Library(piano.clone()),
                 _ => InstrumentAudio::Sample(sample.clone()),
             };
             (t.params(), t.create(48_000.0, audio))
@@ -52,6 +79,11 @@ fn processors_do_not_allocate() {
                     }
                     for sound in 0..4 {
                         inst.sound_on(sound, 90);
+                    }
+                }
+                if block % 10 == 3 {
+                    for note in [36, 60] {
+                        inst.note_off(note);
                     }
                 }
                 if block % 10 == 5 {

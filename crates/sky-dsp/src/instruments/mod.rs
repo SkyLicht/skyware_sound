@@ -13,6 +13,8 @@ mod acid;
 mod bank;
 mod drums;
 mod envelope;
+mod piano;
+pub mod sampled;
 mod sampler;
 mod synth;
 
@@ -20,6 +22,8 @@ pub use acid::{ACCENT_THRESHOLD, Acid, ENV_OCTAVES as ACID_ENV_OCTAVES};
 pub use bank::{Bank, BankMap, KeyZone};
 pub use drums::DrumKit;
 pub use envelope::Adsr;
+pub use piano::Piano;
+pub use sampled::{SampleData, SampleLibrary, Zone};
 pub use sampler::Sampler;
 pub use synth::Synth;
 
@@ -76,6 +80,9 @@ pub enum InstrumentType {
     Bank,
     /// Monophonic acid bass line synth with accent and slide.
     Acid,
+    /// Sampled piano with velocity layers, played from an instrument
+    /// library.
+    Piano,
 }
 
 /// The audio an instrument plays.
@@ -87,15 +94,18 @@ pub enum InstrumentAudio {
     Sample(Arc<AudioData>),
     /// A sample bank's sounds and key map.
     Bank(Arc<BankMap>),
+    /// A multi-sampled instrument library, for the piano.
+    Library(Arc<SampleLibrary>),
 }
 
 impl InstrumentType {
-    pub const ALL: [InstrumentType; 5] = [
+    pub const ALL: [InstrumentType; 6] = [
         InstrumentType::Synth,
         InstrumentType::Acid,
         InstrumentType::Drums,
         InstrumentType::Sampler,
         InstrumentType::Bank,
+        InstrumentType::Piano,
     ];
 
     pub fn name(self) -> &'static str {
@@ -105,6 +115,7 @@ impl InstrumentType {
             InstrumentType::Sampler => "sampler",
             InstrumentType::Bank => "bank",
             InstrumentType::Acid => "acid",
+            InstrumentType::Piano => "piano",
         }
     }
 
@@ -115,6 +126,7 @@ impl InstrumentType {
             InstrumentType::Sampler => "Sampler",
             InstrumentType::Bank => "Sample bank",
             InstrumentType::Acid => "Acid bass",
+            InstrumentType::Piano => "Piano",
         }
     }
 
@@ -140,6 +152,11 @@ impl InstrumentType {
                  brighter sweep that builds over consecutive accents); a note that starts while \
                  another is held slides to it"
             }
+            InstrumentType::Piano => {
+                "Sampled piano from an instrument library (Upright Piano KW by default): velocity \
+                 picks the layer and the level through the velocity curve and dynamics, release \
+                 samples play on key up, and a mono library spreads across the stereo field by key"
+            }
         }
     }
 
@@ -156,12 +173,13 @@ impl InstrumentType {
             InstrumentType::Sampler => sampler::SAMPLER_PARAMS,
             InstrumentType::Bank => bank::BANK_PARAMS,
             InstrumentType::Acid => acid::ACID_PARAMS,
+            InstrumentType::Piano => piano::PIANO_PARAMS,
         }
     }
 
-    /// A new instance with default parameters. `audio` is what the sampler
-    /// or sample bank plays; other instruments ignore it, and each ignores
-    /// the other's kind of audio.
+    /// A new instance with default parameters. `audio` is what the sampler,
+    /// sample bank or piano plays; other instruments ignore it, and each
+    /// ignores the others' kinds of audio.
     pub fn create(self, sample_rate: f32, audio: InstrumentAudio) -> Box<dyn Instrument> {
         self.create_with(sample_rate, audio, std::iter::empty())
     }
@@ -185,6 +203,10 @@ impl InstrumentType {
                 Box::new(Bank::new(sample_rate, map))
             }
             (InstrumentType::Bank, _) => Box::new(Bank::new(sample_rate, Arc::default())),
+            (InstrumentType::Piano, InstrumentAudio::Library(library)) => {
+                Box::new(Piano::new(sample_rate, library))
+            }
+            (InstrumentType::Piano, _) => Box::new(Piano::new(sample_rate, Arc::default())),
         };
         for spec in self.params() {
             inst.set_param(spec.name, spec.default);
@@ -234,6 +256,7 @@ mod tests {
                     keys,
                 }))
             }
+            InstrumentType::Piano => InstrumentAudio::Library(sampled::tests::library()),
             _ => InstrumentAudio::None,
         }
     }

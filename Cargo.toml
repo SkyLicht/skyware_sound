@@ -95,6 +95,10 @@ tempfile = "3"
 directories = "6"
 # Downloads sound packs. Its default TLS is rustls with Mozilla's roots.
 ureq = "3.4"
+# Checks downloaded instrument libraries.
+sha2 = "0.10"
+# Unpacks instrument libraries published as .7z archives (LZMA2 only).
+sevenz-rust2 = { version = "0.20", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
