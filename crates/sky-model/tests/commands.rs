@@ -1040,6 +1040,7 @@ fn bank_of(sounds: &[(&str, &[sky_core::AudioId])]) -> SampleBank {
             })
             .collect(),
         pitched: None,
+        packs: Vec::new(),
     }
 }
 

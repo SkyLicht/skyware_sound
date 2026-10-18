@@ -73,12 +73,13 @@ impl LoadSoundsDialog {
         if let Some(p) = self.pack.and_then(|i| PACKS.get(i)) {
             return Some(PackSource::from(p));
         }
-        let text = self.address.trim();
+        // Strudel's samples('…') line, pasted, names its address.
+        let text = sky_library::samples::address_in(&self.address);
         if text.is_empty() {
             return None;
         }
-        let known = packs::find(text).is_some();
-        Some(PackSource::parse(text, (!known).then_some(self.license)))
+        let known = packs::find(&text).is_some();
+        Some(PackSource::parse(&text, (!known).then_some(self.license)))
     }
 
     /// The listing of the pack as chosen now, once read.
@@ -470,6 +471,14 @@ pub fn bank_panel(app: &mut App, ui: &mut Ui, track: TrackId, slot: &InstrumentS
                 app.open_load_sounds(Some(track));
             }
         });
+        if let Some(bank) = &slot.bank
+            && let Some(b) = linked_packs_ui(ui, bank)
+        {
+            let mut s = slot.clone();
+            s.bank = Some(b);
+            let r = actions::set_instrument(&app.session, track, s, "Unlink a pack");
+            app.report(r);
+        }
         return;
     };
     let mut next: Option<(SampleBank, &str)> = None;
@@ -518,6 +527,9 @@ pub fn bank_panel(app: &mut App, ui: &mut Ui, track: TrackId, slot: &InstrumentS
             next = Some((b, "Choose the sound notes play"));
         }
     });
+    if let Some(b) = linked_packs_ui(ui, bank) {
+        next = Some((b, "Unlink a pack"));
+    }
     for (pack, license, credit) in packs_of(&project, bank) {
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -606,6 +618,40 @@ pub fn bank_panel(app: &mut App, ui: &mut Ui, track: TrackId, slot: &InstrumentS
     } else if pattern {
         app.add_bank_pattern(track);
     }
+}
+
+/// The packs linked to a bank, each with a button that unlinks it. Returns
+/// the bank without the pack whose button was clicked.
+fn linked_packs_ui(ui: &mut Ui, bank: &SampleBank) -> Option<SampleBank> {
+    let mut unlink = None;
+    for (i, link) in bank.packs.iter().enumerate() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Linked").small().color(theme::TEXT_WEAK));
+            ui.label(RichText::new(&link.name).small().color(theme::TEXT))
+                .on_hover_text(format!(
+                    "{}\nA sound a pattern names that the bank lacks loads from here, as \
+                     samples('…') does in Strudel",
+                    link.map
+                ));
+            ui.label(
+                RichText::new(link.license.label())
+                    .small()
+                    .color(license_color(link.license)),
+            )
+            .on_hover_text(license_note(link.license));
+            if ui
+                .small_button("Unlink")
+                .on_hover_text("Patterns stop loading sounds from this pack; the sounds stay")
+                .clicked()
+            {
+                unlink = Some(i);
+            }
+        });
+    }
+    let i = unlink?;
+    let mut b = bank.clone();
+    b.packs.remove(i);
+    Some(b)
 }
 
 fn sound_chip(name: &str, files: usize) -> String {

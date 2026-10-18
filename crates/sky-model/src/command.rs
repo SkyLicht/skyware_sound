@@ -482,6 +482,10 @@ fn validate_instrument(project: &Project, slot: &InstrumentSlot) -> Result<(), M
 
 /// The longest sound name a bank accepts.
 const MAX_SOUND_NAME: usize = 64;
+/// The most packs a sample bank links.
+const MAX_PACK_LINKS: usize = 16;
+/// The longest address of a linked pack.
+const MAX_PACK_ADDRESS: usize = 2048;
 
 fn validate_bank(project: &Project, bank: &SampleBank) -> Result<(), ModelError> {
     for (name, samples) in &bank.sounds {
@@ -516,6 +520,19 @@ fn validate_bank(project: &Project, bank: &SampleBank) -> Result<(), ModelError>
         return Err(ModelError::InvalidValue(format!(
             "the bank has no sound {p:?} to play notes with"
         )));
+    }
+    if bank.packs.len() > MAX_PACK_LINKS {
+        return Err(ModelError::InvalidValue(format!(
+            "a bank links at most {MAX_PACK_LINKS} packs"
+        )));
+    }
+    for link in &bank.packs {
+        let map = link.map.trim();
+        if map.is_empty() || map.len() > MAX_PACK_ADDRESS || link.name.len() > MAX_PACK_ADDRESS {
+            return Err(ModelError::InvalidValue(format!(
+                "a linked pack needs an address of at most {MAX_PACK_ADDRESS} bytes"
+            )));
+        }
     }
     Ok(())
 }

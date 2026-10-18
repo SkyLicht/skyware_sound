@@ -117,6 +117,7 @@ fn bank_sounds_play_by_number() {
         )]
         .into(),
         pitched: None,
+        packs: Vec::new(),
     });
     let track = t.id;
     p.tracks.push(t);

@@ -13,10 +13,10 @@ use crate::game::GameSummary;
 use crate::loop_inspector::{Checked, Target};
 use crate::pictures;
 use crate::waveform::Peaks;
-use sky_core::AudioId;
+use sky_core::{AudioId, ClipId, Ticks};
 use sky_library::Pack;
 use sky_model::PictureImage;
-use sky_session::{BankLoaded, ImportedFiles, Placed};
+use sky_session::{BankLoaded, ImportedFiles, Placed, SoundsLoaded};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +53,17 @@ pub enum JobOutput {
         result: Result<Arc<Pack>, String>,
     },
     BankLoaded(Result<BankLoaded, String>),
+    /// What a pattern asked for, loaded with the pattern change.
+    PatternSounds {
+        clip: ClipId,
+        /// The text applied, `samples(...)` calls included.
+        text: String,
+        /// The pattern as it is now, without them.
+        source: String,
+        seed: u64,
+        cycle: Ticks,
+        result: Result<SoundsLoaded, String>,
+    },
     /// A sound pack's sample map, read for the browser.
     BrowserPack {
         map: String,
