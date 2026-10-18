@@ -32,6 +32,34 @@ impl Meter {
     }
 }
 
+/// The keys an instrument holds and whether its sustain pedal is down,
+/// for an editor to light them.
+#[derive(Default)]
+pub struct KeyTap {
+    low: AtomicU64,
+    high: AtomicU64,
+    pedal: AtomicBool,
+}
+
+impl KeyTap {
+    #[inline]
+    pub fn record(&self, keys: u128, pedal: bool) {
+        self.low.store(keys as u64, Ordering::Relaxed);
+        self.high.store((keys >> 64) as u64, Ordering::Relaxed);
+        self.pedal.store(pedal, Ordering::Relaxed);
+    }
+
+    /// The keys held, one bit per key from bit 0.
+    pub fn keys(&self) -> u128 {
+        u128::from(self.low.load(Ordering::Relaxed))
+            | u128::from(self.high.load(Ordering::Relaxed)) << 64
+    }
+
+    pub fn pedal(&self) -> bool {
+        self.pedal.load(Ordering::Relaxed)
+    }
+}
+
 /// Insert slots per channel whose gain reduction is metered.
 pub const REDUCTION_SLOTS: usize = 16;
 
@@ -141,6 +169,8 @@ pub struct EngineShared {
     /// K-weighted 100 ms blocks of the master, for loudness meters.
     pub loudness: LoudnessTap,
     pub tracks: Vec<Meter>,
+    /// Each track's held keys and pedal, by meter slot.
+    keys: Vec<KeyTap>,
     /// Gain reduction of each insert slot: [`REDUCTION_SLOTS`] per track
     /// meter slot, then the master's.
     reductions: Vec<Reduction>,
@@ -162,6 +192,7 @@ impl EngineShared {
             master_true_peak: Meter::default(),
             loudness: LoudnessTap::default(),
             tracks: (0..MAX_METERS).map(|_| Meter::default()).collect(),
+            keys: (0..MAX_METERS).map(|_| KeyTap::default()).collect(),
             reductions: (0..(MAX_METERS + 1) * REDUCTION_SLOTS)
                 .map(|_| Reduction::default())
                 .collect(),
@@ -187,6 +218,11 @@ impl EngineShared {
 
     pub fn track_meter(&self, index: usize) -> Option<&Meter> {
         self.tracks.get(index)
+    }
+
+    /// The keys and pedal of the track in meter slot `index`.
+    pub fn track_keys(&self, index: usize) -> Option<&KeyTap> {
+        self.keys.get(index)
     }
 
     /// The gain-reduction meters of a channel's insert slots, by effect

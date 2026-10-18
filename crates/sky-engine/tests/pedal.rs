@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use sky_core::{ClipId, PPQ, Ticks};
 use sky_dsp::instruments::{SampleData, SampleLibrary, Zone};
-use sky_dsp::{AudioData, InstrumentType};
+use sky_dsp::{AudioData, InstrumentType, SUSTAIN_PEDAL};
 use sky_engine::compile::SourceNode;
 use sky_engine::{AudioCache, EngineMsg, LibraryCache, compile_with, create_engine, render};
 use sky_model::*;
@@ -237,4 +237,54 @@ fn a_pattern_chord_rings_under_the_pedal() {
     let b = beats(out.left(), 8);
     assert!(b[2] > 0.05, "held in the first bar: {b:?}");
     assert!(b[6] < 1e-3, "let go in the second: {b:?}");
+}
+
+#[test]
+fn the_editor_sees_the_pedal_and_the_keys_it_holds() {
+    let p = chord(true);
+    let track = p.tracks[0].id;
+    let (mut handle, mut engine) =
+        create_engine(compile_with(&p, &AudioCache::new(), &libraries(), SR, 1));
+    let shared = handle.shared().clone();
+    let seen = || {
+        let tap = shared.track_keys(0).expect("a slot");
+        (tap.pedal(), tap.keys())
+    };
+    let mut play = |frames: usize| {
+        let (mut l, mut r) = (vec![0.0; frames], vec![0.0; frames]);
+        engine.process_planar(&mut l, &mut r);
+    };
+    let chord_keys = 1u128 << 60 | 1 << 64 | 1 << 67;
+    handle.send(EngineMsg::Play);
+    play(512);
+    assert_eq!(seen(), (true, chord_keys));
+    // The keys came up after a beat; the pedal holds them to beat 3.
+    play(BEAT * 2);
+    assert_eq!(seen(), (true, chord_keys));
+    play(BEAT);
+    assert_eq!(seen(), (false, 0));
+
+    // Stopped, the pedal can go down for keys played to hear them.
+    handle.send(EngineMsg::Stop);
+    handle.send(EngineMsg::Controller {
+        track,
+        controller: SUSTAIN_PEDAL,
+        value: 127,
+    });
+    handle.send(EngineMsg::NoteOn {
+        track,
+        pitch: 72,
+        velocity: 100,
+        frames: None,
+    });
+    handle.send(EngineMsg::NoteOff { track, pitch: 72 });
+    play(512);
+    assert_eq!(seen(), (true, 1 << 72));
+    handle.send(EngineMsg::Controller {
+        track,
+        controller: SUSTAIN_PEDAL,
+        value: 0,
+    });
+    play(512);
+    assert_eq!(seen(), (false, 0));
 }

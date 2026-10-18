@@ -600,6 +600,16 @@ impl SampleVoices {
         &self.library
     }
 
+    /// The keys down, and those the pedal holds, one bit per key.
+    pub fn held_keys(&self) -> u128 {
+        self.down
+            .iter()
+            .zip(&self.sustained)
+            .enumerate()
+            .filter(|(_, (down, held))| **down || **held)
+            .fold(0, |bits, (key, _)| bits | 1u128 << key)
+    }
+
     /// Voices sounding, not counting stolen ones fading out.
     pub fn active_voices(&self) -> usize {
         self.voices.iter().filter(|v| v.active && !v.stolen).count()
@@ -1223,9 +1233,11 @@ pub(crate) mod tests {
         assert!(held > 0.1, "{held}");
         assert_eq!((sounding(&v, 60), sounding(&v, 64)), (1, 1));
         assert_eq!(v.active_voices(), 2, "no release zone yet");
+        assert_eq!(v.held_keys(), 1 << 60 | 1 << 64, "the pedal holds them");
         // Pedal up: they stop and the release zones play.
         v.set_pedal(false, &NoteShape::default(), |_| quick);
         assert_eq!((sounding(&v, 60), sounding(&v, 64)), (0, 0));
+        assert_eq!(v.held_keys(), 0);
         let _ = render(&mut v, 480);
         assert_eq!(v.active_voices(), 2, "the two release zones");
         // A key still held when the pedal comes up goes on.
@@ -1234,13 +1246,16 @@ pub(crate) mod tests {
         v.set_pedal(false, &NoteShape::default(), |_| quick);
         let _ = render(&mut v, 480);
         assert_eq!(sounding(&v, 62), 1);
+        assert_eq!(v.held_keys(), 1 << 62, "down, not held by the pedal");
         v.note_off(62, &quick);
         let _ = render(&mut v, 480);
         assert_eq!(sounding(&v, 62), 0);
         // Stopping lifts the pedal.
         v.set_pedal(true, &NoteShape::default(), |_| quick);
+        v.note_on(67, 100, &NoteShape::default());
         v.release_all();
         assert!(!v.pedal());
+        assert_eq!(v.held_keys(), 0);
     }
 
     #[test]

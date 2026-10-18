@@ -297,10 +297,14 @@ pub fn instrument_panel(app: &mut App, ui: &mut Ui) {
             let r = actions::set_instrument(&app.session, track_id, fresh, "Reset instrument");
             app.report(r);
         }
-        ui.label(
-            RichText::new(slot.kind.description())
-                .small()
-                .color(theme::TEXT_DIM),
+        // Wrapped to the panel, so a long description cannot widen it.
+        ui.add(
+            egui::Label::new(
+                RichText::new(slot.kind.description())
+                    .small()
+                    .color(theme::TEXT_DIM),
+            )
+            .wrap(),
         );
     });
     if track.instrument.is_some() {
@@ -357,11 +361,13 @@ pub fn instrument_panel(app: &mut App, ui: &mut Ui) {
     if slot.kind == InstrumentType::Bank {
         crate::sounds::bank_panel(app, ui, track_id, &slot);
     }
+    ui.add_space(2.0);
     if slot.kind == InstrumentType::Piano {
         crate::piano::library_row(app, ui, track_id, &slot);
+        crate::piano::key_map(app, ui, track, &slot);
+    } else {
+        crate::audition::keyboard(app, ui, track);
     }
-    ui.add_space(2.0);
-    crate::audition::keyboard(app, ui, track);
     ui.separator();
 
     let specs = slot.kind.params();

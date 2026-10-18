@@ -40,6 +40,14 @@ pub enum EngineMsg {
         track: TrackId,
         pitch: u8,
     },
+    /// Moves a controller of a track's instrument now, such as the
+    /// sustain pedal while keys are played to hear them. Playback moves
+    /// the pedal again where a clip's pedal changes.
+    Controller {
+        track: TrackId,
+        controller: u8,
+        value: u8,
+    },
     /// Starts sound number `sound` of a track's sample bank as a one-shot.
     SoundOn {
         track: TrackId,
@@ -562,6 +570,15 @@ impl Engine {
                     }
                     self.set_live(track, pitch.min(127), None);
                 }
+                EngineMsg::Controller {
+                    track,
+                    controller,
+                    value,
+                } => {
+                    if let Some(inst) = instrument_of(&mut self.snapshot, track) {
+                        inst.controller(controller, value.min(127));
+                    }
+                }
                 EngineMsg::SoundOn {
                     track,
                     sound,
@@ -724,6 +741,15 @@ impl Engine {
             let (pl, pr) = apply_channel(&mut track.channel, k, bl, br, reductions);
             if let Some(m) = self.shared.track_meter(track.meter) {
                 m.record(pl, pr);
+            }
+            if let Some(tap) = self.shared.track_keys(track.meter) {
+                match &track.source {
+                    SourceNode::Instrument {
+                        instrument: Some(inst),
+                        ..
+                    } => tap.record(inst.held_keys(), inst.pedal_down()),
+                    _ => tap.record(0, false),
+                }
             }
             for ((m, s), (n, t)) in ml
                 .iter_mut()

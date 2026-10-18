@@ -125,6 +125,46 @@ pub fn decay_level(decay_ms: f32, t_ms: f32) -> f32 {
     (-SIXTY_DB * t_ms / decay_ms.max(1e-3)).exp()
 }
 
+/// The piano's velocity curve: velocity `velocity` (1 to 127) as played,
+/// as a share from 0 to 1 of how hard the note sounds. `curve` from -1
+/// to 1 bends it: above 0 soft playing sounds harder (a light touch),
+/// below 0 it takes more force (a heavy touch).
+pub fn piano_velocity(velocity: f32, curve: f32) -> f32 {
+    let v = velocity.clamp(1.0, 127.0) / 127.0;
+    v.powf(piano_power(curve))
+}
+
+/// The velocity to play (1 to 127) for a note to sound `heard` hard
+/// (0 to 1): [`piano_velocity`] the other way round.
+pub fn piano_velocity_for(heard: f32, curve: f32) -> f32 {
+    let v = heard.clamp(0.0, 1.0).powf(1.0 / piano_power(curve));
+    (v * 127.0).clamp(1.0, 127.0)
+}
+
+fn piano_power(curve: f32) -> f32 {
+    2f32.powf(-1.5 * curve.clamp(-1.0, 1.0))
+}
+
+/// The piano's level in dB for a note that sounds `heard` hard (0 to 1),
+/// spread over `dynamics` dB from the softest to the hardest.
+pub fn piano_level_db(heard: f32, dynamics: f32) -> f32 {
+    -dynamics.max(0.0) * (1.0 - heard.clamp(0.0, 1.0))
+}
+
+/// Where the piano's tone control turns over from lows to highs.
+pub const TILT_HZ: f32 = 700.0;
+
+/// The piano's tone control at `freq`, in dB: the lows down and the
+/// highs up by half of `tone_db` each, turning over around [`TILT_HZ`].
+/// This is the analog shape of the piano's one-pole tilt, which it
+/// follows to well within a dB below 10 kHz.
+pub fn tone_tilt_db(tone_db: f32, freq: f32) -> f32 {
+    let low = 10f32.powf(-0.5 * tone_db / 20.0);
+    let high = 10f32.powf(0.5 * tone_db / 20.0);
+    let x = (freq / TILT_HZ).powi(2);
+    10.0 * ((low * low + high * high * x) / (1.0 + x)).log10()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +266,34 @@ mod tests {
         let half = duck_gain(1.0, 0.75, 2.0, 0.0, 10.0, 5.0);
         assert!((half - (0.25 + 0.75 * 0.25)).abs() < 1e-6);
         assert_eq!(duck_gain(1.0, 1.0, 1.0, 2.0, 10.0, 1.0), 0.5);
+    }
+
+    #[test]
+    fn the_piano_curves_bend_and_turn_back() {
+        // A straight line at 0, softer above it and harder below.
+        assert!((piano_velocity(64.0, 0.0) - 64.0 / 127.0).abs() < 1e-6);
+        assert!(piano_velocity(64.0, 1.0) > piano_velocity(64.0, 0.0));
+        assert!(piano_velocity(64.0, -1.0) < piano_velocity(64.0, 0.0));
+        assert_eq!(piano_velocity(127.0, 0.7), 1.0);
+        for curve in [-1.0, -0.3, 0.0, 0.5, 1.0] {
+            for vel in [1.0, 20.0, 64.0, 100.0, 127.0] {
+                let back = piano_velocity_for(piano_velocity(vel, curve), curve);
+                assert!((back - vel).abs() < 0.01, "{curve} {vel}: {back}");
+            }
+        }
+        assert_eq!(piano_level_db(1.0, 30.0), 0.0);
+        assert_eq!(piano_level_db(0.5, 30.0), -15.0);
+        assert_eq!(piano_level_db(0.0, -5.0), 0.0);
+    }
+
+    #[test]
+    fn the_tone_tilt_turns_around_its_crossing() {
+        assert!(tone_tilt_db(0.0, 1_000.0).abs() < 1e-5);
+        assert!((tone_tilt_db(12.0, 20.0) + 6.0).abs() < 0.1);
+        assert!((tone_tilt_db(12.0, 20_000.0) - 6.0).abs() < 0.1);
+        let middle = tone_tilt_db(12.0, TILT_HZ);
+        assert!(middle > 0.0 && middle < 6.0, "{middle}");
+        assert!((tone_tilt_db(-8.0, 20_000.0) + 4.0).abs() < 0.1);
     }
 
     #[test]

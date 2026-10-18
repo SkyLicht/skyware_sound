@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pictures of the instruments for the Instrument tab: the envelopes as
 //! graphs to drag, the filter sweeps of the synth and the acid bass, the
-//! sampler's waveform with its start and end, and the drum kit as pads to
-//! play and pick. Their handles change the same parameters as the sliders
-//! under them.
+//! sampler's waveform with its start and end, the piano's velocity curve
+//! over its layers and its tone, and the drum kit as pads to play and
+//! pick. Their handles change the same parameters as the sliders under
+//! them.
 
 use std::collections::HashMap;
 use std::f32::consts::LN_2;
@@ -13,8 +14,10 @@ use egui::{
     WidgetInfo, WidgetType, pos2, vec2,
 };
 use sky_core::TrackId;
-use sky_dsp::curves::{self, SIXTY_DB};
-use sky_dsp::instruments::ACID_ENV_OCTAVES;
+use sky_core::music::note_name;
+use sky_dsp::curves::{self, SIXTY_DB, TILT_HZ};
+use sky_dsp::instruments::sampled::Trigger;
+use sky_dsp::instruments::{ACID_ENV_OCTAVES, SampleLibrary};
 use sky_dsp::{InstrumentType, ParamSpec};
 use sky_model::InstrumentSlot;
 
@@ -29,6 +32,8 @@ use crate::waveform::Peaks;
 pub struct DeviceState {
     /// The drum pad picked on each drum track, as an index into [`PADS`].
     pub pads: HashMap<TrackId, usize>,
+    /// A piano library being downloaded.
+    pub download: Option<crate::piano::Download>,
 }
 
 /// The size of an envelope or sweep graph.
@@ -59,6 +64,16 @@ pub fn instrument_view(
         }
         _ => None,
     };
+    let library = match slot.kind {
+        InstrumentType::Piano => app.session.track_library(track),
+        _ => None,
+    };
+    // The layers shown are those of the key last played, or middle C.
+    let key = app
+        .audition
+        .held
+        .filter(|(t, _)| *t == track)
+        .map_or(60, |(_, k)| k);
     let value_of = |name: &str| slot.param(name).unwrap_or(0.0);
     let mut e = Edits::new(slot.kind.params(), &mut app.gestures, &value_of);
     ui.horizontal_wrapped(|ui| {
@@ -74,8 +89,11 @@ pub fn instrument_view(
                 envelope_graph(ui, track, &mut e, &AR, "Envelope");
             }
             InstrumentType::Bank => envelope_graph(ui, track, &mut e, &AR, "Envelope"),
-            // The piano's editor comes with its own pictures later.
-            InstrumentType::Drums | InstrumentType::Piano => {}
+            InstrumentType::Piano => {
+                velocity_graph(ui, track, &mut e, library.as_deref(), key);
+                tone_graph(ui, track, &mut e);
+            }
+            InstrumentType::Drums => {}
         }
     });
     e.changes
@@ -123,6 +141,17 @@ fn title(plot: &Plot, painter: &egui::Painter, text: &str) {
     painter.text(
         pos2(plot.rect.right() - 5.0, plot.rect.top() + 3.0),
         Align2::RIGHT_TOP,
+        text,
+        FontId::proportional(11.0),
+        theme::TEXT_WEAK,
+    );
+}
+
+/// A graph's title starting at `x`, for curves that reach the top right.
+fn title_from(plot: &Plot, painter: &egui::Painter, x: f32, text: &str) {
+    painter.text(
+        pos2(x + 5.0, plot.rect.top() + 3.0),
+        Align2::LEFT_TOP,
         text,
         FontId::proportional(11.0),
         theme::TEXT_WEAK,
@@ -251,6 +280,158 @@ fn envelope_graph(ui: &mut Ui, track: TrackId, e: &mut Edits, names: &EnvParams,
                 "Attack {}   Release {}",
                 graph::ms_label(a),
                 graph::ms_label(r)
+            )
+        };
+        readout(ui, GRAPH.x, text);
+    });
+}
+
+/// The piano's velocity curve that the handle bends through.
+fn curve_through(velocity: f32, heard: f32) -> f32 {
+    let v = velocity.clamp(2.0, 126.0) / 127.0;
+    let p = heard.clamp(0.005, 0.995).ln() / v.ln();
+    -p.log2() / 1.5
+}
+
+/// How hard each velocity played sounds after the piano's curve, over
+/// the velocity layers of the recordings at `key`, with the level each
+/// sounds at on the left. The handle bends the curve.
+fn velocity_graph(
+    ui: &mut Ui,
+    track: TrackId,
+    e: &mut Edits,
+    lib: Option<&SampleLibrary>,
+    key: u8,
+) {
+    let curve = e.get("vel_curve");
+    let dynamics = e.get("dynamics");
+    let mut layers: Vec<(u8, u8)> = lib
+        .map(|l| {
+            l.zones()
+                .iter()
+                .filter(|z| z.trigger == Trigger::Attack && (z.lokey..=z.hikey).contains(&key))
+                .map(|z| (z.lovel, z.hivel))
+                .collect()
+        })
+        .unwrap_or_default();
+    layers.sort_unstable();
+    layers.dedup();
+    ui.vertical(|ui| {
+        let (plot, painter) = Plot::new(ui, GRAPH, Axis::lin(1.0, 127.0), Axis::lin(0.0, 128.0));
+        for (i, (lo, hi)) in layers.iter().enumerate() {
+            let band = Rect::from_min_max(
+                plot.pos(1.0, f32::from(*hi) + 1.0),
+                plot.pos(127.0, f32::from(*lo)),
+            );
+            if i % 2 == 1 {
+                painter.rect_filled(band, CornerRadius::ZERO, theme::LANE_ALT);
+            }
+            if i > 0 {
+                painter.hline(
+                    plot.rect.x_range(),
+                    band.bottom(),
+                    Stroke::new(1.0, theme::GRID_BEAT),
+                );
+            }
+            if band.height() >= 12.0 {
+                painter.text(
+                    band.right_bottom() + vec2(-4.0, -2.0),
+                    Align2::RIGHT_BOTTOM,
+                    format!("Layer {}", i + 1),
+                    FontId::proportional(9.0),
+                    theme::TEXT_DIM,
+                );
+            }
+        }
+        plot.grid_x(&painter, &[32.0, 64.0, 96.0], |v| format!("{v:.0}"));
+        // At a quarter, a half and three quarters of full strength.
+        plot.grid_y(&painter, &[31.75, 63.5, 95.25], None, |v| {
+            let db = curves::piano_level_db(v / 127.0, dynamics);
+            let text = format!("{db:.1}");
+            format!("{} dB", text.strip_suffix(".0").unwrap_or(&text))
+        });
+        let points = plot.points(|v| curves::piano_velocity(v, curve) * 127.0);
+        plot.fill(&painter, &points, 0.0, theme::ACCENT.gamma_multiply(0.14));
+        plot.line(&painter, points, Stroke::new(2.0, theme::ACCENT));
+        plot.border(&painter);
+        // The curve always ends in the top right corner.
+        title_from(&plot, &painter, plot.rect.left(), "Velocity");
+
+        let id = handle_id(track, "vel_curve");
+        let mid = 64.0;
+        let at = (mid, curves::piano_velocity(mid, curve) * 127.0);
+        let h = graph::handle(ui, &plot, id, at, theme::ACCENT, "");
+        if let Some((_, y)) = h.dragged_to {
+            e.drag(id, "vel_curve", curve_through(mid, y / 127.0));
+        }
+        if h.response.double_clicked() {
+            e.reset("vel_curve");
+        }
+        h.response.on_hover_text(format!(
+            "Velocity curve {curve:+.2}\nUp for a light touch, where soft playing sounds \
+             harder; down for a heavy one. Double-click to reset"
+        ));
+        let layers_text = match layers.len() {
+            0 => String::new(),
+            1 => format!("   1 layer at {}", note_name(key)),
+            n => format!("   {n} layers at {}", note_name(key)),
+        };
+        readout(
+            ui,
+            GRAPH.x,
+            format!("Curve {curve:+.2}   Dynamics {dynamics:.0} dB{layers_text}"),
+        );
+    });
+}
+
+/// Where the tone graph's handle sits, high enough to show the tilt's
+/// full lift.
+const TONE_AT: f32 = 8_000.0;
+
+/// The piano's tone control as a tilt of the spectrum; the handle lifts
+/// or lowers the highs, and the lows go the other way.
+fn tone_graph(ui: &mut Ui, track: TrackId, e: &mut Edits) {
+    let tone = e.get("tone");
+    ui.vertical(|ui| {
+        let (plot, painter) = Plot::new(ui, GRAPH, Axis::log(20.0, 20_000.0), Axis::lin(-7.5, 7.5));
+        plot.grid_x(&painter, &[100.0, 1_000.0, 10_000.0], graph::hz_label);
+        plot.grid_y(&painter, &[-6.0, 0.0, 6.0], Some(0.0), |v| {
+            format!("{v:+.0}")
+        });
+        painter.vline(
+            plot.pos(TILT_HZ, 0.0).x,
+            plot.rect.y_range(),
+            Stroke::new(1.0, theme::GRID_BEAT),
+        );
+        let points = plot.points(|f| curves::tone_tilt_db(tone, f));
+        plot.fill(&painter, &points, 0.0, theme::ACCENT.gamma_multiply(0.14));
+        plot.line(&painter, points, Stroke::new(2.0, theme::ACCENT));
+        plot.border(&painter);
+        // Beside the crossing, where the tilt stays near the middle.
+        title_from(&plot, &painter, plot.pos(TILT_HZ, 0.0).x, "Tone");
+
+        let id = handle_id(track, "tone");
+        let at = (TONE_AT, curves::tone_tilt_db(tone, TONE_AT));
+        let h = graph::handle(ui, &plot, id, at, theme::ACCENT, "");
+        if let Some((_, y)) = h.dragged_to {
+            // The tilt there is close to a straight share of the tone.
+            let per_db = curves::tone_tilt_db(12.0, TONE_AT) / 12.0;
+            e.drag(id, "tone", y / per_db);
+        }
+        if h.response.double_clicked() {
+            e.reset("tone");
+        }
+        h.response.on_hover_text(format!(
+            "Tone {tone:+.1} dB\nUp for brighter highs and leaner lows, down for darker. \
+             Double-click to reset"
+        ));
+        let text = if tone.abs() < 0.05 {
+            "Tone flat".to_string()
+        } else {
+            format!(
+                "Tone {tone:+.1} dB: {} above {}",
+                if tone > 0.0 { "brighter" } else { "darker" },
+                graph::hz_label(TILT_HZ)
             )
         };
         readout(ui, GRAPH.x, text);

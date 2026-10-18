@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use crate::MAX_BLOCK;
+use crate::curves::{TILT_HZ, piano_level_db, piano_velocity};
 use crate::instruments::sampled::{NoteShape, SampleLibrary, SampleVoices};
 use crate::instruments::{Instrument, SUSTAIN_PEDAL};
 use crate::params::ParamSpec;
@@ -29,8 +30,6 @@ pub(crate) const PIANO_PARAMS: &[ParamSpec] = &[
     ParamSpec::linear("gain", "Gain", -60.0, 12.0, 0.0, "dB"),
 ];
 
-/// Where the tone control tilts the spectrum around.
-const TILT_HZ: f32 = 700.0;
 /// How far a mono library spreads the outer keys from the centre.
 const KEY_SPREAD: f32 = 0.6;
 /// Recorded pianos are normalized close to full scale. This brings a key
@@ -38,7 +37,7 @@ const KEY_SPREAD: f32 = 0.6;
 const HEADROOM_DB: f32 = -9.0;
 /// The lowest key without a damper, F#6: from here up the strings ring on
 /// after the key comes up.
-const UNDAMPED_FROM: u8 = 90;
+pub const UNDAMPED_FROM: u8 = 90;
 
 /// How the piano shapes each key, apart from its velocity.
 #[derive(Clone, Copy)]
@@ -55,7 +54,7 @@ impl Feel {
         // From the bench, low keys sit on the left.
         let place = ((f32::from(key) - 64.5) / 44.0).clamp(-1.0, 1.0);
         NoteShape {
-            gain: db_to_gain(-self.dynamics * (1.0 - curved)),
+            gain: db_to_gain(piano_level_db(curved, self.dynamics)),
             tune: self.tune / 100.0,
             pan: 0.0,
             mono_pan: place * self.width * KEY_SPREAD,
@@ -107,8 +106,7 @@ impl Piano {
 
     /// Velocity 1-127 after the curve, as 0 to 1.
     fn curved(&self, velocity: u8) -> f32 {
-        let v = f32::from(velocity.clamp(1, 127)) / 127.0;
-        v.powf(2f32.powf(-1.5 * self.vel_curve))
+        piano_velocity(f32::from(velocity), self.vel_curve)
     }
 
     fn shape(&self, key: u8, curved: f32) -> NoteShape {
@@ -159,6 +157,14 @@ impl Instrument for Piano {
         // Keys the pedal lets go of release as they would have on key up.
         self.voices
             .set_pedal(value >= 64, &noise, |key| feel.shape(key, 1.0));
+    }
+
+    fn pedal_down(&self) -> bool {
+        self.voices.pedal()
+    }
+
+    fn held_keys(&self) -> u128 {
+        self.voices.held_keys()
     }
 
     fn all_notes_off(&mut self) {
@@ -282,6 +288,13 @@ mod tests {
         assert!((flat - 1.0).abs() < 0.05, "{flat}");
         assert!(brightness(12.0) > flat * 1.5);
         assert!(brightness(-12.0) < flat * 0.8);
+        // The editor's picture of the tilt is what the piano does.
+        for tone in [-12.0, 6.0, 12.0] {
+            let heard = 20.0 * (brightness(tone) / flat).log10();
+            let drawn =
+                crate::curves::tone_tilt_db(tone, 880.0) - crate::curves::tone_tilt_db(tone, 220.0);
+            assert!((heard - drawn).abs() < 0.5, "{tone}: {heard} vs {drawn}");
+        }
     }
 
     #[test]
@@ -312,9 +325,9 @@ mod tests {
         let mut p = Piano::new(48_000.0, lib);
         p.controller(1, 127);
         p.controller(SUSTAIN_PEDAL, 63);
-        assert!(!p.voices.pedal());
+        assert!(!p.pedal_down());
         p.controller(SUSTAIN_PEDAL, 64);
-        assert!(p.voices.pedal());
+        assert!(p.pedal_down());
         assert!(p.set_param("pedal_noise", -12.0));
     }
 
