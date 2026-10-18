@@ -26,10 +26,11 @@ pub mod map;
 pub mod packs;
 pub mod samples;
 pub mod sfz;
+mod steinway_b;
 
 pub use instruments::{
     DEFAULT_PIANO, INSTRUMENTS, InstrumentInfo, InstrumentSource, InstrumentStatus, Instruments,
-    find_instrument,
+    Stage, find_instrument,
 };
 pub use map::{MapFile, SampleMap, expand_github};
 pub use packs::{PACKS, PackInfo};

@@ -786,6 +786,9 @@ pub struct PianoLibraryArgs {
     pub library: String,
     /// Download the library when it is not here yet. Default true.
     pub download: Option<bool>,
+    /// Load at most this many velocity layers, to save memory on big
+    /// libraries; the loudest is always kept. Default: all.
+    pub layers: Option<u8>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2600,6 +2603,8 @@ impl SkywareMcp {
                     "credit": i.credit,
                     "homepage": i.homepage,
                     "megabytes": round(i.size as f64 / 1e6, 1),
+                    "layers": i.layers,
+                    "memoryMb": round(i.memory as f64 / 1e6, 1),
                     "builtIn": i.is_bundled(),
                     "downloaded": s.installed,
                 })
@@ -2613,7 +2618,7 @@ impl SkywareMcp {
     }
 
     #[tool(
-        description = "Makes a track a piano that plays a library from instrument_libraries, as one undo step, downloading the library first if needed (tens of MB, checked against its SHA-256). A track that is a piano already keeps its settings."
+        description = "Makes a track a piano that plays a library from instrument_libraries, as one undo step, downloading the library first if needed (tens to hundreds of MB, checked against its SHA-256). A track that is a piano already keeps its settings. Big libraries can load fewer velocity layers to save memory."
     )]
     async fn piano_library(
         &self,
@@ -2627,7 +2632,14 @@ impl SkywareMcp {
         let download = a.download.unwrap_or(true);
         let set = blocking(move || {
             session
-                .set_piano_library(track, &a.library, download, origin)
+                .set_piano_library_reporting(
+                    track,
+                    &a.library,
+                    a.layers,
+                    download,
+                    origin,
+                    &mut |_, _, _| {},
+                )
                 .map_err(|e| e.to_string())
         })
         .await?;

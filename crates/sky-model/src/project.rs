@@ -494,12 +494,20 @@ pub struct LibraryRef {
     /// The credit line the license asks for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit: Option<String>,
+    /// How many velocity layers to load, fewer to save memory; all when
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layers: Option<u8>,
 }
 
 impl LibraryRef {
-    /// `id@version`, the key a loaded copy is shared under.
+    /// `id@version`, plus the layers when only some load: the key a loaded
+    /// copy is shared under.
     pub fn key(&self) -> String {
-        format!("{}@{}", self.id, self.version)
+        match self.layers {
+            Some(n) => format!("{}@{}/{n}", self.id, self.version),
+            None => format!("{}@{}", self.id, self.version),
+        }
     }
 }
 

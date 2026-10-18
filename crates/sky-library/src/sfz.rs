@@ -9,7 +9,8 @@
 //! `pitch_keytrack`), set their level and place (`volume`, `amplitude`,
 //! `pan`, `width`), loop them (`loop_mode`, `loop_start`, `loop_end`,
 //! `offset`, `end`), take turns (`seq_length`, `seq_position`), play on
-//! note-off (`trigger=release`, `rt_decay`), release (`ampeg_release`) and
+//! note-off (`trigger=release`, `rt_decay`), fade in and out
+//! (`ampeg_attack`, `ampeg_release`) and
 //! filter them (`fil_type` low-pass, `cutoff`, `resonance`). Regions that
 //! need a pedal or controller to be pressed are left out, as the instrument
 //! starts with every controller at 0. Anything else is skipped and listed,
@@ -325,6 +326,7 @@ const KNOWN: &[&str] = &[
     "seq_position",
     "lorand",
     "hirand",
+    "ampeg_attack",
     "ampeg_release",
     "fil_type",
     "filtype",
@@ -420,6 +422,7 @@ fn region_zone(ops: &Opcodes, sample: u32) -> Zone {
     z.seq_position = number(ops, "seq_position").map_or(1, |v| v.clamp(1.0, 100.0) as u8);
     z.lorand = number(ops, "lorand").unwrap_or(0.0);
     z.hirand = number(ops, "hirand").unwrap_or(1.0);
+    z.attack = number(ops, "ampeg_attack").unwrap_or(0.0).clamp(0.0, 10.0);
     z.release = number(ops, "ampeg_release").unwrap_or(0.001).max(0.001);
     let fil = ops
         .get("fil_type")
@@ -627,6 +630,64 @@ mod tests {
         assert_eq!(sfz.zones[0].rt_decay, 3.0);
         assert!(sfz.skipped.contains(&"set_hdcc64".to_string()));
         assert!(sfz.skipped.iter().any(|s| s.starts_with("sample=*sine")));
+    }
+
+    #[test]
+    fn salamander_style_files_read() {
+        // The shape of the Salamander Grand Piano's SFZ file: CRLF lines,
+        // `#` in sample names, pedal noises on key -1, and voice groups.
+        let text = "//Salamander Grand Piano V3\r\n//Notes\r\n\
+             <group> amp_veltrack=73 ampeg_release=1\r\n\
+             <region> sample=samples/D#4v1.flac lokey=62 hikey=64 lovel=1 hivel=26 \
+             pitch_keycenter=63\r\n\
+             <region> sample=samples/C4v16.flac lokey=59 hikey=61 lovel=121\r\n\
+             //Notes without dampers\r\n\
+             <group> amp_veltrack=73 ampeg_release=5\r\n\
+             <region> sample=samples/F#6v1.flac lokey=89 hikey=91 hivel=26 \
+             pitch_keycenter=90\r\n\
+             <group> trigger=release volume=-4 amp_veltrack=94 rt_decay=6\r\n\
+             <region> sample=samples/harmLD#1.flac lokey=26 hikey=28 lovel=45 \
+             pitch_keycenter=27\r\n\
+             <group> trigger=release pitch_keytrack=0 volume=-37 amp_veltrack=82 rt_decay=2\r\n\
+             <region> sample=samples/rel1.flac lokey=21 hikey=21\r\n\
+             <group> group=1 hikey=-1 lokey=-1 on_locc64=126 on_hicc64=127 off_by=2 \
+             volume=-20\r\n\
+             <region> sample=samples/pedalD1.flac lorand=0 hirand=0.5\r\n\
+             <region> sample=samples/pedalD2.flac lorand=0.5 hirand=1\r\n\
+             <group> group=2 hikey=-1 lokey=-1 on_locc64=0 on_hicc64=1 volume=-19\r\n\
+             <region> sample=samples/pedalU1.flac lorand=0 hirand=0.5\r\n";
+        let sfz = parse(text, "Salamander+V3", &mut |f| Err(format!("no {f}"))).expect("parses");
+        assert_eq!(sfz.samples.len(), 8);
+        assert_eq!(sfz.samples[0], "Salamander+V3/samples/D#4v1.flac");
+        assert_eq!(sfz.skipped, ["group", "off_by"]);
+        let z = &sfz.zones;
+        assert_eq!(
+            (z[0].root, z[0].lovel, z[0].hivel, z[0].release),
+            (63, 1, 26, 1.0)
+        );
+        // A region with neither a key centre nor a key plays at middle C.
+        assert_eq!((z[1].root, z[1].lovel, z[1].hivel), (60, 121, 127));
+        assert_eq!((z[2].lovel, z[2].hivel, z[2].release), (0, 26, 5.0));
+        assert_eq!(
+            (z[3].trigger, z[3].lovel, z[3].gain_db, z[3].rt_decay),
+            (Trigger::Release, 45, -4.0, 6.0)
+        );
+        assert_eq!(
+            (z[4].trigger, z[4].keytrack, z[4].gain_db),
+            (Trigger::Release, 0.0, -37.0)
+        );
+        let pedal: Vec<_> = z[5..]
+            .iter()
+            .map(|z| (z.trigger, z.gain_db, z.lorand))
+            .collect();
+        assert_eq!(
+            pedal,
+            [
+                (Trigger::PedalDown, -20.0, 0.0),
+                (Trigger::PedalDown, -20.0, 0.5),
+                (Trigger::PedalUp, -19.0, 0.0)
+            ]
+        );
     }
 
     #[test]

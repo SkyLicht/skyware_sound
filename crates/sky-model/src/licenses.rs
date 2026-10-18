@@ -68,8 +68,11 @@ pub fn audio_in_use(project: &Project) -> Vec<AudioId> {
 pub fn libraries_in_use(project: &Project) -> Vec<&LibraryRef> {
     let mut libraries: Vec<&LibraryRef> = Vec::new();
     for t in tracks_in_use(project) {
+        // The same library with fewer layers loaded is still the same one.
         if let Some(l) = t.instrument.as_ref().and_then(|s| s.library.as_ref())
-            && !libraries.contains(&l)
+            && !libraries
+                .iter()
+                .any(|x| x.id == l.id && x.version == l.version)
         {
             libraries.push(l);
         }
@@ -239,10 +242,15 @@ mod tests {
             sha256: None,
             license: License::CcBy3,
             credit: Some("Salamander Grand Piano by Alexander Holm (CC BY 3.0)".into()),
+            layers: None,
         };
         p.tracks[0].instrument.as_mut().unwrap().library = Some(grand.clone());
-        // A second track on the same library is credited once.
-        piano.instrument.as_mut().unwrap().library = Some(grand.clone());
+        // A second track on the same library is credited once, even with
+        // fewer layers loaded.
+        piano.instrument.as_mut().unwrap().library = Some(LibraryRef {
+            layers: Some(8),
+            ..grand.clone()
+        });
         p.tracks.push(piano);
         assert_eq!(libraries_in_use(&p), [&grand]);
         let r = license_report(&p);
